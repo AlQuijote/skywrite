@@ -2,6 +2,7 @@
 use crate::{
     captions::{self, CaptionMode},
     io, media, process,
+    stretch::{SpeedFilters, StretcherChoice},
     timeline::{MediaKind, ValidatedEdit, ValidatedMix, ValidatedVideoClip},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -14,10 +15,11 @@ use std::{
     time::Duration,
 };
 mod fcpxml;
+mod media_url;
 mod project;
 mod xmeml;
 
-/// Nearest-frame rounding may run a clip up to half a frame past its media end.
+/// Nearest-frame rounding may run a clip up to one frame past its media end.
 /// Skywrite's renderers pad that tail, but an NLE may treat it as missing media,
 /// so interchange files end such clips on the last whole frame inside the media.
 fn within_media(edit: &ValidatedEdit) -> (ValidatedEdit, Vec<String>) {
@@ -86,11 +88,44 @@ fn within_media(edit: &ValidatedEdit) -> (ValidatedEdit, Vec<String>) {
     (edit, notes)
 }
 
+/// Export settings beyond the target and output.
+#[derive(Debug, Clone, Default)]
+pub struct ExportOptions {
+    /// FCPXML/Premiere XML only: the editor's absolute media folder. Each
+    /// source URL is rewritten beneath it, keeping its layout relative to the
+    /// folder that holds the edit and all its media.
+    pub media_root: Option<String>,
+    /// FFmpeg script only: time-stretcher for creative clip speeds (default auto).
+    pub stretcher: Option<StretcherChoice>,
+}
+
 pub fn export(edit: &ValidatedEdit, target: &str, output: &Path, overwrite: bool) -> Result<Value> {
+    export_with(edit, target, output, overwrite, &ExportOptions::default())
+}
+
+pub fn export_with(
+    edit: &ValidatedEdit,
+    target: &str,
+    output: &Path,
+    overwrite: bool,
+    options: &ExportOptions,
+) -> Result<Value> {
     prevent_source_overwrite(edit, output)?;
+    let interchange_target = matches!(target, "fcpxml" | "premiere" | "xmeml" | "fcp7");
+    let root = options
+        .media_root
+        .as_deref()
+        .map(|root| {
+            ensure!(
+                interchange_target,
+                "--media-root applies only to --to fcpxml or --to premiere; composition projects copy their media"
+            );
+            media_url::MediaRoot::parse(root)
+        })
+        .transpose()?;
     let mut warnings = edit.warnings.clone();
     let interchange;
-    let edit = if matches!(target, "fcpxml" | "premiere" | "xmeml" | "fcp7") {
+    let edit = if interchange_target {
         let (fitted, notes) = within_media(edit);
         warnings.extend(notes);
         interchange = fitted;
@@ -98,17 +133,29 @@ pub fn export(edit: &ValidatedEdit, target: &str, output: &Path, overwrite: bool
     } else {
         edit
     };
+    let urls = if interchange_target {
+        let urls = media_url::MediaUrls::new(edit, root.as_ref())?;
+        warnings.extend(urls.warnings.iter().cloned());
+        Some(urls)
+    } else {
+        None
+    };
+    ensure!(
+        options.stretcher.is_none() || matches!(target, "ffmpeg" | "python"),
+        "--stretcher applies only to --to ffmpeg; other targets leave speed changes to the NLE or composition"
+    );
     let mut sidecar_files: Vec<PathBuf> = Vec::new();
-    match target {
-        "fcpxml" => {
-            io::atomic_write(output, fcpxml::compile(edit)?.as_bytes(), overwrite)?;
+    let mut audio_stretcher = Value::Null;
+    match (target, &urls) {
+        ("fcpxml", Some(urls)) => {
+            io::atomic_write(output, fcpxml::compile(edit, urls)?.as_bytes(), overwrite)?;
             warnings.extend(interchange_warnings(edit, "FCPXML"));
             if !edit.captions.is_empty() {
                 warnings.push("Caption tracks are embedded as native FCPXML captions (SRT role) above the video tracks. Burn-in is not applied. Final Cut/Resolve import of embedded captions has not been verified; please report results with skywrite nit. Unknown languages are labelled English.".into());
             }
         }
-        "premiere" | "xmeml" | "fcp7" => {
-            let (xml, notes) = xmeml::compile(edit)?;
+        ("premiere" | "xmeml" | "fcp7", Some(urls)) => {
+            let (xml, notes) = xmeml::compile(edit, urls)?;
             io::atomic_write(output, xml.as_bytes(), overwrite)?;
             warnings.extend(interchange_warnings(edit, "Premiere XML"));
             warnings.extend(notes);
@@ -121,17 +168,32 @@ pub fn export(edit: &ValidatedEdit, target: &str, output: &Path, overwrite: bool
                 sidecar_files = files;
             }
         }
-        "ffmpeg" | "python" => {
-            io::atomic_write(output, python_script(edit)?.as_bytes(), overwrite)?
+        ("ffmpeg" | "python", _) => {
+            let speeds = SpeedFilters::resolve(
+                options.stretcher.unwrap_or_default(),
+                edit.audible_spans().iter().map(|s| s.speed),
+            )?;
+            io::atomic_write(output, python_script(edit, &speeds)?.as_bytes(), overwrite)?;
+            warnings.extend(speeds.warnings.iter().cloned());
+            audio_stretcher = speeds.report();
         }
-        "hyperframes" | "remotion" => return project::export(edit, target, output),
+        ("hyperframes" | "remotion", _) => return project::export(edit, target, output),
         _ => bail!(
             "unsupported export target {target}; choose fcpxml, premiere, ffmpeg, hyperframes, or remotion"
         ),
     }
-    Ok(
-        json!({"target":target,"output":output,"caption_files":sidecar_files,"external_sources":edit.external_sources(),"duration_seconds":edit.duration(),"duration_frames":edit.duration_frames,"warnings":warnings}),
-    )
+    let mut result = json!({"target":target,"output":output,"caption_files":sidecar_files,"external_sources":edit.external_sources(),"duration_seconds":edit.duration(),"duration_frames":edit.duration_frames,"warnings":warnings});
+    if let (Some(root), Some(base)) = (
+        &options.media_root,
+        urls.as_ref().and_then(|urls| urls.base.as_ref()),
+    ) {
+        result["media_root"] = json!(root);
+        result["media_base"] = json!(base);
+    }
+    if !audio_stretcher.is_null() {
+        result["audio_stretcher"] = audio_stretcher;
+    }
+    Ok(result)
 }
 
 /// Write one validated caption track (output timeline) as SRT or VTT.
@@ -248,20 +310,6 @@ fn number(value: f64) -> String {
 fn push(args: &mut Vec<String>, items: &[&str]) {
     args.extend(items.iter().map(|s| (*s).to_owned()));
 }
-fn tempo(speed: f64) -> String {
-    let mut remaining = speed;
-    let mut parts = Vec::new();
-    while remaining > 2.0 {
-        parts.push("atempo=2".into());
-        remaining /= 2.0;
-    }
-    while remaining < 0.5 {
-        parts.push("atempo=0.5".into());
-        remaining /= 0.5;
-    }
-    parts.push(format!("atempo={}", number(remaining)));
-    parts.join(",")
-}
 fn xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -347,7 +395,9 @@ fn silence(samples: u64, label: &str) -> String {
     format!("anullsrc=r=48000:cl=stereo,atrim=end_sample={samples},asetpts=PTS-STARTPTS[{label}]")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audio_segment(
+    speeds: &SpeedFilters,
     input: usize,
     info: &media::MediaInfo,
     source_times: (f64, f64),
@@ -355,7 +405,7 @@ fn audio_segment(
     speed: f64,
     envelope: &str,
     label: &str,
-) -> String {
+) -> Result<String> {
     let (source_in, unseeked_prefix) = source_times;
     let duration = output_samples as f64 / 48000.0;
     let trim = (unseeked_prefix
@@ -372,17 +422,17 @@ fn audio_segment(
         .unwrap_or(0.0);
     let content = (duration * speed - lead).max(0.0);
     if content <= 0.0 {
-        return silence(output_samples, label);
+        return Ok(silence(output_samples, label));
     }
     // Retiming the content and padding the known stream delay separately prevents
-    // WSOLA from moving the leading boundary when it stretches a run of silence.
+    // a time-stretcher from moving the leading boundary when it stretches silence.
     let delay = (lead / speed * 48000.0).round() as u64;
     let source_samples = (content * 48000.0).round() as u64;
-    format!(
+    Ok(format!(
         "[{input}:a:0]asetpts=PTS-STARTPTS,atrim=start={},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,atrim=end_sample={source_samples},{},aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={delay}S:all=1,apad=whole_len={output_samples},atrim=end_sample={output_samples},asetpts=N/SR/TB,{envelope}[{label}]",
         number(trim),
-        tempo(speed),
-    )
+        speeds.filter(speed, source_samples)?,
+    ))
 }
 
 fn transparent(edit: &ValidatedEdit, frames: u64, label: &str) -> String {
@@ -522,7 +572,7 @@ fn concat(labels: &[String], video: bool, out: &str) -> String {
     text
 }
 
-fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
+fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan> {
     let mut args = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
@@ -596,6 +646,7 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
             if clip.has_audible_sound() {
                 has_sound = true;
                 sound_filters.push(audio_segment(
+                    speeds,
                     input,
                     &clip.media,
                     (clip.source_in, prefix),
@@ -603,7 +654,7 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
                     clip.speed,
                     &mix_filters(&clip.audio, edit.fps.seconds(clip.duration_frames)),
                     &label,
-                ));
+                )?);
             } else {
                 sound_filters.push(silence(samples, &label));
             }
@@ -655,6 +706,7 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
             );
             let label = format!("x{t}_{c}");
             filters.push(audio_segment(
+                speeds,
                 input,
                 &clip.media,
                 (clip.source_in, prefix),
@@ -662,7 +714,7 @@ fn render_plan(edit: &ValidatedEdit) -> Result<RenderPlan> {
                 clip.speed,
                 &mix_filters(&clip.mix, duration),
                 &label,
-            ));
+            )?);
             sounds.push(label);
             cursor = clip.end_frames();
             input += 1;
@@ -1001,7 +1053,12 @@ pub fn mux_captions(
     )
 }
 
-pub fn render(edit: &ValidatedEdit, output: &Path, overwrite: bool) -> Result<Value> {
+pub fn render(
+    edit: &ValidatedEdit,
+    output: &Path,
+    overwrite: bool,
+    stretcher: StretcherChoice,
+) -> Result<Value> {
     prevent_source_overwrite(edit, output)?;
     ensure!(
         overwrite || !output.exists(),
@@ -1021,7 +1078,8 @@ pub fn render(edit: &ValidatedEdit, output: &Path, overwrite: bool) -> Result<Va
         .suffix(".mp4")
         .tempfile_in(parent)?;
     let cleanup = process::CleanupGuard::new(temp.path())?;
-    let plan = render_plan(edit)?;
+    let speeds = SpeedFilters::resolve(stretcher, edit.audible_spans().iter().map(|s| s.speed))?;
+    let plan = render_plan(edit, &speeds)?;
     let (sidecars, _sidecar_cleanup) = private_sidecars(&plan)?;
     let mut args = plan_args(&plan, sidecars.path())?;
     *args.last_mut().context("missing output argument")? = temp.path().as_os_str().to_owned();
@@ -1041,6 +1099,7 @@ pub fn render(edit: &ValidatedEdit, output: &Path, overwrite: bool) -> Result<Va
         "rendered duration differs from requested timeline"
     );
     let mut warnings = edit.warnings.clone();
+    warnings.extend(speeds.warnings.iter().cloned());
     let (temp, rotation_cleanup) = match display_rotation(temp.path())? {
         Some(rotation) => {
             let (cleared, rotation_cleanup) = clear_display_rotation(temp.path(), parent)?;
@@ -1073,7 +1132,7 @@ pub fn render(edit: &ValidatedEdit, output: &Path, overwrite: bool) -> Result<Va
         ));
     }
     Ok(
-        json!({"output":output,"container":"mp4","duration_seconds":rendered.duration,"duration_frames":edit.duration_frames,"peak_dbfs":peak,"external_sources":edit.external_sources(),"warnings":warnings}),
+        json!({"output":output,"container":"mp4","duration_seconds":rendered.duration,"duration_frames":edit.duration_frames,"peak_dbfs":peak,"external_sources":edit.external_sources(),"audio_stretcher":speeds.report(),"warnings":warnings}),
     )
 }
 
@@ -1160,13 +1219,16 @@ fn peak_dbfs(path: &Path) -> Result<Option<f64>> {
         .find(|value| value.is_finite()))
 }
 
-fn python_script(edit: &ValidatedEdit) -> Result<String> {
-    let literal = serde_json::to_string(&serde_json::to_string(&render_plan(edit)?)?)?;
+fn python_script(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<String> {
+    let literal = serde_json::to_string(&serde_json::to_string(&render_plan(edit, speeds)?)?)?;
+    // The summary holds only fixed text and numbers; keep the comment one line.
+    let stretcher = speeds.summary().replace(['\n', '\r'], " ");
     Ok(format!(
         r##"#!/usr/bin/env python3
 """Skywrite edit: Python standard library and FFmpeg only. Outputs H.264/AAC MP4.
 Run: python3 render.py --output edit.mp4 [--overwrite]
 """
+# Audio time-stretcher: {stretcher}
 import argparse
 import json
 import os
@@ -1336,10 +1398,5 @@ mod tests {
     #[test]
     fn escaping() {
         assert_eq!(xml("a'\"<&>"), "a&apos;&quot;&lt;&amp;&gt;");
-    }
-    #[test]
-    fn atempo_covers_full_allowed_range() {
-        assert_eq!(tempo(8.0), "atempo=2,atempo=2,atempo=2.000000000");
-        assert_eq!(tempo(0.125), "atempo=0.5,atempo=0.5,atempo=0.500000000");
     }
 }

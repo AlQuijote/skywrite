@@ -88,14 +88,77 @@ reported presentation start). Inspection reports elapsed presentation duration:
 Matroska/WebM's ending timestamp is rebased to that start; MP4 and MPEG-TS
 already report elapsed duration. `duration` is always **output seconds**;
 `speed` is **source seconds per output second**. A 10-second output clip at speed
-1.01 consumes 10.1 source seconds. If synchronization reports
-`reference_time = offset + scale * asset_time`, use `speed = 1 / scale` to
-conform that asset to the reference. Source trims are not timeline positions.
+1.01 consumes 10.1 source seconds. Source trims are not timeline positions.
 
-`start`, `duration` and the optional timeline `duration` are rounded to the
-nearest output frame, and the validator reports rounding. `source_in` keeps its
-precision (word-accurate dialogue cuts). Because rounding is to the nearest
-frame, a clip that uses a source to its very end may run up to half an output
+Clip audio is converted to 48 kHz and then follows `speed` in three ways. At
+speed 1 it passes through unchanged. Within 0.1% of 1 (clock-drift conform, such as a `skywrite
+sync` `playback_rate`) it is resampled: timing is sample-exact over any length,
+and pitch shifts by under 1.8 cents. Larger (creative) changes keep pitch with
+a time-stretcher, chosen by `edit render --stretcher` and `edit export --to
+ffmpeg --stretcher` (speed 1 and the resample range are unaffected):
+
+| `--stretcher` | Behaviour |
+|---|---|
+| `auto` (default) | `rubberband` when this FFmpeg build has the filter, else `atempo` with a one-line warning |
+| `rubberband` | `rubberband`; fails with an error if this FFmpeg lacks it |
+| `atempo` | always `atempo` |
+
+FFmpeg is checked once per command (`ffmpeg -hide_banner -filters`), only when a
+clip needs stretching. `rubberband` runs with `window=short:channels=together`.
+FFmpeg's filter leaves the library's latency in its output, off by an amount
+that depends on speed (14.7 ms early at 0.5x, 6.1 ms late at 2x), so Skywrite pads the clip audio with 16384 samples
+of silence at each end and drops the leading output samples that a calibration
+measured for that exact speed: five 50 ms bursts through the same filter chain on
+this FFmpeg. Above 2x it chains 2x stages; a single 4–8x stage loses most of a
+short sound and moves it by up to 28 ms. `atempo` cannot be corrected the same
+way, because its offset moves between events. Measured with FFmpeg 8.0.1 and
+librubberband 4.0 (onsets of 10 ms clicks every 2 s, AAC render):
+
+| Speed | rubberband (compensated) | atempo |
+|---|---|---|
+| 0.5 | -2.3 ms | -36 to -21 ms |
+| 0.8 | +0.3 to +5.2 ms | -28 to -13 ms |
+| 0.9 | -1.1 to +0.7 ms | -24 to -21 ms |
+| 1.1 | -0.1 to +0.5 ms | -19 to -15 ms |
+| 1.25 | -0.1 to +0.5 ms | -13 ms |
+| 2.0 | -0.5 to +0.8 ms | -17 to -3 ms |
+
+In spot checks outside that range, compensated rubberband landed -8 ms at 0.125x,
++3.7 ms at 0.25x and within 5.7 ms at 3–8x; atempo landed up to about 60 ms early
+at 0.125–0.25x. On speech (0.5–2x) the energy envelope lands within 6 ms with
+rubberband, against -22 to +14 ms with atempo. A clip whose speed needs
+stretching is checked even when its audio is silent in the clip window, and one
+command calibrates at most 64 distinct speeds. The result's `audio_stretcher` reports the request,
+whether rubberband was found, the stretcher used and each measured calibration.
+An exported FFmpeg script keeps the stretcher and calibration resolved on the
+exporting machine, names them in a comment, and needs the same kind of FFmpeg
+build.
+
+### Placing a sync result
+
+`skywrite sync apply --sync result.json --edit edit.json -o out.json` writes a
+`skywrite sync` result into an edit (see the README and `skywrite skills read
+synchronization`); use it rather than the arithmetic below. By hand, for a
+result `reference_time = offset_seconds + scale * asset_time` and a reference
+clip at timeline `start` Rs with `source_in` Rin and speed 1: give the asset
+clip a `start` on the output frame grid, no earlier than `Rs + offset_seconds -
+Rin`; set `source_in = (Rin + start - Rs - offset_seconds) / scale` and `speed
+= playback_rate` (`1 / scale`), and end it where either recording ends. Keep
+the sub-frame remainder in `source_in`, which is not rounded; a "start rounded"
+warning on a synced clip means the placement moved. For example, at 24 fps
+with the camera at `start` 0 and `source_in` 0, `offset_seconds` 7.2 gives
+`start` 7.208333333333333 (frame 173 = 173/24, at full precision) and
+`source_in` 0.008333; `offset_seconds` -3.5 gives `start` 0 and `source_in`
+3.5. A `discontinuous` result needs one clip per segment, each limited to its
+`asset_range`.
+
+A clip's `start` and its end (`start + duration`) are each rounded once to the
+nearest output frame, and its frame length is end minus start, so clips written
+back to back in round seconds share their boundary frame at 23.976, 29.97 or
+59.94 fps (never a one-frame overlap or gap). The optional timeline `duration`
+is rounded to the nearest frame too; the validator reports rounding. `source_in` keeps its
+precision (word-accurate dialogue cuts). Because start and end round to the
+nearest frame, a clip that uses a source to its very end may run up to one output
 frame past it; that tail is accepted with a warning and padded (silence, held
 last picture) by Skywrite's renderers, so durations need not be floored.
 FCPXML and Premiere XML exports instead end such a clip on the last whole frame
@@ -234,12 +297,41 @@ supplied, preserving authored projects.
 
 **Premiere XML** (`--to premiere`) is Final Cut Pro 7 XML (`xmeml` version 5),
 which Premiere Pro imports via File → Import. Each video track keeps its layer,
-its linked sound goes to a matching audio track, and audio tracks follow. Speed
+its linked sound goes to a matching audio track, and audio tracks follow. Audio
+uses the structure Premiere itself exports (`explodedTracks`): a stereo layer is
+a pair of tracks (`currentExplodedTrackIndex` 0 and 1, `outputchannelindex` 1
+and 2) with one clipitem per channel (`sourcetrack` 1 and 2), linked with its
+video clip; Premiere shows it as one stereo clip. Mono sources get a mono track
+of their own (a track mixing mono and stereo sources is split, with a warning),
+and sources with more than two channels use their first two. Speed
 uses the Time Remap effect, opacity and fades use Opacity keyframes, and gain uses
 Audio Levels keyframes. The format counts whole frames at integer or NTSC rates,
 so subframe source in points are rounded (with a warning). Skywrite checks the
 XML's structure and timing with an independent reader, but import into Premiere
 itself has not yet been verified: please report results with `skywrite nit`.
+
+**Media paths for exports made elsewhere.** FCPXML and Premiere XML reference
+media by absolute URL, by default this machine's paths. When the export is made
+on another machine than the editor's (for example in the cloud), pass the
+editor's folder with `--media-root`:
+
+```sh
+# Cloud: the project lives in /work/film (edit in /work/film/edits, media in /work/film/media)
+skywrite edit export edits/cut.json --to premiere -o edits/cut.xml --media-root /Users/sam/Projects/film
+# result: "media_base": "/work/film", "media_root": "/Users/sam/Projects/film"
+# cut.xml now points at /Users/sam/Projects/film/media/recorder.wav, ...
+```
+
+Each source keeps its path relative to `media_base`, the deepest folder holding
+the edit file and every source it uses. Copy `media_base`'s contents (with
+subfolders) to the media root on the editing machine, then import the XML:
+Premiere and Final Cut link on open. Windows folders work too
+(`--media-root 'D:\Projects\film'`). The root must be absolute. `edit import`
+reads macOS and Linux roots back; Windows roots are only for the editor's
+machine. Keep media file names unique: the export warns when two
+sources share a name (case-insensitively), because after one manual relink an NLE
+locates the remaining files by name. Composition targets copy their media and
+refuse `--media-root`.
 
 **FCPXML 1.10** uses file URLs and rational time values. A full-length gap anchors
 each track as a connected storyline (video tracks above, audio tracks below), so

@@ -1,5 +1,8 @@
 //! FCPXML 1.10, following Apple's FCPXML reference and timeMap specification.
-use super::xml;
+use super::{
+    media_url::{MediaUrls, Style},
+    xml,
+};
 use crate::timeline::{self, MediaKind, Rational, ValidatedEdit, ValidatedMix, ValidatedVideoClip};
 use anyhow::Result;
 use std::{collections::HashMap, fmt::Write as _, path::PathBuf};
@@ -179,7 +182,7 @@ fn two_letter(code: &str) -> &str {
     }
 }
 
-pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
+pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<String> {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE fcpxml>\n<fcpxml version=\"1.10\">\n<resources>\n",
     );
@@ -221,8 +224,6 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
             }
             writeln!(out, "/>")?;
         }
-        let url = url::Url::from_file_path(source)
-            .map_err(|_| anyhow::anyhow!("cannot make file URL for {}", source.display()))?;
         write!(
             out,
             "<asset id=\"{id}\" name=\"{}\" start=\"{}\" duration=\"{}\"",
@@ -248,7 +249,7 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<String> {
         writeln!(
             out,
             "><media-rep kind=\"original-media\" src=\"{}\"/></asset>",
-            xml(url.as_str())
+            xml(urls.get(source, Style::Fcpxml))
         )?;
     }
     writeln!(

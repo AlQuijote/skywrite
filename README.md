@@ -77,6 +77,8 @@ cargo build --release --locked
 ./target/release/skywrite doctor
 ```
 
+`doctor` also reports `audio_stretcher.rubberband_available`: whether this FFmpeg has the `rubberband` filter used for pitch-preserving speed changes (see [edit format](docs/edit-format.md)).
+
 The core is Rust. Direct dependencies include established projects: clap, serde/serde_json, anyhow, reqwest with Rustls, RustCrypto sha2, tempfile, signal-hook, Tokio, and Apache Arrow’s `object_store` S3 backend. `Cargo.lock` records the exact resolved dependency tree. No Python or Node runtime is needed for inspection, synchronization, FCPXML export, or the native FFmpeg renderer.
 
 ## Configuration
@@ -127,31 +129,40 @@ Explicit remote commands may incur OpenRouter charges. Requests have time, size,
 
 ### Synchronize recordings
 
-For speech, transcribe each recording and match timestamped words:
+`--reference` is the recording whose clock your timeline follows (usually the camera on V1); `--asset` is the recording you place against it (usually the separate recorder). Synchronize common audio locally, without any API request:
+
+```sh
+skywrite sync --reference camera-a.mp4 --asset recorder.wav --method audio -o recorder.sync.json
+```
+
+For speech without shared sound, transcribe each recording and match timestamped words (`--method auto` uses transcripts when both inputs are `.json`):
 
 ```sh
 skywrite transcribe camera-a.mp4 -o camera-a.transcript.json
-skywrite sync --reference recorder.transcript.json --asset camera-a.transcript.json -o camera-a.sync.json
-```
-
-Or synchronize common audio directly, without any API request:
-
-```sh
-skywrite sync --reference recorder.wav --asset camera-a.mp4 --method audio -o camera-a.sync.json
+skywrite transcribe recorder.wav -o recorder.transcript.json
+skywrite sync --reference camera-a.transcript.json --asset recorder.transcript.json -o recorder.sync.json
 ```
 
 The result always maps **asset time into reference time**:
 
 ```text
 reference_time = offset_seconds + scale * asset_time
-playback_rate = 1 / scale
+playback_rate = 1 / scale        (the edit `speed` for the asset)
 ```
 
-If `offset_seconds=12` and `scale=1.01`, asset zero belongs at reference second 12 and the asset needs a playback multiplier of approximately 0.990099. To find the asset in point corresponding to reference time `r`, use `(r-offset_seconds)/scale`. In edit JSON, `speed` is that playback multiplier. Trim to the actual overlap; a negative source in point is invalid.
+A negative `offset_seconds` means the asset started recording first.
 
-Transcript matching uses word/phrase anchors and robust affine fitting to tolerate recognition errors and outliers. Audio alignment uses bounded signal analysis and local delay measurements. Results expose anchor coverage, residuals, ambiguity, and whether drift was estimable. A short or repetitive overlap cannot establish a reliable speed correction. Cuts, pauses, or dropped samples can require separate segments; a single affine result must not be treated as a universal time warp. Different microphone positions can introduce acoustic delays; synchronizing scratch audio does not independently certify camera lip sync.
+Place the result with `sync apply` rather than computing it. Put the camera clip on the timeline in an edit, then:
 
-Default audio input limit is one hour per file; `--max-audio-seconds` changes the bounded limit. Other options include `--max-scale-deviation`, `--tolerance-seconds`, `--min-anchors`, and `--min-span-seconds`. `--method auto` treats two `.json` inputs as transcripts and other inputs as media. `sync --method transcript` compares words without binding transcripts to media, so it does not require a content fingerprint.
+```sh
+skywrite sync apply --sync recorder.sync.json --edit edit.json -o edit.synced.json --verify
+```
+
+For every clip of the sync reference (or `--clip TRACK:CLIP`), it adds the asset on a new audio track (`--track`, `--role`, default dialogue): `start` on the first output frame where the asset has sound, the sub-frame remainder in `source_in`, `speed` = `playback_rate` (times the reference clip's own speed when that is not 1), duration trimmed to the real overlap, and the reference clip's own sound muted (`--keep-reference-audio` keeps it). It reports each placement, any `uncovered` timeline inside the reference clip, and validates the edit before writing it next to the input. `--verify` renders each placed clip, re-syncs it against the matching stretch of the reference and reports the residual at both ends; `verify.passed` needs one strong, continuous re-sync covering each clip with both ends within 2 ms (clips under 15 s, or against a reference clip not within 3% of speed 1, are skipped and listed). Results that are not `strong` with drift estimated, or use the envelope method, are refused with the reason and next step; `--allow-limited` overrides for a result the user has checked by ear.
+
+Results report `method` (`audio_waveform`, `audio_envelope` or `transcript`), `quality` (`strong` or `limited`), `drift_estimated`, `drift_ppm`, inlier counts, `anchor_span_seconds`, the matched `asset_interval`/`reference_interval`, residuals (`median_error_seconds`, `p95_error_seconds`, and the `strong_p95_limit_seconds` that `strong` requires), `discontinuous`, `segments` and warnings. A match that several passages support equally fails with an "ambiguous synchronization" error rather than returning a guess. When one mapping does not hold for the whole take (a cut, a dropout or a recorder restart), the result is `discontinuous` with one entry per continuous stretch in `segments` (each with its own `asset_range`, offset, scale and quality; boundaries located from the audio to within about 0.3 s, and each segment stops 0.3 s short of a boundary so no sound is placed with the wrong mapping), the top level describes only the best-supported segment and is `limited`, and `sync apply` places every segment. `skywrite skills read synchronization` has the full checklist and low-confidence steps. Transcript matching uses word/phrase anchors and robust affine fitting to tolerate recognition errors and outliers. Audio alignment finds coarse hypotheses from the sound's energy envelope, then measures waveform anchors (2 s windows, sub-sample peak interpolation, pre-emphasis) every 2 s across the overlap (up to 1800 anchors: every 2 s for takes up to an hour, every 8 s at the 4-hour limit). Sound inside a matched stretch that fits no mapping (strong anchors that disagree with it, or 8 s or more of sound with no match) makes the result `limited` with a warning. On synthetic dual-system takes with scratch-mic damage and 20–208 ppm drift, 2- to 60-minute takes end within about 1.5 ms of the truth ([measured validation](docs/validation.md)). A short or repetitive overlap cannot establish a reliable speed correction. Different microphone positions introduce acoustic delays (about 3 ms per metre); synchronizing to scratch audio does not independently certify camera lip sync.
+
+Default audio input limit is one hour per file; `--max-audio-seconds` changes the bounded limit. Other options include `--max-scale-deviation`, `--tolerance-seconds`, `--min-anchors`, and `--min-span-seconds`. `sync --method transcript` compares words without binding transcripts to media, so it does not require a content fingerprint.
 
 ### Create an edit
 
@@ -219,6 +230,8 @@ Contact sheets tile consecutive exact frames with source times, so expressions a
 
 ```sh
 skywrite edit export edit.json --to premiere -o edit.xml
+# made in the cloud for an editor on a Mac: write their media folder into the XML
+skywrite edit export edit.json --to premiere -o edit.xml --media-root /Users/sam/Projects/film
 skywrite edit export edit.json --to fcpxml -o edit.fcpxml
 skywrite edit render edit.json -o preview.mp4
 skywrite edit export edit.json --to ffmpeg -o render.py
@@ -230,7 +243,7 @@ skywrite edit export edit.json --to remotion -o remotion-project
 - **Import:** `skywrite edit import premiere.xml -o edit.json` brings an editor's Premiere/FCP 7 XML timeline back as a layered edit (layers, linked sound, speed, opacity, levels, fades, markers); `.prproj` is read experimentally.
 - **Premiere XML:** writes Final Cut Pro 7 XML (xmeml v5), which Premiere Pro imports. Video tracks, linked sound, audio tracks, speed (Time Remap), opacity/fades and gain keyframes (Audio Levels) are carried; whole-frame timing rounds subframe in points, with a warning. Structure and timing are checked with OpenTimelineIO's independent reader; import into Premiere itself is not yet verified, so report results with `skywrite nit`.
 - **FCPXML:** generates an FCPXML 1.10 timeline with rational timing, original-media references, a connected storyline per track, constant retiming, blend and volume keyframes. Actual Final Cut/Resolve import must be checked in those applications; generating XML on Linux cannot certify application import fidelity.
-- **Native render:** calls installed FFmpeg, composites layers, applies LUTs, opacity, fades, gain keyframes and the optional master limiter, conforms constant speed, mixes audio, and creates an MP4. It preserves the originals. The generated Python renderer uses only the Python standard library and FFmpeg, with the same compiled edit operations. NLE exports warn about LUTs and the limiter, which must be applied in the NLE to match.
+- **Native render:** calls installed FFmpeg, composites layers, applies LUTs, opacity, fades, gain keyframes and the optional master limiter, conforms constant speed, mixes audio, and creates an MP4. Creative speed changes keep pitch with FFmpeg's `rubberband` when available (`--stretcher auto|rubberband|atempo`; see [edit format](docs/edit-format.md)). It preserves the originals. The generated Python renderer uses only the Python standard library and FFmpeg, with the same compiled edit operations. NLE exports warn about LUTs and the limiter, which must be applied in the NLE to match.
 - **Hyperframes:** exports a new HTML composition project and copied assets for the installed CLI. Follow the generated README for lint/preview/render. Existing project directories are never overwritten.
 - **Remotion:** exports a new React composition project and copied assets. Install the generated npm dependencies inside that project, then preview/render using its scripts. This optional backend currently requires integer fps; use FCPXML/FFmpeg for rational fps. Remotion's own runtime and licensing apply.
 

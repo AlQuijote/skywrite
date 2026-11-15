@@ -1,6 +1,6 @@
 //! Layered edit format: compositing, finishing and interchange at real tool boundaries.
 use serde_json::{Value, json};
-use skywrite::{export, process, timeline};
+use skywrite::{export, process, stretch::StretcherChoice, timeline};
 use std::{path::Path, process::Command, time::Duration};
 
 fn ffmpeg(args: &[&str]) -> Vec<u8> {
@@ -148,7 +148,7 @@ fn rms(values: &[f32]) -> f64 {
 fn render(dir: &Path, edit: Value, name: &str) -> std::path::PathBuf {
     let validated = timeline::validate(&timeline::parse(edit).unwrap(), dir).unwrap();
     let output = dir.join(name);
-    export::render(&validated, &output, false).unwrap();
+    export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
     output
 }
 
@@ -243,7 +243,13 @@ fn picture_fades_volume_keyframes_and_limiter_are_rendered() {
     );
     let validated =
         timeline::validate(&timeline::parse(loud.clone()).unwrap(), dir.path()).unwrap();
-    let report = export::render(&validated, &dir.path().join("report.mp4"), false).unwrap();
+    let report = export::render(
+        &validated,
+        &dir.path().join("report.mp4"),
+        false,
+        StretcherChoice::Auto,
+    )
+    .unwrap();
     assert!(report["peak_dbfs"].as_f64().unwrap() > -0.1, "{report}");
     assert!(
         report["warnings"].to_string().contains("limiter_db"),
@@ -341,12 +347,17 @@ assert s.find('rate/timebase').text=='30' and s.find('rate/ntsc').text=='TRUE'
 assert int(s.find('duration').text)==60
 v=s.findall('media/video/track'); a=s.findall('media/audio/track')
 assert len(v)==2, len(v)
-assert len(a)==2, len(a)  # linked sound of V1, then the tone track
+assert len(a)==2, len(a)  # linked sound of V1, then the tone track (both mono sources)
+assert s.attrib['explodedTracks']=='true'
+for track in a:
+    assert track.attrib=={'currentExplodedTrackIndex':'0','totalExplodedTrackCount':'1','premiereTrackType':'Mono'}, track.attrib
+    assert all(c.attrib['premiereChannelType']=='mono' for c in track.findall('clipitem'))
 red=v[0].find('clipitem')
 assert red.find('start').text=='0' and red.find('end').text=='60'
 assert red.find('in').text=='12' and red.find('out').text=='72', (red.find('in').text, red.find('out').text)
 assert red.find(".//effect[effectid='timeremap']//parameter[parameterid='speed']/value").text.startswith("120")
 links=red.findall('link'); assert len(links)==2
+assert [l.find('mediatype').text for l in links]==['video','audio']
 linked=a[0].find('clipitem')
 assert linked.find(".//effect[effectid='audiolevels']") is not None
 assert len(linked.findall(".//keyframe"))>=2
@@ -354,7 +365,7 @@ assert all('file://localhost/' in p.text for p in s.iter('pathurl'))
 items=v[1].findall('clipitem'); assert len(items)==2
 assert items[0].find(".//effect[effectid='opacity']//keyframe") is not None
 assert items[1].find('stillframe').text=='TRUE'
-assert len(items[0].findall('link'))==1  # muted B-roll has no linked audio
+assert len(items[0].findall('link'))==0  # muted B-roll: a lone clipitem has no self-link
 tone=a[1].find('clipitem')
 assert len(tone.findall(".//effect[effectid='audiolevels']//keyframe"))==3  # points at 0 and 1s, then the end hold
 assert s.find('marker/name').text=='Start'
@@ -509,7 +520,7 @@ fn subframe_source_end_rounding_is_padded_not_rejected() {
         "{summary}"
     );
     let output = dir.path().join("padded.mp4");
-    export::render(&validated, &output, false).unwrap();
+    export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
     // Interchange files end the clip on the last whole frame inside the media.
     for (target, name) in [("fcpxml", "edit.fcpxml"), ("premiere", "edit.xml")] {
         let report = export::export(&validated, target, &dir.path().join(name), false).unwrap();

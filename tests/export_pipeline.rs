@@ -2,6 +2,7 @@
 use serde_json::{Value, json};
 use skywrite::{
     export, media, process,
+    stretch::StretcherChoice,
     timeline::{self, Edit},
 };
 use std::{ffi::OsString, fs, path::Path, time::Duration};
@@ -194,7 +195,7 @@ fn real_render_preserves_timing_picture_and_audio() {
     make_fixtures(dir.path());
     let validated = timeline::validate(&build(&edit()), dir.path()).unwrap();
     let output = dir.path().join("render.mp4");
-    export::render(&validated, &output, false).unwrap();
+    export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
     let info = media::probe(&output).unwrap();
     assert!(info.has_audio() && info.has_video());
     assert!((info.duration - 1.5).abs() < 0.04);
@@ -239,9 +240,17 @@ fn real_render_preserves_timing_picture_and_audio() {
         "offset external audio missing"
     );
     let bytes = fs::read(&output).unwrap();
-    assert!(export::render(&validated, &output, false).is_err());
+    assert!(export::render(&validated, &output, false, StretcherChoice::Auto).is_err());
     assert_eq!(fs::read(&output).unwrap(), bytes);
-    assert!(export::render(&validated, &dir.path().join("green.mp4"), true).is_err());
+    assert!(
+        export::render(
+            &validated,
+            &dir.path().join("green.mp4"),
+            true,
+            StretcherChoice::Auto
+        )
+        .is_err()
+    );
     assert!(!dir.path().join("HACKED").exists());
 }
 
@@ -423,7 +432,7 @@ fn delayed_stream_presentation_times_survive_trim_and_retime() {
         specification["video"] = json!([{"clips":[{"start":0,"source":input,"source_in":source_in,"duration":duration,"speed":speed}]}]);
         let validated = timeline::validate(&build(&specification), dir.path()).unwrap();
         let output = dir.path().join(format!("delayed-{index}.mp4"));
-        export::render(&validated, &output, false).unwrap();
+        export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
         let onset: f64 = ((0.5f64 - source_in) / speed).max(0.0);
         if onset > 0.1 {
             assert!(
@@ -501,7 +510,7 @@ fn delayed_video_prefix_is_counted_once_in_both_renderers() {
                     ],
                 );
             } else {
-                export::render(&validated, &output, false).unwrap();
+                export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
             }
             let onset: f64 = ((1.0f64 - source_in) / speed).max(0.0);
             if onset > 0.1 {
@@ -579,7 +588,7 @@ fn additional_audio_preserves_content_before_delayed_video() {
                     ],
                 );
             } else {
-                export::render(&validated, &output, false).unwrap();
+                export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
             }
             assert!(
                 rms(&output, "0.05", "0.1") > 0.03,
@@ -663,4 +672,255 @@ for output in [root/"speaker's $(touch HACKED) & <take>.mp4",root/'existing.mp4'
 print('five lifecycle modes and source/no-clobber controls passed')
 "#;
     command("python3", &["-c", probe, dir.path().to_str().unwrap()]);
+}
+
+/// Sample index of each 10 ms, 2 kHz Hann burst within 60 ms of `expected` seconds.
+fn burst_onsets(path: &Path, expected: &[f64]) -> Vec<i64> {
+    let bytes = command(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            path.to_str().unwrap(),
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-f",
+            "f32le",
+            "pipe:1",
+        ],
+    )
+    .stdout;
+    let samples: Vec<f64> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|v| f32::from_le_bytes(*v) as f64)
+        .collect();
+    let template: Vec<f64> = (0..480)
+        .map(|i| {
+            let t = i as f64 / 48000.0;
+            (std::f64::consts::TAU * 2000.0 * t).sin()
+                * 0.5
+                * (1.0 - (std::f64::consts::TAU * t / 0.01).cos())
+        })
+        .collect();
+    expected
+        .iter()
+        .map(|seconds| {
+            let center = (seconds * 48000.0).round() as usize;
+            (center - 2880..center + 2880)
+                .max_by(|a, b| {
+                    let score = |s: usize| -> f64 {
+                        template.iter().zip(&samples[s..]).map(|(x, y)| x * y).sum()
+                    };
+                    score(*a).total_cmp(&score(*b))
+                })
+                .unwrap() as i64
+                - center as i64
+        })
+        .collect()
+}
+
+/// Four seconds of silence with 10 ms Hann-windowed 2 kHz bursts at `bursts`.
+fn click_wav(path: &Path, bursts: &[f64]) {
+    let expression = bursts
+        .iter()
+        .map(|t| {
+            format!("between(t,{t},{t}+0.01)*sin(2*PI*2000*(t-{t}))*0.5*(1-cos(2*PI*(t-{t})/0.01))")
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    command(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("aevalsrc='{expression}':s=48000:d=4"),
+            "-c:a",
+            "pcm_s16le",
+            path.to_str().unwrap(),
+        ],
+    );
+}
+
+#[test]
+fn audio_lands_on_exact_samples_at_unit_and_clock_drift_speeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let bursts = [0.5, 1.5, 2.5, 3.5];
+    click_wav(&dir.path().join("clicks.wav"), &bursts);
+    // FFmpeg's atempo (WSOLA) put these bursts about 976 samples early, even at speed 1.
+    for (index, (source_in, speed)) in [(0.0, 1.0), (0.25, 1.0), (0.0, 1.0005), (0.1, 0.9995)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut specification = edit();
+        specification["video"] = json!([]);
+        specification["audio"] = json!([{"clips":[{"start":0,"source":"clicks.wav","source_in":source_in,"duration":3.5,"speed":speed}]}]);
+        let validated = timeline::validate(&build(&specification), dir.path()).unwrap();
+        let output = dir.path().join(format!("clicks-{index}.mp4"));
+        export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
+        let expected: Vec<f64> = bursts
+            .iter()
+            .map(|t| (t - source_in) / speed)
+            .filter(|t| (0.1..3.4).contains(t))
+            .collect();
+        let errors = burst_onsets(&output, &expected);
+        assert!(
+            errors.iter().all(|e| e.abs() <= 1),
+            "source_in={source_in} speed={speed}: sample errors {errors:?}"
+        );
+    }
+}
+
+/// Clip-audio edit of `clicks.wav` at `speed` covering 3.4 source seconds.
+fn click_edit(dir: &Path, speed: f64) -> timeline::ValidatedEdit {
+    let mut specification = edit();
+    specification["video"] = json!([]);
+    specification["audio"] =
+        json!([{"clips":[{"start":0,"source":"clicks.wav","duration":3.4 / speed,"speed":speed}]}]);
+    timeline::validate(&build(&specification), dir).unwrap()
+}
+
+/// Expected template start of a burst at source `t` played at `speed`: a
+/// pitch-preserving stretch keeps the burst's center on `center / speed`.
+fn stretched_start(t: f64, speed: f64) -> f64 {
+    (t + 0.005) / speed - 0.005
+}
+
+#[test]
+fn creative_speeds_land_within_a_few_ms_with_rubberband() {
+    if !skywrite::stretch::rubberband_available().unwrap() {
+        eprintln!(
+            "skipping creative_speeds_land_within_a_few_ms_with_rubberband: this FFmpeg has no rubberband filter"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bursts = [0.5, 1.5, 2.5];
+    click_wav(&dir.path().join("clicks.wav"), &bursts);
+    // Uncompensated, FFmpeg 8.0.1's rubberband (short window) put these 14.7 ms
+    // early at 0.5 and 6.1 ms late at 2.0; atempo 3-36 ms early. 4.0 chains 2x stages.
+    for speed in [0.5, 1.25, 2.0, 4.0] {
+        let validated = click_edit(dir.path(), speed);
+        let output = dir.path().join(format!("rb-{speed}.mp4"));
+        let report =
+            export::render(&validated, &output, false, StretcherChoice::Rubberband).unwrap();
+        assert_eq!(report["audio_stretcher"]["stretcher"], json!("rubberband"));
+        assert_eq!(
+            report["audio_stretcher"]["calibrations"][0]["speed"],
+            json!(speed)
+        );
+        let expected: Vec<f64> = bursts.iter().map(|t| stretched_start(*t, speed)).collect();
+        let errors = burst_onsets(&output, &expected);
+        assert!(
+            errors.iter().all(|e| e.abs() <= 192),
+            "speed={speed}: sample errors {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn ffmpeg_script_uses_and_names_the_resolved_stretcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let bursts = [0.5, 1.5, 2.5];
+    click_wav(&dir.path().join("clicks.wav"), &bursts);
+    let options = |stretcher| export::ExportOptions {
+        media_root: None,
+        stretcher: Some(stretcher),
+    };
+    let unit = click_edit(dir.path(), 1.0);
+    let script = dir.path().join("unit.py");
+    let report = export::export_with(
+        &unit,
+        "ffmpeg",
+        &script,
+        false,
+        &options(StretcherChoice::Rubberband),
+    )
+    .unwrap();
+    assert_eq!(report["audio_stretcher"]["stretcher"], Value::Null);
+    let text = fs::read_to_string(&script).unwrap();
+    assert!(text.contains("# Audio time-stretcher: none ("), "{text}");
+
+    let fast = click_edit(dir.path(), 1.25);
+    let script = dir.path().join("atempo.py");
+    export::export_with(
+        &fast,
+        "ffmpeg",
+        &script,
+        false,
+        &options(StretcherChoice::Atempo),
+    )
+    .unwrap();
+    let text = fs::read_to_string(&script).unwrap();
+    assert!(
+        text.contains("# Audio time-stretcher: atempo (requested atempo)"),
+        "{text}"
+    );
+    assert!(text.contains("atempo=1.25") && !text.contains("rubberband="));
+
+    let error = export::export_with(
+        &fast,
+        "fcpxml",
+        &dir.path().join("cut.fcpxml"),
+        false,
+        &options(StretcherChoice::Atempo),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("--stretcher applies only to --to ffmpeg"),
+        "{error}"
+    );
+
+    if !skywrite::stretch::rubberband_available().unwrap() {
+        eprintln!(
+            "skipping the rubberband half of ffmpeg_script_uses_and_names_the_resolved_stretcher: this FFmpeg has no rubberband filter"
+        );
+        return;
+    }
+    let script = dir.path().join("rubberband.py");
+    let report = export::export_with(
+        &fast,
+        "ffmpeg",
+        &script,
+        false,
+        &options(StretcherChoice::Auto),
+    )
+    .unwrap();
+    assert_eq!(report["audio_stretcher"]["stretcher"], json!("rubberband"));
+    let text = fs::read_to_string(&script).unwrap();
+    assert!(text.contains("# Audio time-stretcher: rubberband (window=short:channels=together); latency compensation measured"), "{text}");
+    assert!(text.contains("rubberband=tempo=1.250000000000") && !text.contains("atempo="));
+    let output = dir.path().join("script.mp4");
+    let run = command(
+        "python3",
+        &[
+            script.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let expected: Vec<f64> = bursts.iter().map(|t| stretched_start(*t, 1.25)).collect();
+    let errors = burst_onsets(&output, &expected);
+    assert!(
+        errors.iter().all(|e| e.abs() <= 192),
+        "sample errors {errors:?}"
+    );
 }

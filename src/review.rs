@@ -451,6 +451,7 @@ fn cuts(args: &CutsArgs) -> Result<Value> {
     std::fs::create_dir(&args.output_dir)
         .context("--output-dir must be a new directory (existing directories are never reused)")?;
     let dir = args.output_dir.canonicalize()?;
+    let mut audio_stretcher = Value::Null;
     let (render, _temporary) = match &args.render {
         Some(path) => {
             let info = media::probe(path)?;
@@ -469,7 +470,8 @@ fn cuts(args: &CutsArgs) -> Result<Value> {
                 .tempfile_in(&dir)?;
             let cleanup = process::CleanupGuard::new(temp.path())?;
             let path = temp.path().to_owned();
-            export::render(&edit, &path, true)?;
+            let report = export::render(&edit, &path, true, crate::stretch::StretcherChoice::Auto)?;
+            audio_stretcher = report["audio_stretcher"].clone();
             (path, Some((temp, cleanup)))
         }
     };
@@ -523,6 +525,7 @@ fn cuts(args: &CutsArgs) -> Result<Value> {
         "output_dir": dir,
         "cut_count": clips.len(),
         "cuts": clips,
+        "audio_stretcher": audio_stretcher,
         "note": "Each clip plays the rendered edit around one cut. Watch and listen for clipped words, stumbles, repeated phrases, sound cut off mid-flow (applause, music tails), jump cuts and sync. Skywrite cannot judge delivery or emotional fit; that review is yours.",
     }))
 }

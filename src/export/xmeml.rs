@@ -4,7 +4,10 @@
 //! own layer. Speed, opacity, fades and gain envelopes are written as the
 //! standard Time Remap, Opacity and Audio Levels effects. Timing uses whole
 //! frames at the sequence rate, so subframe source in points are rounded.
-use super::xml;
+use super::{
+    media_url::{MediaUrls, Style},
+    xml,
+};
 use crate::timeline::{
     Keyframe, MediaKind, Rational, ValidatedEdit, ValidatedMix, ValidatedVideoClip,
 };
@@ -49,19 +52,13 @@ fn rate_xml(rate: &Rate) -> String {
     )
 }
 
-fn path_url(path: &Path) -> Result<String> {
-    let url = url::Url::from_file_path(path)
-        .map_err(|_| anyhow::anyhow!("cannot make file URL for {}", path.display()))?;
-    // Premiere writes and expects the explicit localhost authority.
-    Ok(url.as_str().replacen("file://", "file://localhost", 1))
-}
-
 fn name(path: &Path) -> String {
     xml(path.file_name().and_then(|v| v.to_str()).unwrap_or("Media"))
 }
 
 struct Files<'a> {
     ids: HashMap<&'a Path, usize>,
+    urls: &'a MediaUrls,
 }
 impl<'a> Files<'a> {
     /// First use carries the full definition; later uses reference its id.
@@ -100,7 +97,7 @@ impl<'a> Files<'a> {
         Ok(format!(
             "<file id=\"file-{id}\"><name>{}</name><pathurl>{}</pathurl>{}<duration>{frames}</duration><timecode>{}<string>00:00:00:00</string><frame>0</frame><displayformat>NDF</displayformat></timecode><media>{media}</media></file>",
             name(path),
-            xml(&path_url(path)?),
+            xml(self.urls.get(path, Style::Premiere)),
             rate_xml(rate),
             rate_xml(rate)
         ))
@@ -190,98 +187,238 @@ fn levels(mix: &ValidatedMix, fps: Rational, in_frame: u64, duration: f64) -> St
     )
 }
 
-struct Item {
-    id: String,
-    track: usize,
-    clip_index: usize,
-    video: bool,
+/// One sound use on the timeline, before it is split into channel clipitems.
+struct Sound<'a> {
+    source: &'a Path,
+    media: &'a crate::media::MediaInfo,
+    timing: String,
+    speed: f64,
+    levels: String,
+    /// The video clipitem this sound is linked to: (id, track, clip index).
+    video: Option<(usize, usize, usize)>,
 }
 
-fn link(item: &Item) -> String {
+/// A run of xmeml audio tracks for one timeline layer: an exploded stereo
+/// pair (one track per channel) or a single mono track.
+struct Layer<'a> {
+    stereo: bool,
+    sounds: Vec<Sound<'a>>,
+    /// The first xmeml audio track number and the first clipitem id.
+    first_track: usize,
+    first_id: usize,
+}
+
+impl Layer<'_> {
+    fn channels(&self) -> usize {
+        if self.stereo { 2 } else { 1 }
+    }
+    fn id(&self, sound: usize, channel: usize) -> usize {
+        self.first_id + channel * self.sounds.len() + sound
+    }
+}
+
+fn channels(info: &crate::media::MediaInfo) -> u32 {
+    info.audio().and_then(|a| a.channels).unwrap_or(2)
+}
+
+/// Splits one timeline layer into a stereo pair and a mono track as needed.
+/// Premiere reads a clip's channels from its exploded track, so a pair holds
+/// only stereo (or wider) sources and a mono track only mono ones.
+fn split<'a>(sounds: Vec<Sound<'a>>, layers: &mut Vec<Layer<'a>>, mixed: &mut bool) {
+    let (stereo, mono): (Vec<_>, Vec<_>) = sounds.into_iter().partition(|s| channels(s.media) >= 2);
+    *mixed |= !stereo.is_empty() && !mono.is_empty();
+    if !stereo.is_empty() || mono.is_empty() {
+        layers.push(Layer {
+            stereo: true,
+            sounds: stereo,
+            first_track: 0,
+            first_id: 0,
+        });
+    }
+    if !mono.is_empty() {
+        layers.push(Layer {
+            stereo: false,
+            sounds: mono,
+            first_track: 0,
+            first_id: 0,
+        });
+    }
+}
+
+fn link(id: usize, media: &str, track: usize, clip_index: usize) -> String {
     format!(
-        "<link><linkclipref>{}</linkclipref><mediatype>{}</mediatype><trackindex>{}</trackindex><clipindex>{}</clipindex>{}</link>",
-        item.id,
-        if item.video { "video" } else { "audio" },
-        item.track,
-        item.clip_index,
-        if item.video {
-            ""
-        } else {
+        "<link><linkclipref>clipitem-{id}</linkclipref><mediatype>{media}</mediatype><trackindex>{track}</trackindex><clipindex>{clip_index}</clipindex>{}</link>",
+        if media == "audio" {
             "<groupindex>1</groupindex>"
+        } else {
+            ""
         }
     )
 }
 
+/// Every member of a link group lists the whole group: the video clipitem (if
+/// any) and one clipitem per channel. A lone clipitem carries no links.
+fn links(layer: &Layer<'_>, index: usize) -> String {
+    let sound = &layer.sounds[index];
+    let mut out = String::new();
+    if let Some((id, track, clip_index)) = sound.video {
+        out.push_str(&link(id, "video", track, clip_index));
+    }
+    for channel in 0..layer.channels() {
+        out.push_str(&link(
+            layer.id(index, channel),
+            "audio",
+            layer.first_track + channel,
+            index + 1,
+        ));
+    }
+    if sound.video.is_none() && layer.channels() == 1 {
+        return String::new();
+    }
+    out
+}
+
+const OUTPUTS: &str = "<outputs><group><index>1</index><numchannels>1</numchannels><downmix>0</downmix><channel><index>1</index></channel></group><group><index>2</index><numchannels>1</numchannels><downmix>0</downmix><channel><index>2</index></channel></group></outputs>";
+
 /// Returns XML plus notes about rounding and unverified mappings.
-pub(super) fn compile(edit: &ValidatedEdit) -> Result<(String, Vec<String>)> {
+///
+/// Audio follows the structure Premiere itself exports (`explodedTracks`):
+/// each stereo layer is a pair of tracks with `currentExplodedTrackIndex` 0
+/// and 1, `totalExplodedTrackCount` 2 and `outputchannelindex` 1 and 2, and
+/// each sound is one clipitem per channel (`sourcetrack` 1 and 2) linked in a
+/// group with its video. A single stereo clipitem on an unexploded track is
+/// what Premiere silently dropped.
+pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<(String, Vec<String>)> {
     let fps = edit.fps;
     let rate = rate(fps)?;
+    let rate_tag = rate_xml(&rate);
     let mut notes = Vec::new();
     let mut files = Files {
         ids: HashMap::new(),
-    };
-    let mut next_id = 0usize;
-    let mut new_id = || {
-        next_id += 1;
-        format!("clipitem-{next_id}")
+        urls,
     };
     let mut subframe = false;
     let mut retimed = false;
-    let mut video_tracks = Vec::new();
-    let mut linked_tracks = Vec::new();
+    let mut mixed = false;
+    let mut wide = false;
+
+    // Plan: number video clipitems, gather sound per layer.
+    let mut next_id = 0usize;
+    let mut video_ids = Vec::new();
+    let mut layers: Vec<Layer<'_>> = Vec::new();
+    let item_timing = |in_frame: u64, item_duration: u64, start: u64, end: u64, out: u64| {
+        format!(
+            "<duration>{item_duration}</duration>{rate_tag}<start>{start}</start><end>{end}</end><in>{in_frame}</in><out>{out}</out>"
+        )
+    };
+    let source_frames = |source_in: f64, speed: f64, subframe: &mut bool| {
+        let exact = source_in * fps.value() / speed;
+        *subframe |= (exact - exact.round()).abs() > 1e-6;
+        exact.round() as u64
+    };
     for (t, track) in edit.video_tracks().iter().enumerate() {
-        let mut video_xml = String::new();
-        let mut audio_xml = String::new();
-        let audio_track_number = linked_tracks.len() + 1;
-        let mut audio_index = 0usize;
+        let mut ids = Vec::new();
+        let mut sounds = Vec::new();
         for (k, clip) in track.clips.iter().enumerate() {
-            let duration = fps.seconds(clip.duration_frames);
+            next_id += 1;
+            ids.push(next_id);
+            if clip.kind == MediaKind::Image || !clip.has_audible_sound() {
+                continue;
+            }
+            let in_frame = source_frames(clip.source_in, clip.speed, &mut subframe);
+            sounds.push(Sound {
+                source: &clip.source,
+                media: &clip.media,
+                timing: item_timing(
+                    in_frame,
+                    (fps.frames(clip.media.duration) as f64 / clip.speed).round() as u64,
+                    clip.start_frames,
+                    clip.end_frames(),
+                    in_frame + clip.duration_frames,
+                ),
+                speed: clip.speed,
+                levels: levels(
+                    &clip.audio,
+                    fps,
+                    in_frame,
+                    fps.seconds(clip.duration_frames),
+                ),
+                video: Some((next_id, t + 1, k + 1)),
+            });
+        }
+        video_ids.push(ids);
+        if !sounds.is_empty() {
+            split(sounds, &mut layers, &mut mixed);
+        }
+    }
+    for track in edit.audio_tracks() {
+        let mut sounds = Vec::new();
+        for clip in track.clips.iter().filter(|c| c.mix.audible()) {
+            let in_frame = source_frames(clip.source_in, clip.speed, &mut subframe);
+            sounds.push(Sound {
+                source: &clip.source,
+                media: &clip.media,
+                timing: item_timing(
+                    in_frame,
+                    (fps.frames(clip.media.duration) as f64 / clip.speed).round() as u64,
+                    clip.start_frames,
+                    clip.end_frames(),
+                    in_frame + clip.duration_frames,
+                ),
+                speed: clip.speed,
+                levels: levels(&clip.mix, fps, in_frame, fps.seconds(clip.duration_frames)),
+                video: None,
+            });
+        }
+        split(sounds, &mut layers, &mut mixed);
+    }
+    let mut track_number = 1;
+    for layer in &mut layers {
+        layer.first_track = track_number;
+        layer.first_id = next_id + 1;
+        track_number += layer.channels();
+        next_id += layer.channels() * layer.sounds.len();
+    }
+    // Sound per video clipitem, to write the group from the video side.
+    let mut video_links = HashMap::<usize, String>::new();
+    for layer in &layers {
+        for (index, sound) in layer.sounds.iter().enumerate() {
+            if let Some((id, _, _)) = sound.video {
+                video_links.insert(id, links(layer, index));
+            }
+        }
+    }
+
+    // Write in document order, so each file's full definition comes first.
+    let mut video_tracks = String::new();
+    for (t, track) in edit.video_tracks().iter().enumerate() {
+        let mut items = String::new();
+        for (k, clip) in track.clips.iter().enumerate() {
+            let id = video_ids[t][k];
             let (in_frame, item_duration) = if clip.kind == MediaKind::Image {
                 (0, clip.duration_frames)
             } else {
-                let exact = clip.source_in * fps.value() / clip.speed;
-                subframe |= (exact - exact.round()).abs() > 1e-6;
                 retimed |= clip.speed != 1.0;
                 (
-                    exact.round() as u64,
+                    source_frames(clip.source_in, clip.speed, &mut subframe),
                     (fps.frames(clip.media.duration) as f64 / clip.speed).round() as u64,
                 )
             };
-            let out_frame = in_frame + clip.duration_frames;
-            let video_item = Item {
-                id: new_id(),
-                track: t + 1,
-                clip_index: k + 1,
-                video: true,
-            };
-            let audio_item = clip.has_audible_sound().then(|| {
-                audio_index += 1;
-                Item {
-                    id: new_id(),
-                    track: audio_track_number,
-                    clip_index: audio_index,
-                    video: false,
-                }
-            });
             // A still's file is as long as the whole sequence, so every use of
             // it (including a later, longer one) fits inside the file.
             let still = (clip.kind == MediaKind::Image).then_some(edit.duration_frames);
             let file = files.element(&clip.source, &clip.media, still, fps, &rate)?;
-            let timing = format!(
-                "<duration>{item_duration}</duration>{}<start>{}</start><end>{}</end><in>{in_frame}</in><out>{out_frame}</out>",
-                rate_xml(&rate),
-                clip.start_frames,
-                clip.end_frames()
-            );
-            let mut links = link(&video_item);
-            if let Some(audio) = &audio_item {
-                links.push_str(&link(audio));
-            }
             write!(
-                video_xml,
-                "<clipitem id=\"{}\"><name>{}</name><enabled>TRUE</enabled>{timing}{}{file}{}{}{links}</clipitem>",
-                video_item.id,
+                items,
+                "<clipitem id=\"clipitem-{id}\"><name>{}</name><enabled>TRUE</enabled>{}{}{file}{}{}{}</clipitem>",
                 name(&clip.source),
+                item_timing(
+                    in_frame,
+                    item_duration,
+                    clip.start_frames,
+                    clip.end_frames(),
+                    in_frame + clip.duration_frames
+                ),
                 if clip.kind == MediaKind::Image {
                     "<stillframe>TRUE</stillframe>"
                 } else {
@@ -293,79 +430,65 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<(String, Vec<String>)> {
                     String::new()
                 },
                 opacity(clip, fps, in_frame),
+                video_links.get(&id).map(String::as_str).unwrap_or_default(),
             )?;
-            if let Some(audio) = &audio_item {
+        }
+        write!(
+            video_tracks,
+            "<track>{items}<enabled>TRUE</enabled><locked>FALSE</locked></track>"
+        )?;
+    }
+    let mut audio_tracks = String::new();
+    for layer in &layers {
+        let total = layer.channels();
+        for channel in 0..total {
+            let mut items = String::new();
+            for (index, sound) in layer.sounds.iter().enumerate() {
+                retimed |= sound.speed != 1.0;
+                wide |= channels(sound.media) > 2;
+                let file = files.element(sound.source, sound.media, None, fps, &rate)?;
                 write!(
-                    audio_xml,
-                    "<clipitem id=\"{}\" premiereChannelType=\"{}\"><name>{}</name><enabled>TRUE</enabled>{timing}<file id=\"file-{}\"/><sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex></sourcetrack>{}{}{links}</clipitem>",
-                    audio.id,
-                    channel_type(&clip.media),
-                    name(&clip.source),
-                    files.ids[clip.source.as_path()],
-                    if clip.speed != 1.0 {
-                        time_remap(clip.speed, "audio")
+                    items,
+                    "<clipitem id=\"clipitem-{}\" premiereChannelType=\"{}\"><name>{}</name><enabled>TRUE</enabled>{}{file}<sourcetrack><mediatype>audio</mediatype><trackindex>{}</trackindex></sourcetrack>{}{}{}</clipitem>",
+                    layer.id(index, channel),
+                    if layer.stereo { "stereo" } else { "mono" },
+                    name(sound.source),
+                    sound.timing,
+                    channel + 1,
+                    if sound.speed != 1.0 {
+                        time_remap(sound.speed, "audio")
                     } else {
                         String::new()
                     },
-                    levels(&clip.audio, fps, in_frame, duration),
+                    sound.levels,
+                    links(layer, index),
+                )?;
+            }
+            if layer.stereo {
+                write!(
+                    audio_tracks,
+                    "<track currentExplodedTrackIndex=\"{channel}\" totalExplodedTrackCount=\"2\" premiereTrackType=\"Stereo\">{items}<enabled>TRUE</enabled><locked>FALSE</locked><outputchannelindex>{}</outputchannelindex></track>",
+                    channel + 1
+                )?;
+            } else {
+                write!(
+                    audio_tracks,
+                    "<track currentExplodedTrackIndex=\"0\" totalExplodedTrackCount=\"1\" premiereTrackType=\"Mono\">{items}<enabled>TRUE</enabled><locked>FALSE</locked></track>"
                 )?;
             }
         }
-        video_tracks.push(format!(
-            "<track>{video_xml}<enabled>TRUE</enabled><locked>FALSE</locked></track>"
-        ));
-        if audio_index > 0 {
-            linked_tracks.push(format!(
-                "<track premiereTrackType=\"Stereo\">{audio_xml}<enabled>TRUE</enabled><locked>FALSE</locked></track>"
-            ));
-        }
-    }
-    let mut audio_tracks = linked_tracks;
-    for track in edit.audio_tracks() {
-        let mut audio_xml = String::new();
-        let track_number = audio_tracks.len() + 1;
-        for (position, clip) in track.clips.iter().filter(|c| c.mix.audible()).enumerate() {
-            let duration = fps.seconds(clip.duration_frames);
-            let exact = clip.source_in * fps.value() / clip.speed;
-            subframe |= (exact - exact.round()).abs() > 1e-6;
-            retimed |= clip.speed != 1.0;
-            let in_frame = exact.round() as u64;
-            let item = Item {
-                id: new_id(),
-                track: track_number,
-                clip_index: position + 1,
-                video: false,
-            };
-            let file = files.element(&clip.source, &clip.media, None, fps, &rate)?;
-            write!(
-                audio_xml,
-                "<clipitem id=\"{}\" premiereChannelType=\"{}\"><name>{}</name><enabled>TRUE</enabled><duration>{}</duration>{}<start>{}</start><end>{}</end><in>{in_frame}</in><out>{}</out>{file}<sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex></sourcetrack>{}{}{}</clipitem>",
-                item.id,
-                channel_type(&clip.media),
-                name(&clip.source),
-                (fps.frames(clip.media.duration) as f64 / clip.speed).round() as u64,
-                rate_xml(&rate),
-                clip.start_frames,
-                clip.end_frames(),
-                in_frame + clip.duration_frames,
-                if clip.speed != 1.0 {
-                    time_remap(clip.speed, "audio")
-                } else {
-                    String::new()
-                },
-                levels(&clip.mix, fps, in_frame, duration),
-                link(&item),
-            )?;
-        }
-        audio_tracks.push(format!(
-            "<track premiereTrackType=\"Stereo\">{audio_xml}<enabled>TRUE</enabled><locked>FALSE</locked></track>"
-        ));
     }
     if subframe {
         notes.push("Premiere XML uses whole frames: subframe source in points (word-precise cuts) were rounded to the nearest frame. Listen to dialogue cuts after import.".into());
     }
     if retimed {
         notes.push("Retimed clips use the Time Remap speed effect with in/out points in retimed frames; check speed and sync after Premiere import.".into());
+    }
+    if mixed {
+        notes.push("A track mixed mono and stereo sources; Premiere tracks hold one channel layout, so its mono clips were written to a separate mono audio track below its stereo pair.".into());
+    }
+    if wide {
+        notes.push("Sources with more than two audio channels are written as stereo from their first two channels; assign other channels in Premiere (Modify > Audio Channels).".into());
     }
     notes.push("Premiere import of this XML has not been verified by Skywrite. Please record the result with skywrite nit, including any import errors or timing differences.".into());
     let markers: String = edit
@@ -380,23 +503,14 @@ pub(super) fn compile(edit: &ValidatedEdit) -> Result<(String, Vec<String>)> {
         })
         .collect();
     let out = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"5\"><sequence id=\"sequence-1\"><name>{name}</name><duration>{duration}</duration>{rate}<timecode>{rate}<string>00:00:00:00</string><frame>0</frame><displayformat>NDF</displayformat></timecode><media><video><format><samplecharacteristics>{rate}<width>{width}</width><height>{height}</height><anamorphic>FALSE</anamorphic><pixelaspectratio>square</pixelaspectratio><fielddominance>none</fielddominance></samplecharacteristics></format>{video}</video><audio><numOutputChannels>2</numOutputChannels><format><samplecharacteristics><depth>16</depth><samplerate>48000</samplerate></samplecharacteristics></format>{audio}</audio></media>{markers}</sequence></xmeml>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"5\"><sequence id=\"sequence-1\" explodedTracks=\"true\"><name>{name}</name><duration>{duration}</duration>{rate}<timecode>{rate}<string>00:00:00:00</string><frame>0</frame><displayformat>NDF</displayformat></timecode><media><video><format><samplecharacteristics>{rate}<width>{width}</width><height>{height}</height><anamorphic>FALSE</anamorphic><pixelaspectratio>square</pixelaspectratio><fielddominance>none</fielddominance></samplecharacteristics></format>{video_tracks}</video><audio><numOutputChannels>2</numOutputChannels><format><samplecharacteristics><depth>16</depth><samplerate>48000</samplerate></samplecharacteristics></format>{OUTPUTS}{audio_tracks}</audio></media>{markers}</sequence></xmeml>\n",
         name = xml(&edit.name),
         duration = edit.duration_frames,
-        rate = rate_xml(&rate),
+        rate = rate_tag,
         width = edit.width,
         height = edit.height,
-        video = video_tracks.join(""),
-        audio = audio_tracks.join(""),
     );
     Ok((out, notes))
-}
-
-fn channel_type(info: &crate::media::MediaInfo) -> &'static str {
-    match info.audio().and_then(|a| a.channels) {
-        Some(1) => "mono",
-        _ => "stereo",
-    }
 }
 
 #[cfg(test)]
@@ -419,12 +533,5 @@ mod tests {
         .unwrap();
         assert_eq!((r.timebase, r.ntsc), (60, true));
         assert!(rate(Rational { num: 25, den: 2 }).is_err());
-    }
-    #[test]
-    fn localhost_urls() {
-        assert_eq!(
-            path_url(Path::new("/tmp/a b.mp4")).unwrap(),
-            "file://localhost/tmp/a%20b.mp4"
-        );
     }
 }

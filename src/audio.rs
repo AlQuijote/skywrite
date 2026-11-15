@@ -15,7 +15,7 @@ const MAX_LOOPS: usize = 128;
 pub enum AudioCommand {
     /// Normalize integrated loudness (default -18 LUFS), or sample peak only.
     Normalize(FinishArgs),
-    /// Change speed while preserving pitch; requires --tempo.
+    /// Change speed, preserving pitch beyond 0.1% (smaller changes resample); requires --tempo.
     Tempo(FinishArgs),
     /// Repeat a music selection with crossfades to --duration.
     Loop(FinishArgs),
@@ -37,9 +37,15 @@ pub struct FinishArgs {
     /// Source selection length before tempo; defaults to remaining decoded samples.
     #[arg(long)]
     pub length: Option<f64>,
-    /// Pitch-preserving speed multiplier, 0.25 through 4.
+    /// Pitch-preserving speed multiplier, 0.25 through 4. Within 0.1% of 1 it
+    /// resamples sample-exactly; beyond that it time-stretches (see --stretcher).
     #[arg(long)]
     pub tempo: Option<f64>,
+    /// Time-stretcher for --tempo beyond 0.1%: auto uses rubberband when this
+    /// FFmpeg has it (latency-compensated, within about 6 ms (8 ms at 0.125x)), else atempo with a
+    /// warning (3-36 ms early at 0.5-2x, up to about 60 ms below 0.5x); rubberband fails if it is missing.
+    #[arg(long, value_enum, default_value_t = crate::stretch::StretcherChoice::Auto)]
+    pub stretcher: crate::stretch::StretcherChoice,
     /// Integrated loudness target, -50 through -5 LUFS; two-pass loudnorm.
     #[arg(long, allow_hyphen_values = true)]
     pub lufs: Option<f64>,
@@ -162,19 +168,6 @@ fn checked_timing(path: &Path) -> Result<crate::media::AudioTiming> {
         bail!("audio finishing input/output exceeds one hour of decoded audio");
     }
     Ok(timing)
-}
-fn tempo_filter(mut speed: f64) -> String {
-    let mut filters = Vec::new();
-    while speed < 0.5 {
-        filters.push("atempo=0.5".to_owned());
-        speed /= 0.5;
-    }
-    while speed > 2.0 {
-        filters.push("atempo=2".to_owned());
-        speed /= 2.0;
-    }
-    filters.push(format!("atempo={speed:.12}"));
-    filters.join(",")
 }
 fn loudness_stats(
     path: &Path,
@@ -334,9 +327,10 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
         "asetpts=N/SR/TB,aresample={RATE},atrim=start_sample={start_samples}:end_sample={},asetpts=N/SR/TB",
         start_samples + selection_samples
     );
+    let speed_filters = crate::stretch::SpeedFilters::resolve(options.stretcher, options.tempo)?;
     if let Some(speed) = options.tempo {
         filter.push(',');
-        filter.push_str(&tempo_filter(speed));
+        filter.push_str(&speed_filters.filter(speed, selection_samples)?);
     }
     filter_file(&source, &prepared, &filter, deadline)?;
     let prepared_timing = checked_timing(&prepared)?;
@@ -564,7 +558,7 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
     }
     drop(publication_cleanup);
     Ok(
-        json!({"version":1,"operation":operation,"output":options.output,"format":extension,"codec":codec,"sample_rate":RATE,"channels":2,"source":source,"source_sha256":source_timing.source_sha256,"source_timing":source_timing,"source_selection":{"time_basis":"seconds from first decoded audio sample; output rebased to zero","container_start_seconds":source_info.start_time,"audio_stream_start_seconds":source_info.audio().and_then(|s|s.start_time),"requested_start_seconds":options.start,"start_samples_48000":start_samples,"length_samples_48000":selection_samples,"tempo":options.tempo.unwrap_or(1.0)},"normalization":normalization,"loop_repetitions":repetitions,"crossfade_samples":crossfade_samples,"sidechain":options.sidechain,"sidechain_timing":side_timing,"requested_duration_seconds":options.duration,"rounded_target_samples":target_samples,"actual_duration_seconds":output_timing.decoded_duration_seconds,"rounding":"nearest sample at 48000 Hz; exact decoded sample count checked","output_timing":output_timing,"full_output_decode_executed":true,"note":"Normalization precedes loops, ducking and fades; these can change final loudness. Duck output contains the music only."}),
+        json!({"version":1,"operation":operation,"output":options.output,"format":extension,"codec":codec,"sample_rate":RATE,"channels":2,"source":source,"source_sha256":source_timing.source_sha256,"source_timing":source_timing,"source_selection":{"time_basis":"seconds from first decoded audio sample; output rebased to zero","container_start_seconds":source_info.start_time,"audio_stream_start_seconds":source_info.audio().and_then(|s|s.start_time),"requested_start_seconds":options.start,"start_samples_48000":start_samples,"length_samples_48000":selection_samples,"tempo":options.tempo.unwrap_or(1.0)},"audio_stretcher":speed_filters.report(),"warnings":speed_filters.warnings,"normalization":normalization,"loop_repetitions":repetitions,"crossfade_samples":crossfade_samples,"sidechain":options.sidechain,"sidechain_timing":side_timing,"requested_duration_seconds":options.duration,"rounded_target_samples":target_samples,"actual_duration_seconds":output_timing.decoded_duration_seconds,"rounding":"nearest sample at 48000 Hz; exact decoded sample count checked","output_timing":output_timing,"full_output_decode_executed":true,"note":"Normalization precedes loops, ducking and fades; these can change final loudness. Duck output contains the music only."}),
     )
 }
 

@@ -162,7 +162,13 @@ fn native_python_soft_tracks_chapters_mux_and_no_clobber() {
     let edit_file = fixture(d.path(), "soft");
     let edit = timeline::load_and_validate(&edit_file).unwrap();
     let native = d.path().join("native.mp4");
-    export::render(&edit, &native, false).unwrap();
+    export::render(
+        &edit,
+        &native,
+        false,
+        skywrite::stretch::StretcherChoice::Auto,
+    )
+    .unwrap();
     assert_metadata(&native);
     let script = d.path().join("render.py");
     export::export(&edit, "ffmpeg", &script, false).unwrap();
@@ -182,7 +188,15 @@ fn native_python_soft_tracks_chapters_mux_and_no_clobber() {
     assert!(captions::mux(&native, &edit, &native, true).is_err());
     for protected in [&edit_file, &d.path().join("cues.srt")] {
         let before = fs::read(protected).unwrap();
-        assert!(export::render(&edit, protected, true).is_err());
+        assert!(
+            export::render(
+                &edit,
+                protected,
+                true,
+                skywrite::stretch::StretcherChoice::Auto
+            )
+            .is_err()
+        );
         assert!(export::export(&edit, "ffmpeg", protected, true).is_err());
         let out = Command::new("python3")
             .args([
@@ -197,7 +211,15 @@ fn native_python_soft_tracks_chapters_mux_and_no_clobber() {
         assert_eq!(fs::read(protected).unwrap(), before);
     }
     let before = fs::read(&native).unwrap();
-    assert!(export::render(&edit, &native, false).is_err());
+    assert!(
+        export::render(
+            &edit,
+            &native,
+            false,
+            skywrite::stretch::StretcherChoice::Auto
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(native).unwrap(), before);
 }
 fn bright_pixels(path: &Path, time: &str) -> usize {
@@ -232,7 +254,13 @@ fn explicit_burn_changes_actual_pixels_in_native_and_python() {
     let file = fixture(d.path(), "burn");
     let edit = timeline::load_and_validate(&file).unwrap();
     let native = d.path().join("native.mp4");
-    export::render(&edit, &native, false).unwrap();
+    export::render(
+        &edit,
+        &native,
+        false,
+        skywrite::stretch::StretcherChoice::Auto,
+    )
+    .unwrap();
     let script = d.path().join("render.py");
     export::export(&edit, "ffmpeg", &script, false).unwrap();
     let python = d.path().join("python.mp4");
@@ -385,7 +413,15 @@ fn srt_vtt_transcript_mapping_and_consumed_aliases_are_protected() {
                     input.display()
                 );
             }
-            assert!(export::render(&edit, &input, true).is_err());
+            assert!(
+                export::render(
+                    &edit,
+                    &input,
+                    true,
+                    skywrite::stretch::StretcherChoice::Auto
+                )
+                .is_err()
+            );
             let out = Command::new("python3")
                 .args([
                     script.to_str().unwrap(),
@@ -458,7 +494,15 @@ fn failed_native_and_python_renders_preserve_previous_outputs_and_inputs() {
     fs::write(&output, b"previous completed output").unwrap();
     let edit_before = fs::read(&file).unwrap();
     let captions_before = fs::read(d.path().join("cues.srt")).unwrap();
-    assert!(export::render(&edit, &output, true).is_err());
+    assert!(
+        export::render(
+            &edit,
+            &output,
+            true,
+            skywrite::stretch::StretcherChoice::Auto
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(&output).unwrap(), b"previous completed output");
     let out = Command::new("python3")
         .args([
@@ -596,7 +640,13 @@ fn literal_caption_text_is_exact_or_rejected_before_publication() {
     .unwrap();
     let edit = timeline::load_and_validate(&file).unwrap();
     let native = d.path().join("native.mp4");
-    export::render(&edit, &native, false).unwrap();
+    export::render(
+        &edit,
+        &native,
+        false,
+        skywrite::stretch::StretcherChoice::Auto,
+    )
+    .unwrap();
     let script = d.path().join("render.py");
     export::export(&edit, "ffmpeg", &script, false).unwrap();
     let python = d.path().join("python.mp4");
@@ -686,7 +736,13 @@ fn literal_burn_keeps_two_lines_at_bottom_with_python_parity() {
     .unwrap();
     let edit = timeline::load_and_validate(&file).unwrap();
     let native = d.path().join("native.mp4");
-    export::render(&edit, &native, false).unwrap();
+    export::render(
+        &edit,
+        &native,
+        false,
+        skywrite::stretch::StretcherChoice::Auto,
+    )
+    .unwrap();
     let script = d.path().join("render.py");
     export::export(&edit, "ffmpeg", &script, false).unwrap();
     let python = d.path().join("python.mp4");

@@ -234,11 +234,16 @@ enum SyncMethod {
     Audio,
 }
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct SyncArgs {
-    #[arg(long)]
-    reference: PathBuf,
-    #[arg(long)]
-    asset: PathBuf,
+    #[command(subcommand)]
+    command: Option<SyncCommand>,
+    /// The file whose clock the timeline follows (normally the camera on V1).
+    #[arg(long, required = true)]
+    reference: Option<PathBuf>,
+    /// The file to place against it (normally the separate recorder).
+    #[arg(long, required = true)]
+    asset: Option<PathBuf>,
     #[arg(long,value_enum,default_value_t=SyncMethod::Auto)]
     method: SyncMethod,
     /// Maximum fractional clock-scale deviation (0.03 = +/-3%).
@@ -255,6 +260,13 @@ struct SyncArgs {
     max_audio_seconds: f64,
     #[command(flatten)]
     output: OutputOptions,
+}
+#[derive(Subcommand)]
+enum SyncCommand {
+    /// Place a sync result's asset into an edit against its reference clip(s):
+    /// frame-grid start, sub-frame source_in, drift speed, trimmed to the
+    /// overlap, reference sound muted. Refuses results that are not strong.
+    Apply(skywrite::sync_apply::ApplyArgs),
 }
 #[derive(Subcommand)]
 enum EditCommand {
@@ -291,6 +303,16 @@ enum EditCommand {
         output: PathBuf,
         #[arg(long)]
         overwrite: bool,
+        /// FCPXML/Premiere XML: write media URLs beneath this absolute folder on the
+        /// editing machine (for example /Users/me/Projects/film or D:\Projects\film),
+        /// keeping each file's path relative to the folder holding the edit and all
+        /// its media (reported as media_base). Default: this machine's absolute paths.
+        #[arg(long, value_name = "FOLDER")]
+        media_root: Option<String>,
+        /// --to ffmpeg only: time-stretcher baked into the script for clip speeds
+        /// beyond 0.1% (default auto; see edit render --stretcher).
+        #[arg(long, value_enum)]
+        stretcher: Option<skywrite::stretch::StretcherChoice>,
     },
     /// Render an H.264/AAC MP4 with FFmpeg, applying layers, fades, gain, LUTs and limiter.
     Render {
@@ -303,6 +325,12 @@ enum EditCommand {
         /// for a dialogue-only check render). Every audible track must declare a role.
         #[arg(long, value_enum, value_delimiter = ',')]
         roles: Vec<skywrite::timeline::Role>,
+        /// Time-stretcher for clip speeds beyond 0.1% (speed 1 and clock-drift
+        /// speeds are sample-exact either way). auto: rubberband when this FFmpeg
+        /// has it (latency-compensated, within about 6 ms (8 ms at 0.125x)), else atempo with a
+        /// warning (3-36 ms early at 0.5-2x, up to about 60 ms below 0.5x); rubberband: fail if it is missing.
+        #[arg(long, value_enum, default_value_t = skywrite::stretch::StretcherChoice::Auto)]
+        stretcher: skywrite::stretch::StretcherChoice,
     },
     /// Draft an edit from existing analyses and an editorial brief, then validate it.
     Suggest {
@@ -512,7 +540,7 @@ fn execute(command: Command) -> Result<Value> {
                 tools.insert(tool.to_owned(),match result {Ok(out)=>json!({"available":true,"version":String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("")}),Err(error)=>json!({"available":false,"reason":error.to_string()})});
             }
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":skywrite::image::TAKUMI_VERSION,"available":true}}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":skywrite::image::TAKUMI_VERSION,"available":true},"audio_stretcher":match skywrite::stretch::rubberband_available() {Ok(available)=>json!({"rubberband_available":available,"auto_uses":if available {"rubberband"} else {"atempo"}}),Err(error)=>json!({"rubberband_available":null,"reason":error.to_string()})}}),
             )
         }
         Command::Verify(args) => skywrite::verify::execute(args),
@@ -629,8 +657,14 @@ fn execute(command: Command) -> Result<Value> {
             finish(serde_json::to_value(result)?, &args.output)
         }
         Command::Sync(args) => {
+            if let Some(SyncCommand::Apply(apply)) = &args.command {
+                return skywrite::sync_apply::apply(apply);
+            }
+            let (Some(reference_path), Some(asset_path)) = (&args.reference, &args.asset) else {
+                bail!("sync needs --reference and --asset");
+            };
             preflight_output(&args.output)?;
-            protect_inputs(&args.output, &[args.reference.clone(), args.asset.clone()])?;
+            protect_inputs(&args.output, &[reference_path.clone(), asset_path.clone()])?;
             let options = skywrite::sync::SyncOptions {
                 max_scale_deviation: args.max_scale_deviation,
                 tolerance_seconds: args.tolerance_seconds,
@@ -642,23 +676,25 @@ fn execute(command: Command) -> Result<Value> {
                 SyncMethod::Transcript => true,
                 SyncMethod::Audio => false,
                 SyncMethod::Auto => {
-                    args.reference.extension().is_some_and(|e| e == "json")
-                        && args.asset.extension().is_some_and(|e| e == "json")
+                    reference_path.extension().is_some_and(|e| e == "json")
+                        && asset_path.extension().is_some_and(|e| e == "json")
                 }
             };
             let result = if transcripts {
-                let reference = skywrite::transcript::Transcript::load(&args.reference)?;
-                let asset = skywrite::transcript::Transcript::load(&args.asset)?;
-                protect_inputs(
-                    &args.output,
-                    &[
-                        relative_input(&args.reference, &reference.source),
-                        relative_input(&args.asset, &asset.source),
-                    ],
-                )?;
-                skywrite::sync::align_transcripts(&reference, &asset, &options)?
+                let reference = skywrite::transcript::Transcript::load(reference_path)?;
+                let asset = skywrite::transcript::Transcript::load(asset_path)?;
+                let media = [
+                    relative_input(reference_path, &reference.source),
+                    relative_input(asset_path, &asset.source),
+                ];
+                protect_inputs(&args.output, &media)?;
+                let mut result = skywrite::sync::align_transcripts(&reference, &asset, &options)?;
+                // Name the media (as found from here) so `sync apply` can match clips.
+                result.reference = media[0].canonicalize().unwrap_or_else(|_| media[0].clone());
+                result.asset = media[1].canonicalize().unwrap_or_else(|_| media[1].clone());
+                result
             } else {
-                skywrite::sync::align_audio(&args.reference, &args.asset, &options)?
+                skywrite::sync::align_audio(reference_path, asset_path, &options)?
             };
             finish(serde_json::to_value(result)?, &args.output)
         }
@@ -707,13 +743,19 @@ fn execute(command: Command) -> Result<Value> {
                 to,
                 output,
                 overwrite,
+                media_root,
+                stretcher,
             } => {
                 skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
-                skywrite::export::export(
+                skywrite::export::export_with(
                     &skywrite::timeline::load_and_validate(&file)?,
                     &to,
                     &output,
                     overwrite,
+                    &skywrite::export::ExportOptions {
+                        media_root,
+                        stretcher,
+                    },
                 )
             }
             EditCommand::Render {
@@ -721,13 +763,14 @@ fn execute(command: Command) -> Result<Value> {
                 output,
                 overwrite,
                 roles,
+                stretcher,
             } => {
                 skywrite::io::protect_inputs(&output, std::slice::from_ref(&file))?;
                 let mut edit = skywrite::timeline::load_and_validate(&file)?;
                 if !roles.is_empty() {
                     edit = edit.with_roles(&roles)?;
                 }
-                let mut result = skywrite::export::render(&edit, &output, overwrite)?;
+                let mut result = skywrite::export::render(&edit, &output, overwrite, stretcher)?;
                 if !roles.is_empty() {
                     result["roles"] = json!(roles);
                 }
@@ -986,7 +1029,7 @@ fn schema() -> Value {
             {"name":"Music","clips":[{"start":0,"source":"bed.mp3","duration":12,"volume":0.5,"volume_keyframes":[{"time":0,"volume":1},{"time":1,"volume":0.3},{"time":8.5,"volume":0.3},{"time":9.5,"volume":1}],"fade_out":2}]}],
         "master":{"limiter_db":-1}},
         "transcript_example":{"version":1,"source":"/absolute/path/camera.mp4","duration":20,"text":"Hello world","words":[{"text":"Hello","start":2.1,"end":2.4},{"text":"world","start":2.5,"end":2.8}]},
-        "sync_mapping":{"formula":"reference_time = offset_seconds + scale * asset_time","playback_rate":"1 / scale","timeline_speed":"Use playback_rate when placing asset on reference timeline; trim overlap explicitly."},
+        "sync_mapping":{"formula":"reference_time = offset_seconds + scale * asset_time (negative offset: the asset started first)","playback_rate":"1 / scale","timeline_speed":"The asset clip's speed is playback_rate times the reference clip's speed (playback_rate when the reference plays at speed 1)","placement":"Do not compute it: skywrite sync apply --sync RESULT --edit EDIT -o OUT --verify writes the asset clip(s) (frame-grid start, sub-frame source_in, speed = playback_rate x the reference clip's speed, trimmed to the overlap, one per segment of a discontinuous result) and mutes the reference clip. It refuses results that are not strong with drift_estimated; see skywrite skills read synchronization."},
         "notes":["JSON Schema is discovery guidance; edit validate also checks frame alignment, overlaps, source media bounds, LUT files and actual sources.",
             "Every clip has an explicit timeline start. Video track 0 is the bottom layer; empty regions are black and silent. Upper-track pictures composite over lower ones, and letterboxing is transparent.",
             "The rendered MP4 applies everything here. FCPXML/Premiere XML carry layers, speed, opacity, fades and gain; they warn about LUTs and the master limiter, which must be applied in the NLE.",

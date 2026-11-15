@@ -1166,16 +1166,16 @@ fn check_overlaps(
                 start >= previous_end,
                 "track {track}: clip {index} overlaps clip {previous_index}{}; put overlapping clips on separate tracks",
                 if previous_end - start == 1 {
-                    " by one frame (often rounding: compute each start from the previous clip's frame-rounded end)"
+                    " by one frame (to make them touch, set its start to the previous clip's start + duration)"
                 } else {
                     ""
                 }
             );
-            // Starts and durations round independently, so float times can
-            // leave a single black/silent frame between intended neighbors.
+            // Clips that touch in seconds share a frame (see `place`), so a
+            // one-frame gap means the times themselves leave a small space.
             if start - previous_end == 1 {
                 warnings.push(format!(
-                    "track {track}: one-frame gap between clip {previous_index} and clip {index}; if they should touch, set the start to the previous clip's frame-rounded end"
+                    "track {track}: one-frame gap between clip {previous_index} and clip {index}; if they should touch, set its start to the previous clip's start + duration"
                 ));
             }
         }
@@ -1184,6 +1184,10 @@ fn check_overlaps(
     Ok(())
 }
 
+/// Converts a clip's start and end to output frames once each and derives the
+/// duration from them, so clips written back to back in seconds share their
+/// boundary frame at any rate (23.976, 29.97, 59.94, ...) instead of rounding
+/// start and duration separately into a one-frame overlap or gap.
 fn place(
     fps: Rational,
     start: f64,
@@ -1201,8 +1205,16 @@ fn place(
             "{label} start rounded to output frame {start_frames}"
         ));
     }
-    let duration_frames = quantize(fps, duration, &format!("{label} duration"), warnings)?;
-    Ok((start_frames, duration_frames))
+    let end = start + duration;
+    let end_frames = fps.frames(end);
+    ensure!(
+        end_frames > start_frames,
+        "{label} duration rounds to zero output frames"
+    );
+    if (fps.seconds(end_frames) - end).abs() > 1e-7 {
+        warnings.push(format!("{label} end rounded to output frame {end_frames}"));
+    }
+    Ok((start_frames, end_frames - start_frames))
 }
 
 fn validate_fades(fade_in: f64, fade_out: f64, duration: f64, label: &str) -> Result<()> {
@@ -1424,9 +1436,10 @@ fn probe_cached(
     cache.insert(path.to_owned(), info.clone());
     Ok(info)
 }
-/// Nearest-frame rounding may lengthen a clip by up to half an output frame.
-/// That tail past the source end is accepted and padded by renderers (silence,
-/// held last picture); anything longer is a real out-of-range trim.
+/// Start and end each round to the nearest output frame, so a clip may run up
+/// to one output frame longer than its written duration. That tail past the
+/// source end is accepted and padded by renderers (silence, held last
+/// picture); anything longer is a real out-of-range trim.
 fn check_range(
     start: f64,
     duration: f64,
@@ -1440,7 +1453,7 @@ fn check_range(
         bail!("{label}: source does not have a known positive duration");
     }
     let end = start + duration * speed;
-    let rounding = fps.seconds(1) * speed / 2.0;
+    let rounding = fps.seconds(1) * speed;
     ensure!(
         end.is_finite() && end <= info.duration + rounding + 0.002,
         "{label}: source range ends at {end:.6}s, beyond {} duration {:.6}s",

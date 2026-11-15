@@ -59,9 +59,33 @@ impl SyncOptions {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncAnchor {
+    /// Index into `segments` whose mapping this anchor supports.
+    pub segment: usize,
     pub asset_time: f64,
     pub reference_time: f64,
     pub error_seconds: f64,
+}
+/// One continuous stretch of the asset with its own affine mapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncSegment {
+    /// Asset seconds this mapping applies to, in time order. Between
+    /// segments the asset is placed by neither mapping: sound with no
+    /// counterpart in the reference, plus a 0.3 s margin each side of a
+    /// boundary for its location uncertainty.
+    pub asset_range: [f64; 2],
+    pub offset_seconds: f64,
+    pub scale: f64,
+    pub playback_rate: f64,
+    pub drift_ppm: f64,
+    pub drift_estimated: bool,
+    pub quality: String,
+    pub inliers: usize,
+    pub anchor_span_seconds: f64,
+    pub asset_interval: [f64; 2],
+    pub reference_interval: [f64; 2],
+    pub median_error_seconds: f64,
+    pub p95_error_seconds: f64,
+    pub scale_uncertainty_ppm: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResult {
@@ -89,7 +113,17 @@ pub struct SyncResult {
     /// Residual-based diagnostic, not a statistical confidence interval.
     pub scale_uncertainty_ppm: Option<f64>,
     pub timing_resolution_seconds: f64,
+    /// `p95_error_seconds` must stay below this for `quality` "strong".
+    pub strong_p95_limit_seconds: f64,
+    /// True when one affine mapping does not hold for the whole take (a cut,
+    /// dropout or recorder restart): the top-level fields then describe only
+    /// the best-supported segment, `quality` is "limited", and `segments`
+    /// lists every mapping. Place segmented results with `skywrite sync apply`.
+    pub discontinuous: bool,
+    /// Every mapping in asset-time order (one entry when `discontinuous` is false).
+    pub segments: Vec<SyncSegment>,
     pub warnings: Vec<String>,
+    /// Matched anchors, evenly thinned to at most 64 (all segments together).
     pub anchors: Vec<SyncAnchor>,
 }
 #[derive(Debug, Clone)]
@@ -486,83 +520,172 @@ pub(crate) fn choose_fit(models: &[Fit]) -> Result<Fit> {
 pub(crate) fn fit_pairs(pairs: &[Pair], options: &SyncOptions) -> Result<Fit> {
     choose_fit(&fit_models(pairs, options)?)
 }
-pub(crate) fn result_from_fit(
-    fit: Fit,
-    candidate_count: usize,
+/// How precisely a sync method times its anchors.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Precision {
+    pub method: &'static str,
+    pub resolution_seconds: f64,
+    /// `p95_error_seconds` must stay below this for "strong"; 0 means never.
+    pub strong_p95_seconds: f64,
+}
+/// A fitted mapping and the asset seconds it applies to.
+pub(crate) struct SegmentFit {
+    pub fit: Fit,
+    pub asset_range: [f64; 2],
+}
+fn segment_from_fit(
+    fit: &Fit,
+    asset_range: [f64; 2],
     options: &SyncOptions,
-    reference: &Path,
-    asset: &Path,
-    method: &str,
-    resolution: f64,
-) -> Result<SyncResult> {
+    precision: Precision,
+    strong_limit: f64,
+) -> Result<SyncSegment> {
     ensure!(!fit.pairs.is_empty(), "no accepted sync anchors");
     let first = fit.pairs.first().unwrap();
     let last = fit.pairs.last().unwrap();
     let span = last.asset - first.asset;
     let drift_estimated =
         span >= options.min_span_seconds && fit.pairs.len() >= options.min_anchors;
-    let mut warnings = Vec::new();
     let (offset, scale) = if drift_estimated {
         (fit.offset, fit.scale)
     } else {
-        warnings.push("overlap too short to estimate drift; offset-only mapping is valid near the matched interval".into());
         let mut offsets: Vec<_> = fit.pairs.iter().map(|p| p.reference - p.asset).collect();
         offsets.sort_by(f64::total_cmp);
         (offsets[offsets.len() / 2], 1.0)
     };
+    // Least-squares and inversion leave float noise (scale 0.9999999999999998);
+    // report on grids far finer than any measurable timing.
+    let offset = grid(offset, 1e9);
+    let scale = grid(scale, 1e12);
     let mut residuals: Vec<_> = fit
         .pairs
         .iter()
-        .map(|p| (p.reference - offset - scale * p.asset).abs())
+        .map(|p| grid((p.reference - offset - scale * p.asset).abs(), 1e9))
         .collect();
     residuals.sort_by(f64::total_cmp);
     let median = residuals[residuals.len() / 2];
     let p95 = residuals[((residuals.len() - 1) as f64 * 0.95).ceil() as usize];
-    let uncertainty =
-        drift_estimated.then_some(p95.max(resolution) * 2.0 / span.max(1.0) * 1_000_000.0);
-    let quality =
-        if drift_estimated && fit.pairs.len() >= 16 && p95 < options.tolerance_seconds * 0.75 {
-            "strong"
-        } else {
-            "limited"
-        };
-    let step = fit.pairs.len().div_ceil(64);
-    let anchors = fit
-        .pairs
-        .iter()
-        .step_by(step)
-        .map(|p| SyncAnchor {
-            asset_time: p.asset,
-            reference_time: p.reference,
-            error_seconds: p.reference - offset - scale * p.asset,
-        })
-        .collect();
-    Ok(SyncResult {
-        version: 1,
-        method: method.into(),
-        reference: reference.into(),
-        asset: asset.into(),
-        mapping: "reference_time = offset_seconds + scale * asset_time".into(),
+    let uncertainty = drift_estimated
+        .then_some(p95.max(precision.resolution_seconds) * 2.0 / span.max(1.0) * 1_000_000.0);
+    let quality = if drift_estimated && fit.pairs.len() >= 16 && p95 < strong_limit {
+        "strong"
+    } else {
+        "limited"
+    };
+    Ok(SyncSegment {
+        asset_range,
         offset_seconds: offset,
         scale,
-        playback_rate: scale.recip(),
-        drift_ppm: (scale - 1.0) * 1_000_000.0,
+        playback_rate: grid(scale.recip(), 1e12),
+        drift_ppm: grid((scale - 1.0) * 1_000_000.0, 1e6),
         drift_estimated,
         quality: quality.into(),
-        candidate_matches: candidate_count,
         inliers: fit.pairs.len(),
-        inlier_ratio: fit.pairs.len() as f64 / candidate_count.max(1) as f64,
         anchor_span_seconds: span,
         asset_interval: [first.asset, last.asset],
         reference_interval: [first.reference, last.reference],
         median_error_seconds: median,
         p95_error_seconds: p95,
         scale_uncertainty_ppm: uncertainty,
-        timing_resolution_seconds: resolution,
+    })
+}
+/// Build a result from segments in asset-time order; `primary` (the
+/// best-supported segment) fills the top-level fields.
+pub(crate) fn result_from_segments(
+    segments: &[SegmentFit],
+    primary: usize,
+    candidate_count: usize,
+    options: &SyncOptions,
+    reference: &Path,
+    asset: &Path,
+    precision: Precision,
+) -> Result<SyncResult> {
+    ensure!(primary < segments.len(), "no accepted sync anchors");
+    let strong_limit = precision
+        .strong_p95_seconds
+        .min(options.tolerance_seconds * 0.75);
+    let reported = segments
+        .iter()
+        .map(|s| segment_from_fit(&s.fit, s.asset_range, options, precision, strong_limit))
+        .collect::<Result<Vec<_>>>()?;
+    let main = &reported[primary];
+    let discontinuous = reported.len() > 1;
+    let mut warnings = Vec::new();
+    for (i, segment) in reported.iter().enumerate() {
+        if !segment.drift_estimated {
+            warnings.push(if discontinuous {
+                format!("segment {i}: overlap too short to estimate drift; offset-only mapping is valid near its matched interval")
+            } else {
+                "overlap too short to estimate drift; offset-only mapping is valid near the matched interval".into()
+            });
+        }
+    }
+    if discontinuous {
+        warnings.push(format!(
+            "discontinuity: {} segments with different mappings (a cut, dropout or recorder restart); one offset and speed cannot place this take. The top-level fields describe only segment {primary}; place it with skywrite sync apply, which uses every segment",
+            reported.len()
+        ));
+    }
+    let total: usize = segments.iter().map(|s| s.fit.pairs.len()).sum();
+    let step = total.div_ceil(64).max(1);
+    let anchors = segments
+        .iter()
+        .zip(&reported)
+        .enumerate()
+        .flat_map(|(i, (s, r))| {
+            s.fit.pairs.iter().map(move |p| SyncAnchor {
+                segment: i,
+                asset_time: p.asset,
+                reference_time: p.reference,
+                error_seconds: grid(p.reference - r.offset_seconds - r.scale * p.asset, 1e9),
+            })
+        })
+        .step_by(step)
+        .collect();
+    Ok(SyncResult {
+        version: 1,
+        method: precision.method.into(),
+        reference: reference.into(),
+        asset: asset.into(),
+        mapping: "reference_time = offset_seconds + scale * asset_time".into(),
+        offset_seconds: main.offset_seconds,
+        scale: main.scale,
+        playback_rate: main.playback_rate,
+        drift_ppm: main.drift_ppm,
+        drift_estimated: main.drift_estimated,
+        quality: if discontinuous {
+            "limited".into()
+        } else {
+            main.quality.clone()
+        },
+        candidate_matches: candidate_count,
+        inliers: main.inliers,
+        inlier_ratio: main.inliers as f64 / candidate_count.max(1) as f64,
+        anchor_span_seconds: main.anchor_span_seconds,
+        asset_interval: main.asset_interval,
+        reference_interval: main.reference_interval,
+        median_error_seconds: main.median_error_seconds,
+        p95_error_seconds: main.p95_error_seconds,
+        scale_uncertainty_ppm: main.scale_uncertainty_ppm,
+        timing_resolution_seconds: precision.resolution_seconds,
+        strong_p95_limit_seconds: strong_limit,
+        discontinuous,
+        segments: reported,
         warnings,
         anchors,
     })
 }
+/// Round to `per_unit` steps (1e9: nanoseconds); 1.0 and -3.5 stay exact.
+fn grid(value: f64, per_unit: f64) -> f64 {
+    (value * per_unit).round() / per_unit
+}
+/// ASR word timestamps: about one frame at 24 fps.
+const TRANSCRIPT_STRONG_P95_SECONDS: f64 = 0.05;
+const TRANSCRIPT: Precision = Precision {
+    method: "transcript",
+    resolution_seconds: 0.02,
+    strong_p95_seconds: TRANSCRIPT_STRONG_P95_SECONDS,
+};
 pub fn align_transcripts(
     reference: &Transcript,
     asset: &Transcript,
@@ -580,14 +703,17 @@ pub fn align_transcripts(
         "too little shared speech for a reliable sync ({:.1}% of the shorter transcript)",
         fraction * 100.0
     );
-    let mut result = result_from_fit(
-        fit,
+    let mut result = result_from_segments(
+        &[SegmentFit {
+            fit,
+            asset_range: [0.0, asset.duration],
+        }],
+        0,
         pairs.len(),
         options,
         &reference.source,
         &asset.source,
-        "transcript",
-        0.02,
+        TRANSCRIPT,
     )?;
     result.warnings.push("word timestamps are ASR estimates; validate against audio before frame-accurate conforming".into());
     Ok(result)
@@ -791,6 +917,54 @@ mod tests {
         assert!(
             align_transcripts(&transcript(0.0, 1.2, 200), &asset, &SyncOptions::default()).is_err()
         );
+    }
+    #[test]
+    fn exact_mapping_is_reported_without_float_noise() {
+        let result = align_transcripts(
+            &transcript(12.5, 1.0, 200),
+            &transcript(0.0, 1.0, 200),
+            &SyncOptions::default(),
+        )
+        .unwrap();
+        // Least squares used to report 12.499999999999986 and 0.9999999999999998.
+        assert_eq!(result.offset_seconds, 12.5);
+        assert_eq!(result.scale, 1.0);
+        assert_eq!(result.playback_rate, 1.0);
+        assert_eq!(result.drift_ppm, 0.0);
+        assert_eq!(result.p95_error_seconds, 0.0);
+    }
+    #[test]
+    fn strong_quality_requires_method_precision_not_the_match_tolerance() {
+        let jittered = |amplitude: f64| {
+            let mut asset = transcript(0.0, 1.0, 300);
+            for (i, word) in asset.words.iter_mut().enumerate() {
+                let jitter = amplitude * (i as f64 * 1.7).sin();
+                word.start += jitter;
+                word.end += jitter;
+            }
+            align_transcripts(&transcript(12.5, 1.0, 300), &asset, &SyncOptions::default()).unwrap()
+        };
+        let precise = jittered(0.02);
+        assert_eq!(precise.quality, "strong", "{precise:?}");
+        assert_eq!(
+            precise.strong_p95_limit_seconds,
+            TRANSCRIPT_STRONG_P95_SECONDS
+        );
+        // 100 ms p95 (2.4 frames at 24 fps) was "strong" under 0.75 x tolerance.
+        let loose = jittered(0.1);
+        assert!(loose.p95_error_seconds > 0.09, "{loose:?}");
+        assert_eq!(loose.quality, "limited", "{loose:?}");
+        let tight = SyncOptions {
+            tolerance_seconds: 0.02,
+            ..SyncOptions::default()
+        };
+        let result = align_transcripts(
+            &transcript(12.5, 1.0, 300),
+            &transcript(0.0, 1.0, 300),
+            &tight,
+        )
+        .unwrap();
+        assert_eq!(result.strong_p95_limit_seconds, 0.015);
     }
     #[test]
     fn normalization_keeps_non_ascii_letters() {

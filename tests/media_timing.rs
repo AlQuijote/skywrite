@@ -94,8 +94,13 @@ fn presentation_duration_normalizes_only_matroska_end_timestamps() {
                 "{invalid:#}"
             );
             let output = dir.path().join(format!("last-{origin}-{extension}.mp4"));
-            export::render(&valid, &output, false)
-                .unwrap_or_else(|error| panic!("{extension} origin={origin}: {error:#}"));
+            export::render(
+                &valid,
+                &output,
+                false,
+                skywrite::stretch::StretcherChoice::Auto,
+            )
+            .unwrap_or_else(|error| panic!("{extension} origin={origin}: {error:#}"));
             assert!((media::probe(&output).unwrap().duration - 0.2).abs() < 0.05);
             if origin == 5 {
                 let result = command(
