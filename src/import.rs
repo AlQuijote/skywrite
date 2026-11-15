@@ -71,12 +71,12 @@ pub fn parse_xml(text: &str) -> Result<Node> {
     let mut stack = vec![Node::default()];
     let mut count = 0usize;
     let element = |start: &quick_xml::events::BytesStart<'_>| -> Result<Node> {
-        let name = String::from_utf8_lossy(start.local_name().as_ref()).into_owned();
+        let name = start.local_name().as_ref().to_owned();
         let mut attrs = Vec::new();
         for attr in start.attributes() {
             let attr = attr?;
             attrs.push((
-                String::from_utf8_lossy(attr.key.local_name().as_ref()).into_owned(),
+                attr.key.local_name().as_ref().to_owned(),
                 attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned(),
             ));
         }
@@ -110,7 +110,7 @@ pub fn parse_xml(text: &str) -> Result<Node> {
                     .push(node);
             }
             Event::Text(text) => {
-                let content = text.xml_content(XmlVersion::Implicit1_0)?;
+                let content = text.xml_content(XmlVersion::Implicit1_0);
                 stack
                     .last_mut()
                     .context("XML nesting")?
@@ -118,7 +118,7 @@ pub fn parse_xml(text: &str) -> Result<Node> {
                     .push_str(&content);
             }
             Event::CData(data) => {
-                let content = String::from_utf8_lossy(&data.into_inner()).into_owned();
+                let content = data.into_inner().into_owned();
                 stack
                     .last_mut()
                     .context("XML nesting")?
@@ -129,7 +129,7 @@ pub fn parse_xml(text: &str) -> Result<Node> {
                 let resolved = if reference.is_char_ref() {
                     reference.resolve_char_ref()?.map(String::from)
                 } else {
-                    match reference.decode()?.as_ref() {
+                    match &*reference {
                         "amp" => Some("&".into()),
                         "lt" => Some("<".into()),
                         "gt" => Some(">".into()),
