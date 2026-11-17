@@ -64,6 +64,12 @@ install -m 0755 "skywrite-$VERSION-$TARGET/skywrite" ~/.local/bin/
 skywrite doctor   # if this is not found, add ~/.local/bin to your PATH
 ```
 
+Every release asset, including `SHA256SUMS`, carries a signed GitHub build provenance attestation. With the [GitHub CLI](https://cli.github.com/) you can check that a file was built by this repository's release workflow:
+
+```sh
+gh attestation verify "skywrite-$VERSION-$TARGET.tar.gz" --repo FlyCockpit/skywrite
+```
+
 The crate is not published to crates.io.
 
 ### Build from source
