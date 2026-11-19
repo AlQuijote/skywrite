@@ -5,7 +5,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # Dated exceptions, expiring 2027-01-18. object_store =0.14.2 (latest; chrono and
+    # humantime are unconditional deps) has no release without them. Drop each entry
+    # once object_store moves off the crate (apache/arrow-rs-object-store#909, #908)
+    # or at expiry, whichever comes first.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, required by object_store 0.14.2; expires 2027-01-18, drop when object_store drops it (arrow-rs-object-store#909)." },
+    { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained, required by object_store 0.14.2; expires 2027-01-18, drop when object_store drops it (arrow-rs-object-store#908)." },
+]
 
 [licenses]
 version = 2
