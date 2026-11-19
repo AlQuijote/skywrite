@@ -65,9 +65,13 @@ jobs:
       - name: Install FFmpeg (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      # Homebrew's `ffmpeg` omits libass (the `subtitles` filter) and rubberband;
+      # the keg-only `ffmpeg-full` formula has every filter the tests use.
       - name: Install FFmpeg (macOS)
         if: runner.os == 'macOS'
-        run: brew install ffmpeg
+        run: |
+          brew install ffmpeg-full
+          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
       - name: Check test prerequisites
         run: |
           ffmpeg -version
@@ -84,7 +88,7 @@ jobs:
           test_home="$RUNNER_TEMP/skywrite-test-home"
           mkdir -p "$test_home" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$SKYWRITE_HOME" "$SKYWRITE_CACHE_DIR"
           # Keep Cargo/rustup available while the tests inherit a throwaway HOME.
-          env CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" HOME="$test_home" cargo test --locked
+          env CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" HOME="$test_home" cargo test --locked --no-fail-fast
 
   # Release Linux binaries are static musl builds; catch musl-only breakage
   # (missing libc symbols, C dependencies) before a tag.

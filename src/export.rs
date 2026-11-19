@@ -1291,6 +1291,11 @@ def run_ffmpeg(args):
                         child.kill() if sig == getattr(signal, 'SIGKILL', None) else child.terminate()
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    # macOS reports EPERM, not ESRCH, for a group whose members
+                    # are all zombies, as the WNOWAIT-held leader is after exit.
+                    if not group_owner:
+                        raise
             terminate(signal.SIGTERM)
             if group_owner:
                 # Do not call poll/wait before the final group signal: either
