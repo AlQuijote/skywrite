@@ -301,13 +301,20 @@ mod tests {
             .contains("OPENROUTER_API_KEY")
         );
     }
+    /// Where the fixture withholds the reply until the client gives up.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Stall {
+        None,
+        Headers,
+        Body,
+    }
+    fn hold_until_closed(stream: &mut std::net::TcpStream) {
+        let mut buffer = [0; 1024];
+        while matches!(stream.read(&mut buffer), Ok(n) if n > 0) {}
+    }
     // A single owned loopback request, with real reqwest transport and bounded
     // server lifetime. No runtime credentials or remote endpoints are involved.
-    fn fixture(
-        reply: Vec<u8>,
-        before_headers: Duration,
-        before_body: Duration,
-    ) -> (OpenRouter, std::thread::JoinHandle<()>) {
+    fn fixture(reply: Vec<u8>, stall: Stall) -> (OpenRouter, std::thread::JoinHandle<()>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -343,10 +350,17 @@ mod tests {
                 serde_json::from_slice::<Value>(&body).unwrap()["model"],
                 "fixture"
             );
-            std::thread::sleep(before_headers);
+            // A stall holds until the client's deadline drops the connection. A
+            // fixed sleep let a descheduled client find the reply ready and
+            // succeed; the read timeout only bounds a broken deadline.
+            if stall == Stall::Headers {
+                hold_until_closed(&mut stream);
+            }
             let split = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let _ = stream.write_all(&reply[..split]);
-            std::thread::sleep(before_body);
+            if stall == Stall::Body {
+                hold_until_closed(&mut stream);
+            }
             let _ = stream.write_all(&reply[split..]);
         });
         (
@@ -368,11 +382,7 @@ mod tests {
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(15));
         assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(180));
         let dir = tempfile::tempdir().unwrap();
-        let (mut api, server) = fixture(
-            reply("200 OK", br#"{"ok":true}"#),
-            Duration::ZERO,
-            Duration::ZERO,
-        );
+        let (mut api, server) = fixture(reply("200 OK", br#"{"ok":true}"#), Stall::None);
         api.cache_dir = Some(dir.path().to_owned());
         let request = serde_json::json!({"model":"fixture"});
         assert!(!api.request("chat/completions", &request).unwrap().cached);
@@ -383,8 +393,7 @@ mod tests {
         assert_eq!(second.body["ok"], true);
         let (api, server) = fixture(
             reply("422 Unprocessable Entity", b"fixture rejected"),
-            Duration::ZERO,
-            Duration::ZERO,
+            Stall::None,
         );
         let error = api
             .request("chat/completions", &request)
@@ -406,11 +415,7 @@ mod tests {
                 r#"{"error":{"message":"rejected DUMMY_TEST_ONLY"}}"#,
             ),
         ] {
-            let (api, server) = fixture(
-                reply(status, body.as_bytes()),
-                Duration::ZERO,
-                Duration::ZERO,
-            );
+            let (api, server) = fixture(reply(status, body.as_bytes()), Stall::None);
             let error = api
                 .request("chat/completions", &serde_json::json!({"model":"fixture"}))
                 .unwrap_err();
@@ -426,7 +431,7 @@ mod tests {
         let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         destination.set_nonblocking(true).unwrap();
         let bytes = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", destination.local_addr().unwrap()).into_bytes();
-        let (api, server) = fixture(bytes, Duration::ZERO, Duration::ZERO);
+        let (api, server) = fixture(bytes, Stall::None);
         assert!(
             api.request("chat/completions", &serde_json::json!({"model":"fixture"}))
                 .unwrap_err()
@@ -450,8 +455,7 @@ mod tests {
             if excess {
                 bytes.push(b' ');
             }
-            let (mut api, server) =
-                fixture(reply("200 OK", &bytes), Duration::ZERO, Duration::ZERO);
+            let (mut api, server) = fixture(reply("200 OK", &bytes), Stall::None);
             // Large local transfers need an ordinary deadline, not the deliberately
             // short deadline used to discriminate the stall tests below.
             api.client = http_client(CONNECT_TIMEOUT, Duration::from_secs(5)).unwrap();
@@ -469,11 +473,8 @@ mod tests {
     }
     #[test]
     fn actual_http_deadline_covers_slow_headers_and_body() {
-        for (headers, body) in [
-            (Duration::from_millis(350), Duration::ZERO),
-            (Duration::ZERO, Duration::from_millis(350)),
-        ] {
-            let (api, server) = fixture(reply("200 OK", br#"{"ok":true}"#), headers, body);
+        for stall in [Stall::Headers, Stall::Body] {
+            let (api, server) = fixture(reply("200 OK", br#"{"ok":true}"#), stall);
             let started = std::time::Instant::now();
             let error = api
                 .request("chat/completions", &serde_json::json!({"model":"fixture"}))

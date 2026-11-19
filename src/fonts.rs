@@ -620,6 +620,13 @@ mod tests {
             },
             thread,
         };
+        // A stall holds until the client's deadline drops the connection. A
+        // fixed sleep let a descheduled client find the reply ready and
+        // succeed; the read timeout only bounds a broken deadline.
+        fn hold_until_closed(stream: &mut std::net::TcpStream) {
+            let mut buffer = [0; 1024];
+            while matches!(stream.read(&mut buffer), Ok(n) if n > 0) {}
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -639,7 +646,7 @@ mod tests {
                 assert!(!request.to_ascii_lowercase().contains("authorization:"));
                 server_hits.fetch_add(1, Ordering::SeqCst);
                 if response.starts_with("HTTP/1.1 200") {
-                    thread::sleep(Duration::from_millis(300));
+                    hold_until_closed(&mut stream);
                 }
                 let _ = stream.write_all(response.as_bytes());
             }
@@ -670,7 +677,7 @@ mod tests {
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
                 .unwrap();
-            thread::sleep(Duration::from_millis(300));
+            hold_until_closed(&mut stream);
             let _ = stream.write_all(b"ok");
         });
         let start = Instant::now();

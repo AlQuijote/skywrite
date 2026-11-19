@@ -3417,7 +3417,7 @@ mod tests {
             let thread = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let mut buffer = [0; 4096];
                 let _ = stream.read(&mut buffer).unwrap();
@@ -3428,7 +3428,10 @@ mod tests {
                         )
                         .unwrap();
                 }
-                std::thread::sleep(Duration::from_millis(180));
+                // Hold the rest until the client's deadline drops the connection.
+                // A fixed sleep let a descheduled client find the full response
+                // ready and succeed; the read timeout only bounds a broken deadline.
+                while matches!(stream.read(&mut buffer), Ok(n) if n > 0) {}
                 let _ = stream.write_all(if body_stall {
                     b"}"
                 } else {
