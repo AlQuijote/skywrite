@@ -2682,8 +2682,10 @@ mod tests {
                 .status()
                 .is_success()
         );
+        // Only 127.0.0.1 and ::1 exist on every supported loopback (macOS lo0 has
+        // no other 127/8 address). The fallback server listens on IPv4 only.
         let unavailable =
-            std::net::SocketAddr::new("127.0.0.2".parse().unwrap(), fallback.address.port());
+            std::net::SocketAddr::new("::1".parse().unwrap(), fallback.address.port());
         let cert = crate::test_tls::chain().ca();
         let no_fallback = pinned_download_builder("localhost", &[unavailable])
             .tls_certs_merge([cert])
@@ -2693,12 +2695,21 @@ mod tests {
         assert!(no_fallback.get(&fallback_url).send().is_err());
         let first = OwnedTls::start("127.0.0.1", 0);
         let port = first.address.port();
-        let second = OwnedTls::start("127.0.0.2", port);
+        let second = OwnedTls::start("::1", port);
         let domain_url = format!("https://pinned.invalid:{port}/");
         let client = first.client("pinned.invalid");
         assert_eq!(
             client.get(&domain_url).send().unwrap().text().unwrap(),
             "ok"
+        );
+        assert_eq!(
+            first
+                .client("127.0.0.1")
+                .get(format!("https://127.0.0.1:{port}/"))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
         );
         // Rebuilding with the same origin but a different address reaches server 2.
         // Killing server 1 ensures an old pool or ignored new pin cannot pass.
@@ -2738,8 +2749,8 @@ mod tests {
         );
         assert_eq!(
             second
-                .client("127.0.0.2")
-                .get(format!("https://127.0.0.2:{port}/"))
+                .client("::1")
+                .get(format!("https://[::1]:{port}/"))
                 .send()
                 .unwrap()
                 .status(),

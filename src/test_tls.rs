@@ -17,7 +17,7 @@ pub(crate) struct Leaf {
 
 pub(crate) struct Chain {
     ca_pem: String,
-    /// SANs: pinned.invalid, localhost, 127.0.0.1, 127.0.0.2 and ::1.
+    /// SANs: pinned.invalid, localhost, 127.0.0.1 and ::1.
     pub(crate) server: Leaf,
     /// SAN: mismatch.invalid only, so IP and other names fail verification.
     pub(crate) mismatch: Leaf,
@@ -97,13 +97,7 @@ fn generate() -> Chain {
     };
     Chain {
         ca_pem,
-        server: leaf(&[
-            "pinned.invalid",
-            "localhost",
-            "127.0.0.1",
-            "127.0.0.2",
-            "::1",
-        ]),
+        server: leaf(&["pinned.invalid", "localhost", "127.0.0.1", "::1"]),
         mismatch: leaf(&["mismatch.invalid"]),
     }
 }
