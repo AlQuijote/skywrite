@@ -456,3 +456,26 @@ pub fn mux(
 ) -> Result<Value> {
     crate::export::mux_captions(input, edit, output, overwrite)
 }
+
+/// The FFmpeg filter (libass) that burned-in captions are rendered with.
+pub const BURN_FILTER: &str = "subtitles";
+
+/// How to get an FFmpeg whose `subtitles` filter (libass) can burn in captions.
+pub fn libass_fix_hint(macos: bool) -> &'static str {
+    if macos {
+        "burned-in captions need FFmpeg's subtitles filter (libass), which Homebrew's ffmpeg formula lacks: brew install ffmpeg-full and put $(brew --prefix ffmpeg-full)/bin first on your PATH"
+    } else {
+        "burned-in captions need FFmpeg's subtitles filter (libass): install your distribution's FFmpeg built with libass"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libass_fix_hint_names_the_platform_fix() {
+        assert!(libass_fix_hint(true).contains("brew install ffmpeg-full"));
+        assert!(libass_fix_hint(false).contains("distribution's FFmpeg built with libass"));
+    }
+}

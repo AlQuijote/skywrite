@@ -105,23 +105,10 @@ pub fn is_creative(speed: f64) -> bool {
 
 /// Whether this FFmpeg build has the `rubberband` filter (`ffmpeg -filters`).
 pub fn rubberband_available() -> Result<bool> {
-    let out = crate::process::run(
-        "ffmpeg",
-        &crate::process::args(&["-hide_banner", "-filters"]),
-        Duration::from_secs(30),
-        1024 * 1024,
-    )
-    .context("could not list FFmpeg filters")?;
-    Ok(has_filter(
-        &String::from_utf8_lossy(&out.stdout),
+    Ok(crate::media::has_filter(
+        &crate::media::ffmpeg_filters()?,
         "rubberband",
     ))
-}
-
-fn has_filter(listing: &str, name: &str) -> bool {
-    listing
-        .lines()
-        .any(|line| line.split_whitespace().nth(1) == Some(name))
 }
 
 /// Decide the stretcher from the request and what this FFmpeg offers.
@@ -499,16 +486,6 @@ mod tests {
         assert!(error.contains("no rubberband filter"), "{error}");
         assert_eq!(choose(Atempo, true).unwrap(), (Stretcher::Atempo, None));
         assert_eq!(choose(Atempo, false).unwrap(), (Stretcher::Atempo, None));
-    }
-
-    #[test]
-    fn filter_listing_is_parsed_by_name_column() {
-        let listing = " T.. acrusher          A->A       Reduce audio bit resolution.\n .. rubberband        A->A       Apply time-stretching and pitch-shifting.\n";
-        assert!(has_filter(listing, "rubberband"));
-        assert!(!has_filter(
-            " .. atempo  A->A  Adjust audio tempo (not rubberband).\n",
-            "rubberband"
-        ));
     }
 
     #[test]

@@ -83,7 +83,7 @@ cargo build --release --locked
 ./target/release/skywrite doctor
 ```
 
-`doctor` also reports `audio_stretcher.rubberband_available`: whether this FFmpeg has the `rubberband` filter used for pitch-preserving speed changes (see [edit format](docs/edit-format.md)).
+`doctor` also reports `audio_stretcher.rubberband_available`: whether this FFmpeg has the `rubberband` filter used for pitch-preserving speed changes (see [edit format](docs/edit-format.md)). It also reports `burned_captions.subtitles_filter_available`: whether this FFmpeg has the libass `subtitles` filter that burned-in captions need. When the filter is missing, a `fix` hint says how to get it (see [Installation](#installation)).
 
 The core is Rust. Direct dependencies include established projects: clap, serde/serde_json, anyhow, reqwest with Rustls, RustCrypto sha2, tempfile, signal-hook, Tokio, and Apache Arrow’s `object_store` S3 backend. `Cargo.lock` records the exact resolved dependency tree. No Python or Node runtime is needed for inspection, synchronization, FCPXML export, or the native FFmpeg renderer.
 

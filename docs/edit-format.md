@@ -406,7 +406,8 @@ reassembly across source cuts. Prepare separate output-timeline cues when cuttin
 spoken source material. `language` is a three-letter lowercase ISO-639 code,
 default `und`. `mode` defaults to `soft`, producing optional MP4 `mov_text`
 subtitle tracks. Set `mode` to `burn` explicitly to render text into pixels;
-this requires FFmpeg's `subtitles` filter with libass. Caption text is plain text;
+this requires FFmpeg's `subtitles` filter with libass (`skywrite doctor` reports
+`burned_captions.subtitles_filter_available`). Caption text is plain text;
 markup is escaped and rendered literally through an internal WebVTT sidecar.
 Braces and backslashes in caption text are rejected before export/rendering,
 because FFmpeg cannot preserve them identically across soft tracks and burn-in.

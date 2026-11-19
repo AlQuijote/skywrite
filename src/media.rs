@@ -7,6 +7,25 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The `ffmpeg -hide_banner -filters` listing of this FFmpeg build.
+pub fn ffmpeg_filters() -> Result<String> {
+    let out = crate::process::run(
+        "ffmpeg",
+        &crate::process::args(&["-hide_banner", "-filters"]),
+        Duration::from_secs(30),
+        1024 * 1024,
+    )
+    .context("could not list FFmpeg filters")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether an `ffmpeg -filters` listing has the filter `name` (second column).
+pub fn has_filter(listing: &str, name: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(name))
+}
+
 /// These demuxers can follow playlists, manifests, scripts, session descriptions,
 /// or sidecar files. The file protocol whitelist alone cannot confine those
 /// references to the selected input, so they are not accepted as media sources.
@@ -788,5 +807,20 @@ mod demuxer_tests {
         );
         assert_eq!(whitelist_refusal(&error).as_deref(), Some("hls"));
         assert!(whitelist_refusal(&anyhow::anyhow!("ffprobe exited: Invalid data")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    #[test]
+    fn filter_listing_is_parsed_by_name_column() {
+        let listing = " T.. acrusher          A->A       Reduce audio bit resolution.\n .. rubberband        A->A       Apply time-stretching and pitch-shifting.\n";
+        assert!(has_filter(listing, "rubberband"));
+        assert!(!has_filter(
+            " .. atempo  A->A  Adjust audio tempo (not rubberband).\n",
+            "rubberband"
+        ));
     }
 }

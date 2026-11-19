@@ -539,8 +539,29 @@ fn execute(command: Command) -> Result<Value> {
                 );
                 tools.insert(tool.to_owned(),match result {Ok(out)=>json!({"available":true,"version":String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("")}),Err(error)=>json!({"available":false,"reason":error.to_string()})});
             }
+            let (audio_stretcher, burned_captions) = match skywrite::media::ffmpeg_filters() {
+                Ok(listing) => {
+                    let rubberband = skywrite::media::has_filter(&listing, "rubberband");
+                    let libass =
+                        skywrite::media::has_filter(&listing, skywrite::captions::BURN_FILTER);
+                    let mut captions = json!({"subtitles_filter_available":libass});
+                    if !libass {
+                        captions["fix"] = json!(skywrite::captions::libass_fix_hint(cfg!(
+                            target_os = "macos"
+                        )));
+                    }
+                    (
+                        json!({"rubberband_available":rubberband,"auto_uses":if rubberband {"rubberband"} else {"atempo"}}),
+                        captions,
+                    )
+                }
+                Err(error) => (
+                    json!({"rubberband_available":null,"reason":error.to_string()}),
+                    json!({"subtitles_filter_available":null,"reason":error.to_string()}),
+                ),
+            };
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":skywrite::image::TAKUMI_VERSION,"available":true},"audio_stretcher":match skywrite::stretch::rubberband_available() {Ok(available)=>json!({"rubberband_available":available,"auto_uses":if available {"rubberband"} else {"atempo"}}),Err(error)=>json!({"rubberband_available":null,"reason":error.to_string()})}}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":skywrite::image::TAKUMI_VERSION,"available":true},"audio_stretcher":audio_stretcher,"burned_captions":burned_captions}),
             )
         }
         Command::Verify(args) => skywrite::verify::execute(args),

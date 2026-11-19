@@ -1,6 +1,6 @@
 # FFmpeg assembly and verification
 
-1. Run `skywrite doctor` and `skywrite inspect INPUT`.
+1. Run `skywrite doctor` and `skywrite inspect INPUT`. Burned-in captions (`mode: "burn"`) need `burned_captions.subtitles_filter_available`; if it is false, follow its `fix` hint or keep captions `soft`.
 2. Write an edit following `skywrite schema`, with local sources relative to the edit JSON. Source `duration` is output time; `speed` is source seconds per output second.
 3. Run `skywrite edit validate edit.json` and review all reported rounding and bounds.
 4. Render directly: `skywrite edit render edit.json --output edit.mp4`.
