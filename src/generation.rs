@@ -2911,6 +2911,8 @@ mod tests {
                         Err(e) => panic!("{e}"),
                     }
                 };
+                // Accepted sockets inherit O_NONBLOCK from the listener on macOS, not Linux.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -3065,6 +3067,8 @@ mod tests {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
+                        // Accepted sockets inherit O_NONBLOCK from the listener on macOS, not Linux.
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();

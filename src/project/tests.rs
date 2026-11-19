@@ -85,6 +85,8 @@ fn server(png: Vec<u8>, block_output: Option<PathBuf>) -> Server {
             while !end.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
+                        // Accepted sockets inherit O_NONBLOCK from the listener on macOS, not Linux.
+                        socket.set_nonblocking(false).unwrap();
                         let observed = observed.clone();
                         let finished = finished.clone();
                         let active = active.clone();

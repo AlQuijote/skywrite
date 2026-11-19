@@ -848,6 +848,8 @@ mod tests {
                         Err(error) => panic!("fixture accept: {error}"),
                     }
                 };
+                // Accepted sockets inherit O_NONBLOCK from the listener on macOS, not Linux.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();
