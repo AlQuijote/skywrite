@@ -12,6 +12,8 @@ pub mod process;
 pub mod stretch;
 pub mod sync;
 pub mod sync_apply;
+#[cfg(test)]
+mod test_tls;
 pub mod timeline;
 pub mod transcript;
 pub mod workspace;

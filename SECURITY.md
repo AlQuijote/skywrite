@@ -25,5 +25,5 @@ Edit JSON, Premiere XML and `.prproj` files are trusted input, like scripts: the
 ## Security controls
 
 - Model calls require explicit OpenRouter credentials; do not include API keys, S3/R2 credentials or private media in public issues, logs or fixtures.
-- Ordinary integration tests use synthetic fixtures and loopback servers. The `tests/fixtures/network/*.pem` and `*.key` files are fake **TEST ONLY** credentials for those loopback tests, not production secrets.
+- Ordinary integration tests use synthetic fixtures and loopback servers. Their TLS certificates are generated per test run (`src/test_tls.rs`) as short-lived **TEST ONLY** credentials; none are checked in.
 - SHA-pinned GitHub Actions, and `cargo deny` checks of licenses, sources, bans and RustSec advisories in CI.

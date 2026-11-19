@@ -10,5 +10,7 @@ is a conservative subset of Globally Reachable=True; whole 192.0.0.0/16,
 remain denied. False, N/A and terminated entries are denied. Multicast is denied.
 No runtime fetch occurs. Registry evolution requires reviewing this fixture.
 
-TLS files are public, deliberately fake TEST ONLY credentials generated solely
-for owned loopback tests. They are never used by production transport.
+tls_server.py and public_server.py are TEST ONLY owned-loopback TLS servers. Their
+certificate chain is not checked in: `src/test_tls.rs` generates a fresh CA and
+short-lived leaves per test process (macOS rejects long-lived server certificates),
+and nothing here is used by production transport.

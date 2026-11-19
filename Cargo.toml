@@ -41,6 +41,13 @@ tokio = { version = "1", features = ["rt", "time", "net"] }
 futures-util = "0.3"
 async-trait = "0.1"
 
+[dev-dependencies]
+# TEST ONLY: owned-loopback TLS chains generated per test run with short validity,
+# so platform verifiers (macOS caps server certificate lifetimes) accept them and
+# no checked-in certificate can expire. aws-lc-rs is already rustls's backend.
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+time = "0.3"
+
 [profile.release]
 lto = "thin"
 strip = true

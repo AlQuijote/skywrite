@@ -2632,15 +2632,17 @@ mod tests {
     }
     impl OwnedTls {
         fn start(ip: &str, port: u16) -> Self {
-            Self::start_with_certificate(ip, port, "test-server.pem")
+            Self::start_with_certificate(ip, port, &crate::test_tls::chain().server)
         }
-        fn start_with_certificate(ip: &str, port: u16, certificate: &str) -> Self {
+        fn start_with_certificate(ip: &str, port: u16, leaf: &crate::test_tls::Leaf) -> Self {
             use std::io::BufRead;
             let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network");
+            // The server loads the chain before printing its port, read below.
+            let files = leaf.files();
             let mut child = std::process::Command::new("python3")
                 .arg(base.join("tls_server.py"))
-                .arg(base.join(certificate))
-                .arg(base.join("test-server.key"))
+                .arg(&files.cert)
+                .arg(&files.key)
                 .arg(ip)
                 .arg(port.to_string())
                 .stdin(std::process::Stdio::null())
@@ -2656,10 +2658,7 @@ mod tests {
             Self { child, address }
         }
         fn client(&self, host: &str) -> Client {
-            let cert = reqwest::Certificate::from_pem(include_bytes!(
-                "../tests/fixtures/network/test-ca.pem"
-            ))
-            .unwrap();
+            let cert = crate::test_tls::chain().ca();
             pinned_download_builder(host, &[self.address])
                 .tls_certs_merge([cert])
                 .timeout(Duration::from_secs(2))
@@ -2685,9 +2684,7 @@ mod tests {
         );
         let unavailable =
             std::net::SocketAddr::new("127.0.0.2".parse().unwrap(), fallback.address.port());
-        let cert =
-            reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/network/test-ca.pem"))
-                .unwrap();
+        let cert = crate::test_tls::chain().ca();
         let no_fallback = pinned_download_builder("localhost", &[unavailable])
             .tls_certs_merge([cert])
             .timeout(Duration::from_secs(2))
@@ -2725,9 +2722,7 @@ mod tests {
         assert_eq!(redirect.status(), reqwest::StatusCode::FOUND);
         // A wrong pin must fail even while a valid same-port loopback server exists.
         let wrong: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let cert =
-            reqwest::Certificate::from_pem(include_bytes!("../tests/fixtures/network/test-ca.pem"))
-                .unwrap();
+        let cert = crate::test_tls::chain().ca();
         let wrong_client = pinned_download_builder("pinned.invalid", &[wrong])
             .tls_certs_merge([cert])
             .timeout(Duration::from_secs(2))
@@ -2760,7 +2755,8 @@ mod tests {
             reqwest::StatusCode::OK
         );
         for ip in ["127.0.0.1", "::1"] {
-            let mismatched = OwnedTls::start_with_certificate(ip, 0, "test-mismatch.pem");
+            let mismatched =
+                OwnedTls::start_with_certificate(ip, 0, &crate::test_tls::chain().mismatch);
             let literal = if ip.contains(':') {
                 format!("[{ip}]")
             } else {

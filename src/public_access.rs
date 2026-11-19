@@ -186,10 +186,12 @@ mod tests {
     impl OwnedTls {
         fn start() -> Self {
             let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/network");
+            // The server loads the chain before printing its port, read below.
+            let files = crate::test_tls::chain().server.files();
             let mut child = Command::new("python3")
                 .arg(base.join("public_server.py"))
-                .arg(base.join("test-server.pem"))
-                .arg(base.join("test-server.key"))
+                .arg(&files.cert)
+                .arg(&files.key)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -208,9 +210,7 @@ mod tests {
             if url.host_str() != Some("pinned.invalid") {
                 return crate::generation::public_download_client(url);
             }
-            let cert = reqwest::Certificate::from_pem(include_bytes!(
-                "../tests/fixtures/network/test-ca.pem"
-            ))?;
+            let cert = crate::test_tls::chain().ca();
             Ok(
                 crate::generation::public_test_client("pinned.invalid", &[self.address])
                     .tls_certs_merge([cert])

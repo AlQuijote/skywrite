@@ -2,4 +2,3 @@
 /.skywrite/
 .env
 *.key
-!tests/fixtures/network/test-server.key
