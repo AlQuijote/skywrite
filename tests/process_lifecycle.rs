@@ -24,6 +24,25 @@ fn lifecycle_fixture() {
     }
     if mode == "census" {
         let count = |path| std::fs::read_dir(path).unwrap().count();
+        // pthread_join returns when the kernel clears the thread's tid, which
+        // precedes its removal from /proc/self/task. A joined thread can still be
+        // listed in do_exit, so only tasks without PF_EXITING are live threads.
+        let live_threads = || {
+            std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|task| {
+                    let stat = std::fs::read_to_string(task.unwrap().path().join("stat")).ok()?;
+                    let flags: u64 = stat
+                        .rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .nth(6)?
+                        .parse()
+                        .ok()?;
+                    (flags & PF_EXITING == 0).then_some(stat)
+                })
+                .collect::<Vec<_>>()
+        };
         run(
             "/bin/sh",
             &args(&["-c", "printf ok"]),
@@ -31,7 +50,7 @@ fn lifecycle_fixture() {
             128,
         )
         .unwrap();
-        let before = (count("/proc/self/fd"), count("/proc/self/task"));
+        let before = (count("/proc/self/fd"), live_threads().len());
         for _ in 0..12 {
             let workers: Vec<_> = (0..3)
                 .map(|_| {
@@ -76,10 +95,11 @@ fn lifecycle_fixture() {
                 worker.join().unwrap();
             }
         }
+        let threads = live_threads();
         assert_eq!(
-            (count("/proc/self/fd"), count("/proc/self/task")),
+            (count("/proc/self/fd"), threads.len()),
             before,
-            "repeated concurrent calls leaked descriptors or threads"
+            "repeated concurrent calls leaked descriptors or threads: {threads:?}"
         );
         return;
     }
@@ -104,6 +124,8 @@ fn lifecycle_fixture() {
     }
     std::thread::sleep(Duration::from_secs(2));
 }
+/// Linux `PF_EXITING`: the task has entered `do_exit` and will not run again.
+const PF_EXITING: u64 = 0x4;
 fn live(pid: i32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
