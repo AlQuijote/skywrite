@@ -30,6 +30,15 @@ cargo test --locked
 
 CI checks formatting, Clippy and Rust 1.91 compatibility, runs tests on Linux and macOS, and checks licenses, bans and sources with `cargo deny`. RustSec advisories run weekly and on manual dispatch (see [deny.toml](./deny.toml)).
 
+### Test baseline
+
+`main` is expected to stay fully green: a red or flaky test is a bug to fix at its root, in the test or the code; don't skip it, delete it or raise a timeout to get green. No suite is environment-bound. Verified so far:
+
+- CI: formatting, Clippy and `cargo deny` on Linux and `cargo test --locked --no-fail-fast` on Linux and macOS, all on stable Rust; `cargo check --all-targets --locked` on Rust 1.91 (the MSRV).
+- Locally on Linux (2026-11-18, three consecutive runs under `nice -n 10` and `-j4` beside another heavy job): formatting, Clippy and `cargo test` on Rust 1.99 and 1.100, `cargo deny check licenses bans sources`, and `cargo +1.91.0 check --all-targets --locked`.
+
+Prerequisites are FFmpeg with libx264 and AAC, `ffprobe` and `python3`. Caption burn-in tests also need the libass `subtitles` filter. Tests that use FFmpeg's `rubberband` filter skip themselves when it is missing (see AGENTS.md), so install it for full coverage; CI installs it on both platforms (on macOS through Homebrew's `ffmpeg-full`). The one ignored test, `tests/public_access_live.rs`, reads an explicitly authorized public fixture URL and is not part of the baseline; paid OpenRouter and S3/R2 checks are manual opt-ins, as below. Owned-TLS tests generate their short-lived certificates per run (`src/test_tls.rs`), so nothing in the tree expires.
+
 Tests must not need external network access, paid accounts or the real `~/.config` or `~/.cache`. Use temporary directories, synthetic media and fake providers served over loopback. Relocate personal files with `SKYWRITE_HOME` and cache files with `SKYWRITE_CACHE_DIR`; isolate `HOME`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` as well. Paid/live OpenRouter, S3/R2 and public-access checks are explicit manual opt-ins; leave their credentials and fixture environment variables unset and do not run ignored tests in CI.
 
 ## Pull requests
