@@ -303,6 +303,8 @@ cargo deny check   # licenses, bans, sources and RustSec advisories; see deny.to
 
 CI runs these checks on Linux and macOS, plus a compile check with the minimum supported Rust version (1.91).
 
+While iterating, `scripts/verify-fast` is a quicker local check: formatting, Clippy and every test except the slow media tests listed in `scripts/verify-fast.skip`. CI does not run it, and it does not replace `cargo test --locked` before a change lands.
+
 Integration tests require installed FFmpeg/ffprobe and `python3` (local loopback test servers), and exercise actual decoding, rendering, and known timing transformations. Paid network tests are explicit/manual and use a capped OpenRouter key. Dated live checks cover transcription/understanding, image generation, H3/H3 Max video, video upscaling, narration, and Lyria Clip music; R2 checks use a dedicated, explicitly configured test bucket. Do not confuse local/cached protocol tests with a successful provider call.
 
 The public AMI corpus (CC BY 4.0) is suitable for multi-microphone synchronization tests; controlled copies with known trims/rates provide ground truth. `https://groups.inf.ed.ac.uk/ami/download/` lists downloads and attribution. Synthetic fixtures are generated locally for deterministic regression checks. See [measured validation and limits](docs/validation.md). These checks are not production or all-platform certification.

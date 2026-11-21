@@ -20,7 +20,8 @@ Requires Rust 1.91+ (2024 edition), FFmpeg 5.1+ with libx264/AAC, `ffprobe`, and
 cargo build --release                               # target/release/skywrite
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked                                 # unit + integration (real FFmpeg)
+cargo test --locked                                 # unit + integration (real FFmpeg); the landing gate
+scripts/verify-fast                                 # fmt + Clippy + all tests except scripts/verify-fast.skip
 cargo test --locked --lib -- sync::                 # name filter (also matches audio_sync::)
 cargo test --locked --test export_pipeline          # one integration file
 cargo deny check                                    # licenses, bans, sources, advisories
@@ -61,6 +62,6 @@ Tests must not use the network, paid accounts or the real `~/.config`/`~/.cache`
 ## Verification before handing back
 
 1. `cargo fmt --check` and `cargo clippy --all-targets --locked -- -D warnings`.
-2. The tests for the modules you touched, then `cargo test --locked`. Report any failure with its output, and say which failures were timing-only and passed when re-run alone.
+2. The tests for the modules you touched, then `cargo test --locked`. While iterating, `scripts/verify-fast` (about a minute instead of two) runs fmt, Clippy and every test except the slow media-correctness tests named in `scripts/verify-fast.skip`; it never replaces the full `cargo test --locked` before landing. Only slow tests may be listed, and none that guards security, teardown, data preservation, overwrites, bounds, caches or paid requests unless another test that is not listed checks the same guard; `tests/verify_fast_skips.rs` checks the list. Report any failure with its output, and say which failures were timing-only and passed when re-run alone.
 3. For media or timing changes, a real run on synthetic media (render, then measure with `ffmpeg` decode or `skywrite sync`), with numbers before and after.
 4. Check that the docs and skills you were required to update (rule 2) describe the new behaviour.

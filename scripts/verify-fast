@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Fast hand-back check: formatting, all-target Clippy, and every test except
+# the slow media-correctness tests listed in scripts/verify-fast.skip.
+#
+# This is not the landing gate. Before a change lands, run the full checks
+# (AGENTS.md "Build and test"): `cargo test --locked` runs every test,
+# including the ones skipped here.
+#
+# New tests run here by default; only an exact name in the skip list is left
+# out. tests/verify_fast_skips.rs checks the list.
+#
+# Usage: scripts/verify-fast [--print-test-args]
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+skip_file="$root/scripts/verify-fast.skip"
+
+test_args=(--exact)
+while IFS= read -r line || [[ -n $line ]]; do
+  line=${line%$'\r'}
+  line=${line%%#*}
+  read -r -a fields <<<"$line" || true
+  [[ ${#fields[@]} -eq 0 ]] && continue
+  if [[ ${#fields[@]} -ne 2 ]]; then
+    echo "verify-fast: malformed line in $skip_file: $line" >&2
+    exit 2
+  fi
+  test_args+=(--skip "${fields[1]}")
+done <"$skip_file"
+
+case ${1:-} in
+  --print-test-args)
+    printf '%s\n' "${test_args[@]}"
+    exit 0
+    ;;
+  "") ;;
+  *)
+    echo "usage: scripts/verify-fast [--print-test-args]" >&2
+    exit 2
+    ;;
+esac
+
+cd "$root"
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked -- "${test_args[@]}"
+echo "verify-fast: passed. Not the landing gate: run cargo test --locked (all tests) before landing." >&2

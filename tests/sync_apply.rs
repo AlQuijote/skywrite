@@ -227,6 +227,33 @@ fn late_recorder_with_drift_is_placed_on_the_frame_grid_and_verified() {
     assert!(!ok && again.to_string().contains("--overwrite"), "{again}");
 }
 
+/// The overwrite guard alone, without the slow real sync above, so it also
+/// runs in scripts/verify-fast.
+#[test]
+fn existing_output_is_refused_without_overwrite_before_inputs_are_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("final.json"), b"previous edit").unwrap();
+    let (ok, out) = skywrite(
+        dir,
+        &[
+            "sync",
+            "apply",
+            "--sync",
+            "missing.sync.json",
+            "--edit",
+            "missing-edit.json",
+            "-o",
+            "final.json",
+        ],
+    );
+    assert!(!ok && out.to_string().contains("--overwrite"), "{out}");
+    assert_eq!(
+        std::fs::read(dir.join("final.json")).unwrap(),
+        b"previous edit"
+    );
+}
+
 #[test]
 fn short_overlap_is_refused_unless_allowed_and_options_apply() {
     let tmp = tempfile::tempdir().unwrap();

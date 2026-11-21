@@ -28,6 +28,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
+While iterating, `scripts/verify-fast` runs formatting, Clippy and every test except the slow media-correctness tests listed in `scripts/verify-fast.skip`. It is a shortcut, not a substitute: run the full `cargo test --locked` before opening a pull request.
+
 CI checks formatting, Clippy and Rust 1.91 compatibility, runs tests on Linux and macOS, and checks licenses, bans and sources with `cargo deny`. RustSec advisories run weekly and on manual dispatch (see [deny.toml](./deny.toml)).
 
 ### Test baseline
