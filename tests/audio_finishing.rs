@@ -237,7 +237,10 @@ fn final_pad_trim_fades_and_selection_use_decoded_sample_grid() {
     let p = d.path();
     let src = p.join("short.wav");
     tone(&src, 1.2);
-    let long = p.join("180.wav");
+    // Padding 1.2 s of source to 10 s exercises the same pad-then-trim path
+    // as a long request (no code depends on the length) in a fraction of the
+    // decode time.
+    let long = p.join("padded.wav");
     success(
         p,
         &[
@@ -247,16 +250,16 @@ fn final_pad_trim_fades_and_selection_use_decoded_sample_grid() {
             "-o",
             long.to_str().unwrap(),
             "--duration",
-            "180",
+            "10",
             "--fade-in",
             "0.1",
             "--fade-out",
             "0.1",
         ],
     );
-    assert_eq!(timing(&long).samples, 180 * 48000);
+    assert_eq!(timing(&long).samples, 10 * 48000);
     assert!(rms(&pcm(&long, 0.0, 0.01)) < rms(&pcm(&long, 0.2, 0.01)) * 0.2);
-    assert_eq!(rms(&pcm(&long, 179.8, 0.1)), 0.0);
+    assert_eq!(rms(&pcm(&long, 9.8, 0.1)), 0.0);
     let short = p.join("shortened.mp3");
     let r = success(
         p,
