@@ -126,16 +126,25 @@ fn lifecycle_fixture() {
 }
 /// Linux `PF_EXITING`: the task has entered `do_exit` and will not run again.
 const PF_EXITING: u64 = 0x4;
+/// Whether `pid` can still run: not gone, not a zombie or dead, and not
+/// already in `do_exit`. A SIGKILLed task closes its files (so pipe readers
+/// see EOF) before the kernel marks it a zombie; in that window it is
+/// listed as running but is already `PF_EXITING`.
 fn live(pid: i32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
-    !stat
+    let fields: Vec<&str> = stat
         .rsplit_once(')')
         .unwrap()
         .1
-        .trim_start()
-        .starts_with('Z')
+        .split_whitespace()
+        .collect();
+    let flags: u64 = fields[6].parse().unwrap();
+    !matches!(fields[0], "Z" | "X" | "x") && flags & PF_EXITING == 0
+}
+fn stat(pid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_else(|e| e.to_string())
 }
 fn wait_until(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -258,6 +267,7 @@ fn exited_leader_with_descendant_capture_pipe_is_bounded() {
     let pid = std::fs::read_to_string(marker).unwrap().parse().unwrap();
     assert!(
         !live(pid),
-        "descendant retaining capture pipe survived timeout"
+        "descendant retaining capture pipe survived timeout: {}",
+        stat(pid)
     );
 }
