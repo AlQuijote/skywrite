@@ -1501,8 +1501,8 @@ mod tests {
             parse(json!({"version":7})).unwrap_err().to_string(),
             "unsupported edit version 7; expected 1"
         );
-        let legacy = parse(json!({"version":1,"clips":[]})).unwrap_err();
-        assert!(format!("{legacy:#}").contains("unknown field `clips`"));
+        let top_level_clips = parse(json!({"version":1,"clips":[]})).unwrap_err();
+        assert!(format!("{top_level_clips:#}").contains("unknown field `clips`"));
         assert!(parse(json!({"version":1,"video":[],"transition":"x"})).is_err());
         assert!(parse(json!({"version":1,"video":[]})).is_ok());
     }

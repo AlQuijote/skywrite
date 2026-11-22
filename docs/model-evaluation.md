@@ -50,7 +50,7 @@ samples a fixed number of frames regardless of length.
 |---|---|---|---|---|---|
 | **elevenlabs/scribe-v2** (default) | **0.158** | **0.67** | **0.90** | 0.05 s | 0.0037 |
 | nvidia/parakeet-tdt-0.6b-v3 | 0.201 | 0.63 | 0.70 | 0.09 s | 0.0015 |
-| openai/whisper-large-v3 (previous default) | 0.277 | 0.26 | 0.20 | 0.115 s | 0.00045 |
+| openai/whisper-large-v3 | 0.277 | 0.26 | 0.20 | 0.115 s | 0.00045 |
 
 The well-known Whisper `prompt` trick for keeping disfluencies had no effect through
 OpenRouter (byte-identical output), and routing varied between providers, one of

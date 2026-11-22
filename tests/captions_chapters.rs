@@ -285,14 +285,14 @@ fn explicit_burn_changes_actual_pixels_in_native_and_python() {
     }
 }
 #[test]
-fn legacy_defaults_bounds_and_caption_dependency_protection() {
+fn omitted_captions_chapters_bounds_and_caption_dependency_protection() {
     let d = tempfile::tempdir().unwrap();
     let file = fixture(d.path(), "soft");
     let mut spec: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
     spec.as_object_mut().unwrap().remove("captions");
     spec.as_object_mut().unwrap().remove("chapters");
-    let old: timeline::Edit = serde_json::from_value(spec.clone()).unwrap();
-    assert!(timeline::validate(&old, d.path()).is_ok());
+    let plain: timeline::Edit = serde_json::from_value(spec.clone()).unwrap();
+    assert!(timeline::validate(&plain, d.path()).is_ok());
     for chapters in [
         json!([{"start":1,"title":"One"},{"start":0.5,"title":"Two"}]),
         json!([{"start":2,"title":"Outside"}]),

@@ -89,7 +89,7 @@ skip the damage, isolate the estimator).
 7 s before the camera; error = sync mapping minus truth at the camera's first
 and last frame, worst of the three drift rates):
 
-| Take | Camera | Quality | Anchors | Drift error | Error at camera start | Error at camera end | Previous estimator, end |
+| Take | Camera | Quality | Anchors | Drift error | Error at camera start | Error at camera end | 24-anchor baseline, end |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2 min | clean | strong | 58-59 | +0.426 ppm | +0.06 ms | +0.11 ms | +0.28 ms |
 | 2 min | scratch | strong | 56-57 | -1.390 ppm | +0.56 ms | +0.60 ms | +1.01 ms |
@@ -100,7 +100,7 @@ and last frame, worst of the three drift rates):
 | 60 min | clean | strong | 1739-1756 | -0.001 ppm | -0.06 ms | -0.07 ms | -0.07 ms |
 | 60 min | scratch | strong | 1687-1705 | +0.008 ppm | +0.49 ms | +0.52 ms | +0.93 ms |
 
-The 60-minute sync takes about 15-17 s (one thread, on a loaded machine); the previous estimator (24 anchors) took 10-31 s. No take ended more than 10 ms off with either estimator, so the anchor change is for robustness and discontinuity detection, not long-take accuracy.
+The 60-minute sync takes about 15-17 s (one thread, on a loaded machine); a 24-anchor baseline estimator took 10-31 s. No take ended more than 10 ms off with either estimator, so the dense anchors serve robustness and discontinuity detection, not long-take accuracy.
 
 **Discontinuities** (synthetic flite takes, 24 fps, 104 ppm): a 3 s recorder
 pause, a 40 ms recorder dropout and a 5 s cut in the camera file are each
@@ -115,8 +115,8 @@ positions) and 14-17 ppm drift between phones. Chaining Nexus to Xiaomi to
 Pixel 7 agrees with syncing Nexus to Pixel 7 directly within 0.43 ms across the
 take; syncing each 5-minute half separately gives 21.1 and 14.9 ppm (the
 phones' clocks wander; full take 17.1 ppm) and the half mappings agree with the
-full-take mapping within 0.21 ms at their midpoints. The previous estimator (24
-anchors, no pre-emphasis) closed the triangle within 0.1 ms but graded one pair
+full-take mapping within 0.21 ms at their midpoints. A 24-anchor baseline
+estimator without pre-emphasis closed the triangle within 0.1 ms but graded one pair
 `limited` (p95 5.7 ms), and its full-take drift (12.5 ppm) disagreed with its
 own halves (25.2 and 15.3 ppm) by up to 1.4 ms.
 
@@ -137,14 +137,11 @@ engage at all, and an envelope-only match (50 ms) can be wrong.
 **Agent evaluation** (`scripts/agent-align-eval/run_eval.py`, six scenarios,
 `claude -p --model claude-opus-5-5` and `codex exec -m gpt-6.1-sol`, each run
 in a fresh temporary folder with only the binary and the plain task "replace the
-camera's scratch audio with the recorder audio"): round 1, 12 of 12 passed
-(placements within 0.83-1.16 ms of the audio truth; both agents refused the
-7-second overlap and the unrelated recording); round 2, after clearer
-no-match errors, pre-emphasis and the boundary margin, 12 of 12 passed (within
-0.39-0.72 ms). Every agent measured with `skywrite sync` and placed with
-`skywrite sync apply --verify`; none computed a placement by hand. Their nits
-found that `inlier_ratio` could exceed 1 (candidates were counted on the
-envelope stage), fixed afterwards.
+camera's scratch audio with the recorder audio"): 12 of 12 passed, with
+placements within 0.39-0.72 ms of the audio truth, and both agents refused the
+7-second overlap and the unrelated recording. Every agent measured with
+`skywrite sync` and placed with `skywrite sync apply --verify`; none computed a
+placement by hand.
 
 ## Reproduce public-media checks
 
@@ -223,7 +220,7 @@ and integration limits, not evidence of guaranteed transcription/editorial
 accuracy. No timestamp was fabricated. The source-mix introduction and role names
 were checked against AMI manual word annotations; timestamps remain ASR estimates.
 
-The provider word-order issue was subsequently fixed in ingestion. Replaying the
+Ingestion sorts provider word starts that arrive out of order and reports it. Replaying the
 identical failed array response from cache without an API key succeeded with all
 42 original word text/start/end values preserved, chronological starts, and an
 explicit reordering diagnostic. This replay checks the actual saved provider

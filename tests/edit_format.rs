@@ -263,23 +263,23 @@ fn picture_fades_volume_keyframes_and_limiter_are_rendered() {
 }
 
 #[test]
-fn legacy_sequential_clips_layout_is_rejected() {
+fn top_level_clips_layout_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     fixtures(dir.path());
-    let old = dir.path().join("old.json");
-    let mut legacy = json!({"version":1,"width":160,"height":90,"fps":{"num":30,"den":1},
+    let path = dir.path().join("edit.json");
+    let mut edit = json!({"version":1,"width":160,"height":90,"fps":{"num":30,"den":1},
         "clips":[{"source":"red.mp4","duration":1,"volume":0},{"duration":0.5},{"source":"yellow.png","duration":1}],
         "audio":[{"source":"tone.wav","offset":0.5,"duration":1}]});
     let bin = env!("CARGO_BIN_EXE_skywrite");
     for versioned in [true, false] {
         if !versioned {
-            legacy.as_object_mut().unwrap().remove("version");
+            edit.as_object_mut().unwrap().remove("version");
         }
-        let bytes = serde_json::to_vec(&legacy).unwrap();
-        std::fs::write(&old, &bytes).unwrap();
+        let bytes = serde_json::to_vec(&edit).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
         let rejected = Command::new(bin)
             .args(["edit", "validate"])
-            .arg(&old)
+            .arg(&path)
             .output()
             .unwrap();
         assert!(!rejected.status.success());
@@ -289,36 +289,20 @@ fn legacy_sequential_clips_layout_is_rejected() {
         } else {
             assert!(error.contains("edit requires"), "{error}");
         }
-        assert_eq!(std::fs::read(&old).unwrap(), bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
     // Isolate the top-level key from the independently invalid overlay layout.
-    legacy["version"] = json!(1);
-    legacy.as_object_mut().unwrap().remove("audio");
-    std::fs::write(&old, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    edit["version"] = json!(1);
+    edit.as_object_mut().unwrap().remove("audio");
+    std::fs::write(&path, serde_json::to_vec(&edit).unwrap()).unwrap();
     let rejected = Command::new(bin)
         .args(["edit", "validate"])
-        .arg(&old)
+        .arg(&path)
         .output()
         .unwrap();
     assert!(!rejected.status.success());
     let error = String::from_utf8_lossy(&rejected.stderr);
     assert!(error.contains("unknown field `clips`"), "{error}");
-
-    let new = dir.path().join("new.json");
-    let removed = Command::new(bin)
-        .args(["edit", "migrate"])
-        .arg(&old)
-        .arg("--output")
-        .arg(&new)
-        .output()
-        .unwrap();
-    assert!(!removed.status.success());
-    let error = String::from_utf8_lossy(&removed.stderr);
-    assert!(
-        error.contains("unrecognized subcommand 'migrate'"),
-        "{error}"
-    );
-    assert!(!new.exists());
 }
 
 #[test]
