@@ -102,7 +102,12 @@ fn invalid_audio_recovery_preserves_state_response_cost_and_existing_output() {
             "--overwrite",
         ],
     );
-    assert!(!r.status.success());
+    assert_eq!(r.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&r.stderr)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&r.stderr)));
+    assert_eq!(error["error"]["code"], "job_received", "{error}");
+    assert_eq!(error["error"]["job"]["status"], "received");
+    assert_eq!(error["error"]["job"]["id"], id.as_str());
     assert_eq!(std::fs::read(&out).unwrap(), b"important previous output");
     assert_eq!(std::fs::read(dir.join("response.json")).unwrap(), response);
     let state: Value = skywrite::io::read_json(&dir.join("job.json")).unwrap();
@@ -193,4 +198,82 @@ fn offline_plans_validate_voice_output_kind_and_script_preservation() {
             .unwrap()
             .contains("NOT mean free")
     );
+}
+#[test]
+fn unfinished_jobs_exit_nonzero_with_a_typed_code_and_the_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    // No API key and an unreachable proxy: none of these may touch the network.
+    for (letter, task, status, code, shown, detail) in [
+        (
+            "e",
+            "speech-generation",
+            "prepared",
+            "job_not_submitted",
+            "prepared",
+            "fixture detail",
+        ),
+        (
+            "f",
+            "speech-generation",
+            "uncertain",
+            "job_uncertain",
+            "uncertain",
+            "fixture detail",
+        ),
+        (
+            "a",
+            "speech-generation",
+            "rejected",
+            "job_rejected",
+            "rejected",
+            "fixture detail",
+        ),
+        (
+            "b",
+            "video-generation",
+            "uncertain",
+            "job_uncertain",
+            "uncertain",
+            "fixture detail",
+        ),
+        // A crash during a video submission: uncertain, without polling.
+        (
+            "c",
+            "video-generation",
+            "submitting",
+            "job_uncertain",
+            "uncertain",
+            "stopped during paid submission",
+        ),
+        (
+            "d",
+            "video-generation",
+            "prepared",
+            "job_not_submitted",
+            "prepared",
+            "fixture detail",
+        ),
+    ] {
+        let id = letter.repeat(64);
+        let dir = home.join("jobs").join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = json!({"version":1,"id":id,"task":task,"model":"test/model","status":status,"created_at":1,"updated_at":1,"request":{},"references":[],"remote_id":null,"generation_id":null,"usage":null,"artifact":null,"error":"fixture detail"});
+        skywrite::io::write_json(&dir.join("job.json"), &job, false).unwrap();
+        let r = cli(&home, &["jobs", "resume", &id]);
+        assert_eq!(r.status.code(), Some(1), "{task} {status}");
+        assert!(r.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&r.stderr)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&r.stderr)));
+        assert_eq!(error["error"]["code"], code, "{error}");
+        assert_eq!(error["error"]["job"]["id"], id.as_str());
+        assert_eq!(error["error"]["job"]["status"], shown);
+        assert!(
+            error["error"]["message"].as_str().unwrap().contains(detail),
+            "{error}"
+        );
+        // jobs status still reports any state with exit 0.
+        let r = cli(&home, &["jobs", "status", &id]);
+        assert!(r.status.success());
+    }
 }

@@ -479,6 +479,14 @@ fn main() {
                 let _ = writeln!(std::io::stdout(), "{}", report);
                 std::process::exit(1);
             }
+            if let Some(outcome) = error.downcast_ref::<skywrite::generation::JobOutcome>() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    json!({"error":{"code":outcome.code,"message":format!("{error:#}"),"job":outcome.job}})
+                );
+                std::process::exit(1);
+            }
             let _ = writeln!(
                 std::io::stderr(),
                 "{}",

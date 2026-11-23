@@ -80,8 +80,11 @@ paid request was never sent: recovery continues it through the normal
 identity-checked submission (a long-narration parent resumes from its saved section
 plan instead). A missing receipt after a crash remains uncertain, even when the
 process may have stopped just before the first request. If the worker itself fails
-before any receipt is written (for example, the API key is missing), the node returns
-to pending and can start again. A pending node can start for the first time.
+before any receipt is written (for example, the API key is missing), or the
+submission failed while connecting so nothing was sent (`not_sent`; the job is back
+in `prepared`), the node returns to pending and the next explicit `project run` or
+`project resume` starts it again; a run never retries it by itself. A provider
+rejection or failure marks the node `failed`. A pending node can start for the first time.
 If a crash left a published output, recovery reproduces publication from the
 completed job's verified artifact into private scratch storage and adopts the
 existing output only when its bytes match. This covers image and audio conversion;

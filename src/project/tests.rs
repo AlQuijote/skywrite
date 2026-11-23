@@ -308,6 +308,8 @@ fn durable_http_scheduler_and_recovery() {
     let result = run(args(&fail, &cache), false, engine(&s)).unwrap();
     assert_eq!(result["counts"]["pending"], 1);
     assert_eq!(result["counts"]["completed"], 1);
+    // The provider rejected `bad`: a definite answer, so the node failed.
+    assert_eq!(result["counts"]["failed"], 1, "{result}");
     assert!(!s.seen.lock().unwrap().iter().any(|p| p == "never-admitted"));
     assert!(
         s.done
@@ -329,6 +331,50 @@ fn durable_http_scheduler_and_recovery() {
         .unwrap();
     assert_eq!(never["status"], "completed");
     assert_eq!(never["model"], "fixture/image");
+    // A provably unsent node goes back to pending; only the next explicit run
+    // submits it, exactly once.
+    let unsent = manifest(&root, "unsent", vec![image_node("one", "never-sent")]);
+    let refused = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let first = run(
+        args(&unsent, &cache),
+        false,
+        Engine {
+            base: Some(format!("http://{refused}")),
+        },
+    )
+    .unwrap();
+    assert_eq!(first["counts"]["pending"], 1, "{first}");
+    let node = &first["nodes"][0];
+    assert!(
+        node["error"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was billed"),
+        "{node}"
+    );
+    let receipt = crate::generation::execute_jobs(crate::generation::JobsCommand::Status {
+        id: node["job_id"].as_str().unwrap().into(),
+        refresh: false,
+    })
+    .unwrap();
+    assert_eq!(receipt["status"], "prepared");
+    assert!(!s.seen.lock().unwrap().iter().any(|p| p == "never-sent"));
+    assert_eq!(
+        run(args(&unsent, &cache), true, engine(&s)).unwrap()["complete"],
+        true
+    );
+    assert_eq!(
+        s.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| *p == "never-sent")
+            .count(),
+        1
+    );
     let blocked = manifest(&root, "blocked", vec![image_node("one", "output-block")]);
     let bs = server(png.clone(), Some(root.join("blocked/one.png")));
     assert_eq!(
@@ -466,7 +512,7 @@ fn durable_http_scheduler_and_recovery() {
         "a started node with no receipt cannot submit"
     );
     assert_eq!(missing_result["counts"]["uncertain"], 1);
-    assert_eq!(s.seen.lock().unwrap().len(), count + 3);
+    assert_eq!(s.seen.lock().unwrap().len(), count + 4); // includes the one rerun of the never-sent node
     frozen_plan_probe(&root, &cache, &png_path, &s, &png, &path);
     identity_guard_probe(&root, &cache, &png_path, &s, &png);
     prepared_and_pre_receipt_recovery_probe(&root, &cache, &s);

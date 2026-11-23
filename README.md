@@ -29,7 +29,7 @@ This is an assembly editor: source selection, in points, order, gaps, stills, co
 
 ## How it works
 
-Skywrite is a single Rust binary. It shells out to FFmpeg and ffprobe for all decoding and encoding, calls OpenRouter only for commands that use a model, and embeds Takumi for raster graphics. All successful commands emit one JSON document on stdout. Progress and errors go to stderr; errors have a JSON `error` object and nonzero exit status. `--help` is human-readable. Output files are never replaced without `--overwrite`. Consumed media, edit JSON, transcript, and analysis inputs cannot be used as output destinations, including with `--overwrite`. Paths in an edit are relative to the edit JSON file; exported FCPXML uses absolute file URLs.
+Skywrite is a single Rust binary. It shells out to FFmpeg and ffprobe for all decoding and encoding, calls OpenRouter only for commands that use a model, and embeds Takumi for raster graphics. All successful commands emit one JSON document on stdout. Progress and errors go to stderr; errors have a JSON `error` object and nonzero exit status. Generation commands exit 0 only for a completed or still-running job; otherwise the error carries a `code` (`not_sent`, `job_uncertain`, `job_rejected`, …) and the job receipt ([generation](docs/generation.md)). `--help` is human-readable. Output files are never replaced without `--overwrite`. Consumed media, edit JSON, transcript, and analysis inputs cannot be used as output destinations, including with `--overwrite`. Paths in an edit are relative to the edit JSON file; exported FCPXML uses absolute file URLs.
 
 ## Quick start
 

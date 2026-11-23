@@ -493,27 +493,40 @@ fn join_sections(
                 section_common(common, model),
             )
         });
-        let rejection = match &outcome {
-            Err(error) => Some(format!("{error:#}")),
-            Ok(value) if JobStatus::from_value(&value["status"])? == JobStatus::Rejected => {
-                Some(value["error"].as_str().unwrap_or("").to_owned())
+        // Every unfinished section arrives as a typed outcome carrying its job
+        // receipt; any other error (local, or after the request may have left)
+        // is uncertain.
+        let (status, code, detail) = match outcome {
+            Ok(value) if JobStatus::from_value(&value["status"])? == JobStatus::Completed => {
+                results.push(value);
+                index += 1;
+                continue;
             }
-            Ok(_) => None,
+            Ok(value) => (
+                JobStatus::Uncertain,
+                "job_uncertain",
+                format!(
+                    "unexpected section state {}",
+                    value["status"].as_str().unwrap_or("unknown")
+                ),
+            ),
+            Err(error) => match error.downcast::<crate::generation::JobOutcome>() {
+                Ok(outcome) => (outcome.status()?, outcome.code, outcome.message),
+                Err(error) => (JobStatus::Uncertain, "job_uncertain", format!("{error:#}")),
+            },
         };
-        if let Some(message) = &rejection
-            && length_rejection(message)
-        {
+        if status == JobStatus::Rejected && length_rejection(&detail) {
             let section = &sections[index];
             let chars = section.text.chars().count() / 2;
             if chars < MIN_CHARS {
                 let error = format!(
-                    "section {} of {} was rejected as too long even at {} characters: {message}",
+                    "section {} of {} was rejected as too long even at {} characters: {detail}",
                     index + 1,
                     sections.len(),
                     section.text.chars().count()
                 );
                 parent.block(JobStatus::Rejected, error.clone())?;
-                bail!(error);
+                return Err(parent.outcome("job_rejected", error));
             }
             let mut smaller = split_paragraph(&section.text, chars)
                 .into_iter()
@@ -523,47 +536,32 @@ fn join_sections(
             sections.splice(index..=index, smaller);
             continue;
         }
-        let (status, detail) = match &outcome {
-            Ok(value) if JobStatus::from_value(&value["status"])? == JobStatus::Completed => {
-                results.push(value.clone());
-                index += 1;
-                continue;
-            }
-            Ok(value) => (
-                JobStatus::from_value(&value["status"])?,
-                value["error"]
-                    .as_str()
-                    .unwrap_or("no detail recorded")
-                    .to_owned(),
-            ),
-            Err(error) => {
-                let text = format!("{error:#}");
-                let status = if text.contains("Submission rejected") {
-                    JobStatus::Rejected
-                } else {
-                    JobStatus::Uncertain
-                };
-                (status, text)
-            }
+        let (status, code) = match (status, code) {
+            // The section job is prepared again; so is the combined job.
+            (_, "not_sent") => (JobStatus::Prepared, "not_sent"),
+            (JobStatus::Rejected, _) => (JobStatus::Rejected, "job_rejected"),
+            (JobStatus::Failed, _) => (JobStatus::Failed, "job_failed"),
+            // The section's saved response could not be completed.
+            (JobStatus::Received, _) => (JobStatus::Received, "job_received"),
+            _ => (JobStatus::Uncertain, "job_uncertain"),
+        };
+        let shown = if code == "not_sent" {
+            "not sent"
+        } else {
+            status.as_str()
         };
         let error = format!(
-            "narration section {} of {} is {status}: {detail}. Finished sections are kept; once it is resolved, rerun the same command or `skywrite jobs resume JOB_ID` and only missing sections are requested",
+            "narration section {} of {} is {shown}: {detail}. Finished sections are kept; {}, rerun the same command or `skywrite jobs resume JOB_ID` and only missing sections are requested",
             index + 1,
-            sections.len()
+            sections.len(),
+            if code == "not_sent" {
+                "nothing was billed for this section"
+            } else {
+                "once it is resolved"
+            }
         );
-        let status = match status {
-            JobStatus::Rejected | JobStatus::Failed => status,
-            JobStatus::Prepared
-            | JobStatus::Submitting
-            | JobStatus::Received
-            | JobStatus::Pending
-            | JobStatus::InProgress
-            | JobStatus::Ready
-            | JobStatus::Completed
-            | JobStatus::Uncertain => JobStatus::Uncertain,
-        };
         parent.block(status, error.clone())?;
-        bail!(error);
+        return Err(parent.outcome(code, error));
     }
     let temp = tempfile::tempdir()?;
     let pause_samples = (paragraph_pause * RATE as f64).round() as usize;
@@ -968,5 +966,112 @@ mod tests {
         })
         .unwrap();
         assert!(wav.is_file());
+    }
+    #[test]
+    fn not_sent_section_keeps_finished_sections_and_reruns_only_the_missing_one() {
+        const SELECTOR: &str = "speech_split::tests::not_sent_section_keeps_finished_sections_and_reruns_only_the_missing_one";
+        if std::env::var_os("SKYWRITE_SPLIT_NOT_SENT_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", SELECTOR, "--nocapture"])
+                .env("SKYWRITE_SPLIT_NOT_SENT_CHILD", "1")
+                .env("SKYWRITE_HOME", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        let mut args = crate::process::args(&[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.25",
+            "-acodec",
+            "pcm_s16le",
+        ]);
+        args.push(wav.path().as_os_str().to_owned());
+        crate::process::run("ffmpeg", &args, Duration::from_secs(10), 1024 * 1024).unwrap();
+        let audio = http("200 OK", "audio/wav", &std::fs::read(wav.path()).unwrap());
+        let paragraph = |word: &str| {
+            (0..10)
+                .map(|i| format!("Line {i} {}.", format!("{word} ").repeat(10).trim()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (first, second) = (paragraph("alpha"), paragraph("bravo"));
+        assert!(first.chars().count() > 600 && first.chars().count() < 1100);
+        let text = format!("{first}\n\n{second}");
+        assert_eq!(split(&text, 1100).len(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        // Finish the first section on its own: same section request, same job.
+        let (base, seen, handle) = provider(vec![audio.clone()]);
+        let single = dir.path().join("single.mp3");
+        crate::generation::with_test_transport(&base, || run(plan(&single, false), &first))
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // The provider is unreachable for the second section: nothing left.
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let output = dir.path().join("narration.mp3");
+        let error = crate::generation::with_test_transport(&format!("http://{refused}"), || {
+            run(plan(&output, false), &text)
+        })
+        .unwrap_err()
+        .downcast::<crate::generation::JobOutcome>()
+        .unwrap();
+        assert_eq!(error.code, "not_sent", "{}", error.message);
+        assert_eq!(error.job["status"], "prepared");
+        assert!(
+            error.message.contains("section 2 of 2 is not sent"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("nothing was billed"),
+            "{}",
+            error.message
+        );
+        assert!(!output.exists());
+        // `jobs resume` of the prepared combined job requests only the missing
+        // section and completes.
+        let (base, seen, handle) = provider(vec![audio]);
+        let done = crate::generation::with_test_transport(&base, || {
+            crate::generation::execute_jobs(crate::generation::JobsCommand::Resume {
+                id: error.job["id"].as_str().unwrap().into(),
+                output: Some(output.clone()),
+                overwrite: false,
+                wait: 0,
+                remote_id: None,
+            })
+        })
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(done["status"], "completed", "{done}");
+        assert_eq!(done["id"], error.job["id"]);
+        assert_eq!(seen.lock().unwrap().clone(), vec![second]);
+        assert!(output.is_file());
+        // A section whose answer does not decode stays received; so does the
+        // combined job, with the section's code.
+        let (base, seen, handle) = provider(vec![http("200 OK", "audio/wav", b"not audio")]);
+        let garbled = paragraph("charlie");
+        let output = dir.path().join("garbled.mp3");
+        let error =
+            crate::generation::with_test_transport(&base, || run(plan(&output, false), &garbled))
+                .unwrap_err()
+                .downcast::<crate::generation::JobOutcome>()
+                .unwrap();
+        handle.join().unwrap();
+        assert_eq!(error.code, "job_received", "{}", error.message);
+        assert_eq!(error.job["status"], "received");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(!output.exists());
     }
 }

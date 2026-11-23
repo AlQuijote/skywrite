@@ -40,11 +40,41 @@ impl std::fmt::Display for Unreachable {
 }
 impl std::error::Error for Unreachable {}
 
+/// Classifies a failed `send()`: `Some(detail)` only when reqwest reports a
+/// connect failure. The connector (DNS, TCP, TLS handshake, proxy tunnel) runs
+/// before hyper writes any request byte, rustls sends no early data, and a
+/// reused pooled connection never reaches the connector, so such a request
+/// provably never left this machine. Every other error, and any error while
+/// reading a response body, may follow a sent request and is never classified
+/// here. Clients that call this must neither follow redirects nor retry
+/// (reqwest resends after an HTTP/2 GOAWAY by default).
+pub(crate) fn connect_failure(error: &reqwest::Error) -> Option<String> {
+    if !error.is_connect() {
+        return None;
+    }
+    let mut detail = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !detail.contains(&text) {
+            detail.push(text);
+        }
+        source = cause.source();
+    }
+    Some(if detail.is_empty() {
+        error.to_string()
+    } else {
+        detail.join(": ")
+    })
+}
+
 fn http_client(connect_timeout: Duration, request_timeout: Duration) -> Result<HttpClient> {
     HttpClient::builder()
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
         .redirect(reqwest::redirect::Policy::none())
+        // See `connect_failure`: a client retry could hide an earlier send.
+        .retry(reqwest::retry::never())
         .build()
         .context("initializing HTTPS client")
 }
@@ -111,15 +141,10 @@ impl Client {
     }
 
     fn send_error(&self, error: reqwest::Error, what: &str) -> anyhow::Error {
-        if error.is_connect() {
+        if let Some(detail) = connect_failure(&error) {
             return anyhow::Error::new(Unreachable(format!(
-                "provider {} at {} is unreachable ({}); start the server or fix its base URL (skywrite providers show {}). this request was not sent, and Skywrite does not retry",
-                self.provider.name,
-                self.provider.base_url,
-                std::error::Error::source(&error)
-                    .map(|source| source.to_string())
-                    .unwrap_or_else(|| error.to_string()),
-                self.provider.name
+                "provider {} at {} is unreachable ({detail}); start the server or fix its base URL (skywrite providers show {}). this request was not sent, and Skywrite does not retry",
+                self.provider.name, self.provider.base_url, self.provider.name
             )));
         }
         let hint = if error.is_timeout() {

@@ -142,7 +142,7 @@ pub enum JobsCommand {
         #[arg(long)]
         refresh: bool,
     },
-    /// Retrieve/wait for an existing job. Never submits a paid generation.
+    /// Retrieve/wait for an existing job. Never submits an ordinary job; combined narration requests only its missing sections.
     Resume {
         id: String,
         #[arg(short, long)]
@@ -175,7 +175,7 @@ impl JobStatus {
     pub(crate) fn from_value(value: &Value) -> Result<Self> {
         serde_json::from_value(value.clone()).context("invalid generation state")
     }
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Prepared => "prepared",
             Self::Submitting => "submitting",
@@ -541,6 +541,80 @@ impl std::fmt::Display for HttpRejection {
     }
 }
 impl std::error::Error for HttpRejection {}
+/// A submission whose connection failed before any request byte was written
+/// (see `openrouter::connect_failure`): nothing reached the provider.
+#[derive(Debug)]
+struct NotSent(String);
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not connect to OpenRouter ({})", self.0)
+    }
+}
+impl std::error::Error for NotSent {}
+fn send_failure(error: reqwest::Error) -> anyhow::Error {
+    match crate::openrouter::connect_failure(&error) {
+        Some(detail) => NotSent(detail).into(),
+        None => error.into(),
+    }
+}
+/// A generation command that ended without a result and is not still running.
+/// The CLI prints `{"error":{"code","message","job"}}` and exits 1; `job` is the
+/// same receipt `jobs status` shows.
+#[derive(Debug)]
+pub struct JobOutcome {
+    /// `not_sent`, `job_not_submitted`, `job_uncertain`, `job_received`,
+    /// `job_rejected` or `job_failed`.
+    pub code: &'static str,
+    pub message: String,
+    pub job: Value,
+}
+impl std::fmt::Display for JobOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for JobOutcome {}
+impl JobOutcome {
+    pub(crate) fn status(&self) -> Result<JobStatus> {
+        JobStatus::from_value(&self.job["status"])
+    }
+}
+/// The outcome code of a job that has no result, or `None` when it completed
+/// or is still running at the provider.
+fn outcome_code(status: JobStatus) -> Option<&'static str> {
+    match status {
+        JobStatus::Completed | JobStatus::Pending | JobStatus::InProgress | JobStatus::Ready => {
+            None
+        }
+        JobStatus::Prepared => Some("job_not_submitted"),
+        JobStatus::Received => Some("job_received"),
+        JobStatus::Submitting | JobStatus::Uncertain => Some("job_uncertain"),
+        JobStatus::Rejected => Some("job_rejected"),
+        JobStatus::Failed => Some("job_failed"),
+    }
+}
+/// Ends a generation command: the receipt for completed or still-running jobs,
+/// a `JobOutcome` error for every other state.
+fn conclude(dir: &Path, job: &Job, message: Option<String>) -> Result<Value> {
+    let receipt = public_job(dir, job)?;
+    let Some(code) = outcome_code(job.status) else {
+        return Ok(receipt);
+    };
+    let message = message.unwrap_or_else(|| {
+        format!(
+            "job {} is {}: {}",
+            job.id,
+            job.status,
+            job.error.as_deref().unwrap_or("no further detail recorded")
+        )
+    });
+    Err(JobOutcome {
+        code,
+        message,
+        job: receipt,
+    }
+    .into())
+}
 struct Transport {
     client: Client,
     key: String,
@@ -590,11 +664,18 @@ impl Transport {
         Self::client_with_deadline(Duration::from_secs(300))
     }
     fn client_with_deadline(deadline: Duration) -> Result<Client> {
-        Ok(Client::builder()
+        Ok(Self::client_builder(deadline).build()?)
+    }
+    /// No redirects and no client retries: reqwest otherwise resends a request
+    /// after an HTTP/2 GOAWAY or REFUSED_STREAM, so a paid POST could be sent
+    /// twice, and a connect failure on that resend would hide the first send
+    /// from `openrouter::connect_failure`.
+    fn client_builder(deadline: Duration) -> reqwest::blocking::ClientBuilder {
+        Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(deadline)
             .redirect(reqwest::redirect::Policy::none())
-            .build()?)
+            .retry(reqwest::retry::never())
     }
     fn diagnostic(&self, raw: &str, body: Option<&Value>) -> String {
         let mut message = raw.to_owned();
@@ -630,7 +711,8 @@ impl Transport {
         let response = request
             .bearer_auth(&self.key)
             .header("X-Title", "Skywrite")
-            .send()?;
+            .send()
+            .map_err(send_failure)?;
         let status = response.status();
         let bytes = limited(response, MAX_JSON)?;
         if !status.is_success() {
@@ -1291,29 +1373,42 @@ fn submit_with_upload(
             crate::storage::ensure_uploaded(plan)?;
         }
         job.status = JobStatus::Submitting;
+        job.error = None;
         save_job(&dir, &mut job)?;
         match transport.generated_response(&job.task, &body, &dir) {
             Ok(response) => {
-                if is_synchronous_task(&job.task) {
-                    crate::io::atomic_write(
-                        &dir.join("response.json"),
-                        &serde_json::to_vec(&response)?,
-                        true,
-                    )?;
-                    job.usage = response.get("usage").cloned();
-                    job.status = JobStatus::Received;
+                if let Err(error) = record_response(&dir, &mut job, &response) {
+                    // An answer that cannot be recorded while still submitting:
+                    // the provider may be working on it, so it is uncertain.
+                    if job.status != JobStatus::Submitting {
+                        return Err(error);
+                    }
+                    recover_audio_generation_id(&dir, &mut job)?;
+                    job.status = JobStatus::Uncertain;
+                    job.error = Some(format!(
+                        "Submission outcome uncertain: the provider's answer could not be recorded: {error:#}. {}",
+                        uncertain_advice(&job)
+                    ));
                     save_job(&dir, &mut job)?;
-                    complete_synchronous(&dir, &mut job, &response)?;
-                } else {
-                    let remote = response["id"]
-                        .as_str()
-                        .context("submit response lacks provider job ID")?;
-                    remote_id(remote)?;
-                    job.remote_id = Some(remote.into());
-                    job.status = JobStatus::Pending;
-                    save_job(&dir, &mut job)?;
-                    update_video(&dir, &mut job, &response)?;
+                    let message = format!("{}; job {}", job.error.as_deref().unwrap(), job.id);
+                    return conclude(&dir, &job, Some(message));
                 }
+            }
+            Err(error) if error.downcast_ref::<NotSent>().is_some() => {
+                // Provably never sent: the job may be submitted again, but only
+                // when the user reruns the command.
+                job.status = JobStatus::Prepared;
+                job.error = Some(format!(
+                    "Not sent: {error}. No request reached the provider, so nothing was billed; rerun the same command to submit it. Skywrite does not retry automatically."
+                ));
+                save_job(&dir, &mut job)?;
+                let receipt = public_job(&dir, &job)?;
+                return Err(JobOutcome {
+                    code: "not_sent",
+                    message: format!("{} Job {}.", job.error.as_deref().unwrap(), job.id),
+                    job: receipt,
+                }
+                .into());
             }
             Err(error) => {
                 recover_audio_generation_id(&dir, &mut job)?;
@@ -1336,7 +1431,8 @@ fn submit_with_upload(
                     )
                 });
                 save_job(&dir, &mut job)?;
-                bail!("{}; job {}", job.error.as_deref().unwrap(), job.id);
+                let message = format!("{}; job {}", job.error.as_deref().unwrap(), job.id);
+                return conclude(&dir, &job, Some(message));
             }
         }
     }
@@ -1361,7 +1457,7 @@ fn submit_with_upload(
             open_regular(&dir.join("response.json"), false)?,
             MAX_JSON,
         )?)?;
-        complete_synchronous(&dir, &mut job, &response)?;
+        complete_received(&dir, &mut job, &response)?;
     }
     if job.remote_id.is_some() && !job.status.video_finished() {
         let owned;
@@ -1383,7 +1479,7 @@ fn submit_with_upload(
     {
         publish(&dir, &job, output, common.overwrite)?;
     }
-    public_job(&dir, &job)
+    conclude(&dir, &job, None)
 }
 fn complete_image(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
     let data = response["data"]
@@ -1878,9 +1974,9 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                     open_regular(&dir.join("response.json"), false)?,
                     MAX_JSON,
                 )?)?;
-                complete_synchronous(&dir, &mut job, &value)?;
+                complete_received(&dir, &mut job, &value)?;
             }
-            if is_synchronous_task(&job.task) && job.status == JobStatus::Submitting {
+            if job.status == JobStatus::Submitting {
                 recover_audio_generation_id(&dir, &mut job)?;
                 job.status = JobStatus::Uncertain;
                 job.error = Some(format!(
@@ -1889,7 +1985,24 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                 ));
                 save_job(&dir, &mut job)?;
             }
-            if !is_synchronous_task(&job.task) && job.status.holds_upload() {
+            if job.status == JobStatus::Prepared {
+                let detail = job
+                    .error
+                    .as_deref()
+                    .map(|e| format!(" Last attempt: {e}"))
+                    .unwrap_or_default();
+                let message = format!(
+                    "job {} was never submitted (prepared); nothing was billed. jobs resume never submits: rerun the same generate command to submit it.{detail}",
+                    job.id
+                );
+                return conclude(&dir, &job, Some(message));
+            }
+            // Without a provider ID there is nothing to poll; an uncertain
+            // submission is reported below without needing credentials.
+            if !is_synchronous_task(&job.task)
+                && job.status.holds_upload()
+                && job.remote_id.is_some()
+            {
                 refresh_video(&dir, &mut job, &Transport::new()?, wait)?;
             }
             if initial_status != JobStatus::Completed {
@@ -1897,7 +2010,7 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
             }
             cleanup_job_uploads(&dir, &mut job)?;
             if job.status.resume_blocked() {
-                bail!(
+                let message = format!(
                     "job {} is {} and has no result to resume{}: {}",
                     job.id,
                     job.status,
@@ -1908,13 +2021,14 @@ pub fn execute_jobs(command: JobsCommand) -> Result<Value> {
                     },
                     job.error.as_deref().unwrap_or("no further detail recorded")
                 );
+                return conclude(&dir, &job, Some(message));
             }
             if let Some(output) = output
                 && job.status == JobStatus::Completed
             {
                 publish(&dir, &job, &output, overwrite)?;
             }
-            public_job(&dir, &job)
+            conclude(&dir, &job, None)
         }
     }
 }
@@ -2196,6 +2310,52 @@ fn settle_audio_billing(dir: &Path, job: &mut Job, transport: Option<&Transport>
     }
     Ok(())
 }
+/// Records the provider's answer to a submission: a synchronous result is saved
+/// and completed, a video job ID is saved before polling.
+fn record_response(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
+    if is_synchronous_task(&job.task) {
+        crate::io::atomic_write(
+            &dir.join("response.json"),
+            &serde_json::to_vec(response)?,
+            true,
+        )?;
+        job.usage = response.get("usage").cloned();
+        job.status = JobStatus::Received;
+        save_job(dir, job)?;
+        complete_received(dir, job, response)
+    } else {
+        let remote = response["id"]
+            .as_str()
+            .context("submit response lacks provider job ID")?;
+        remote_id(remote)?;
+        job.remote_id = Some(remote.into());
+        job.status = JobStatus::Pending;
+        save_job(dir, job)?;
+        update_video(dir, job, response)
+    }
+}
+/// Completes a saved synchronous response. A failure that leaves the job
+/// `received` (the provider answered; its result cannot be completed) becomes a
+/// typed outcome with the receipt.
+fn complete_received(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
+    complete_synchronous(dir, job, response).map_err(|error| {
+        if job.status != JobStatus::Received {
+            return error;
+        }
+        match public_job(dir, job) {
+            Ok(receipt) => JobOutcome {
+                code: "job_received",
+                message: format!(
+                    "job {} received a response that could not be completed: {error:#}. The saved response and billing record are kept and never published as a result; no new request is made",
+                    job.id
+                ),
+                job: receipt,
+            }
+            .into(),
+            Err(_) => error,
+        }
+    })
+}
 fn complete_synchronous(dir: &Path, job: &mut Job, response: &Value) -> Result<()> {
     if job.task == "image-generation" {
         return complete_image(dir, job, response);
@@ -2367,6 +2527,13 @@ impl SplitJob {
     pub(crate) fn public(&self) -> Result<Value> {
         public_job(&self.dir, &self.job)
     }
+    /// The typed outcome of a blocked combined job, with its receipt.
+    pub(crate) fn outcome(&self, code: &'static str, message: String) -> anyhow::Error {
+        match public_job(&self.dir, &self.job) {
+            Ok(job) => JobOutcome { code, message, job }.into(),
+            Err(error) => error.context(message),
+        }
+    }
 }
 /// The saved plan of a combined narration job, if `id` is one.
 pub(crate) fn split_plan(id: &str) -> Result<Option<Value>> {
@@ -2480,7 +2647,8 @@ impl Transport {
             .header("Content-Type", "application/json")
             .header("X-Title", "Skywrite")
             .body(encoded)
-            .send()?;
+            .send()
+            .map_err(send_failure)?;
         let status = response.status();
         if !status.is_success() {
             let bytes = limited(response, MAX_JSON)?;
@@ -2874,6 +3042,205 @@ mod tests {
             common: common(),
             wait: 0,
         }
+    }
+    fn outcome(result: Result<Value>) -> JobOutcome {
+        match result {
+            Ok(value) => panic!("expected a job outcome error, got {value}"),
+            Err(error) => error
+                .downcast::<JobOutcome>()
+                .unwrap_or_else(|e| panic!("expected a job outcome error, got {e:#}")),
+        }
+    }
+    /// A loopback port with no listener: connecting is refused.
+    fn refused_transport() -> Transport {
+        let address = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        Transport {
+            client: Transport::client().unwrap(),
+            key: "DUMMY-GENERATION-TEST".into(),
+            base: format!("http://{address}"),
+        }
+    }
+    #[test]
+    fn connect_failure_is_not_sent_and_only_an_explicit_rerun_submits() {
+        if std::env::var_os("SKYWRITE_GENERATION_NOT_SENT_CHILD").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "generation::tests::connect_failure_is_not_sent_and_only_an_explicit_rerun_submits",
+                    "--nocapture",
+                ])
+                .env("SKYWRITE_GENERATION_NOT_SENT_CHILD", "1")
+                .env("SKYWRITE_HOME", temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        for task in ["image-generation", "speech-generation", "video-generation"] {
+            let refused = outcome(submit_with(
+                prepared(task, "not-sent"),
+                Some(&refused_transport()),
+            ));
+            assert_eq!(refused.code, "not_sent", "{task}: {}", refused.message);
+            assert_eq!(refused.job["status"], "prepared", "{task}");
+            assert!(
+                refused.message.contains("nothing was billed"),
+                "{}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains("rerun the same command"),
+                "{}",
+                refused.message
+            );
+            let error = refused.job["error"].as_str().unwrap();
+            assert!(error.starts_with("Not sent:"), "{error}");
+            assert!(
+                error.contains("Connection refused") || error.contains("connect"),
+                "{error}"
+            );
+            // jobs resume never submits a prepared job and exits nonzero.
+            let resume = outcome(execute_jobs(JobsCommand::Resume {
+                id: refused.job["id"].as_str().unwrap().into(),
+                output: None,
+                overwrite: false,
+                wait: 0,
+                remote_id: None,
+            }));
+            assert_eq!(resume.code, "job_not_submitted", "{task}");
+            assert!(resume.message.contains("Not sent:"), "{}", resume.message);
+        }
+        // A 200 answer without a video job ID cannot be recorded: uncertain.
+        let (t, seen, handle) = server(vec![json_http(json!({"status":"pending"}))], true);
+        let missing = outcome(submit_with(prepared("video-generation", "no-id"), Some(&t)));
+        handle.join().unwrap();
+        assert_eq!(missing.code, "job_uncertain", "{}", missing.message);
+        assert_eq!(missing.job["status"], "uncertain");
+        assert!(
+            missing.message.contains("lacks provider job ID"),
+            "{}",
+            missing.message
+        );
+        let again = outcome(submit_with(prepared("video-generation", "no-id"), Some(&t)));
+        assert_eq!(again.code, "job_uncertain");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // Rerunning the same command submits exactly once and completes.
+        let (t, seen, handle) = server(vec![json_http(image_response())], true);
+        let done = submit_with(prepared("image-generation", "not-sent"), Some(&t)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(done["status"], "completed");
+        assert!(done["error"].is_null());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let replay = submit_with(
+            prepared("image-generation", "not-sent"),
+            Some(&refused_transport()),
+        );
+        assert_eq!(replay.unwrap()["status"], "completed");
+        // A request that left but got no reply before the deadline stays uncertain.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(Mutex::new(0usize));
+        let counter = accepted.clone();
+        let stall = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            *counter.lock().unwrap() += 1;
+            let mut buffer = [0; 4096];
+            let _ = socket.read(&mut buffer);
+            std::thread::sleep(Duration::from_millis(1500));
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                listener.accept().is_err(),
+                "uncertain job must not resubmit"
+            );
+        });
+        let slow = Transport {
+            client: Transport::client_with_deadline(Duration::from_millis(500)).unwrap(),
+            key: "DUMMY-GENERATION-TEST".into(),
+            base: format!("http://{address}"),
+        };
+        let timed_out = outcome(submit_with(
+            prepared("image-generation", "stalled"),
+            Some(&slow),
+        ));
+        assert_eq!(timed_out.code, "job_uncertain", "{}", timed_out.message);
+        assert_eq!(timed_out.job["status"], "uncertain");
+        let again = outcome(submit_with(
+            prepared("image-generation", "stalled"),
+            Some(&slow),
+        ));
+        assert_eq!(again.code, "job_uncertain");
+        stall.join().unwrap();
+        assert_eq!(*accepted.lock().unwrap(), 1);
+    }
+    #[test]
+    fn http2_goaway_after_a_sent_post_stays_uncertain() {
+        const SELECTOR: &str = "generation::tests::http2_goaway_after_a_sent_post_stays_uncertain";
+        if std::env::var_os("SKYWRITE_GENERATION_GOAWAY_CHILD").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", SELECTOR, "--nocapture"])
+                .env("SKYWRITE_GENERATION_GOAWAY_CHILD", "1")
+                .env("SKYWRITE_HOME", temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        fn frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+            let length = (payload.len() as u32).to_be_bytes();
+            [&length[1..], &[kind, flags, 0, 0, 0, 0], payload].concat()
+        }
+        // A minimal HTTP/2 peer: it reads the POST's HEADERS (request bytes have
+        // left the client), stops listening so any resend could only fail to
+        // connect, then answers with GOAWAY(NO_ERROR), which reqwest's default
+        // retry policy would resend.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut preface = [0u8; 24];
+            socket.read_exact(&mut preface).unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            socket.write_all(&frame(4, 0, &[])).unwrap();
+            loop {
+                let mut header = [0u8; 9];
+                socket.read_exact(&mut header).unwrap();
+                let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let mut payload = vec![0; length];
+                socket.read_exact(&mut payload).unwrap();
+                match header[3] {
+                    4 if header[4] & 1 == 0 => socket.write_all(&frame(4, 1, &[])).unwrap(),
+                    1 => break,
+                    _ => {}
+                }
+            }
+            drop(listener);
+            socket.write_all(&frame(7, 0, &[0; 8])).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        // Production builder; prior knowledge only selects HTTP/2 without TLS.
+        let transport = Transport {
+            client: Transport::client_builder(Duration::from_secs(10))
+                .http2_prior_knowledge()
+                .build()
+                .unwrap(),
+            key: "DUMMY-GENERATION-TEST".into(),
+            base: format!("http://{address}"),
+        };
+        let result = outcome(submit_with(
+            prepared("image-generation", "goaway"),
+            Some(&transport),
+        ));
+        peer.join().unwrap();
+        assert_eq!(result.code, "job_uncertain", "{}", result.message);
+        assert_eq!(result.job["status"], "uncertain");
     }
     fn fixture_png() -> Vec<u8> {
         base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jQZkAAAAASUVORK5CYII=").unwrap()
@@ -3319,11 +3686,21 @@ mod tests {
         fs::write(&output, b"original").unwrap();
         assert!(publish(&dir, &load_job(&dir).unwrap(), &output, false).is_err());
         assert_eq!(fs::read(output).unwrap(), b"original");
+        // Accept-then-close: the request may have arrived, so it stays uncertain.
         let (t, seen, handle) = server(vec![Vec::new()], true);
-        assert!(submit_with(prepared("video-generation", "uncertain"), Some(&t)).is_err());
+        let first = outcome(submit_with(
+            prepared("video-generation", "uncertain"),
+            Some(&t),
+        ));
+        assert_eq!(first.code, "job_uncertain", "{}", first.message);
+        assert_eq!(first.job["status"], "uncertain");
         handle.join().unwrap();
-        let retry = submit_with(prepared("video-generation", "uncertain"), Some(&t)).unwrap();
-        assert_eq!(retry["status"], "uncertain");
+        let retry = outcome(submit_with(
+            prepared("video-generation", "uncertain"),
+            Some(&t),
+        ));
+        assert_eq!(retry.code, "job_uncertain");
+        assert_eq!(retry.job["status"], "uncertain");
         assert_eq!(
             seen.lock().unwrap().len(),
             1,
@@ -3331,12 +3708,18 @@ mod tests {
         );
         let rejection=b"HTTP/1.1 400 Bad Request\r\nContent-Length: 18\r\nConnection: close\r\n\r\ninvalid parameters".to_vec();
         let (t, seen, handle) = server(vec![rejection], true);
-        assert!(submit_with(prepared("video-generation", "rejected"), Some(&t)).is_err());
+        let first = outcome(submit_with(
+            prepared("video-generation", "rejected"),
+            Some(&t),
+        ));
+        assert_eq!(first.code, "job_rejected");
         handle.join().unwrap();
-        assert_eq!(
-            submit_with(prepared("video-generation", "rejected"), Some(&t)).unwrap()["status"],
-            "rejected"
-        );
+        let again = outcome(submit_with(
+            prepared("video-generation", "rejected"),
+            Some(&t),
+        ));
+        assert_eq!(again.code, "job_rejected");
+        assert_eq!(again.job["status"], "rejected");
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
     #[test]
@@ -3714,7 +4097,7 @@ mod tests {
         assert_eq!(only_job.generation_id.as_deref(), Some("gen-partial"));
         assert_eq!(only_job.status, JobStatus::Uncertain);
         assert_eq!(
-            submit_with(incomplete(), Some(&transport)).unwrap()["status"],
+            outcome(submit_with(incomplete(), Some(&transport))).job["status"],
             "uncertain"
         );
         assert_eq!(

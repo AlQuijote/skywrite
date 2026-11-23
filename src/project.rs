@@ -969,6 +969,19 @@ fn recover(l: &Loaded, n: &Node, s: &NodeState, args: &RunArgs, engine: &Engine)
         remote_id: None,
     })
 }
+/// The node state for a job state that is not a not-sent outcome.
+fn node_status(status: JobStatus) -> NodeStatus {
+    match status {
+        JobStatus::Completed => NodeStatus::Completed,
+        JobStatus::Failed | JobStatus::Rejected => NodeStatus::Failed,
+        JobStatus::Pending | JobStatus::InProgress => NodeStatus::Waiting,
+        JobStatus::Prepared
+        | JobStatus::Submitting
+        | JobStatus::Received
+        | JobStatus::Ready
+        | JobStatus::Uncertain => NodeStatus::Uncertain,
+    }
+}
 fn run(args: RunArgs, resume: bool, engine: Engine) -> Result<Value> {
     if !(1..=8).contains(&args.concurrency) || args.wait > 1800 {
         bail!("concurrency must be 1..8 and wait at most 1800 seconds");
@@ -1143,21 +1156,25 @@ fn run(args: RunArgs, resume: bool, engine: Engine) -> Result<Value> {
                                 }
                             }
                         } else {
-                            s.status = match JobStatus::from_value(&value["status"])? {
-                                JobStatus::Completed => NodeStatus::Completed,
-                                JobStatus::Failed | JobStatus::Rejected => NodeStatus::Failed,
-                                JobStatus::Pending | JobStatus::InProgress => NodeStatus::Waiting,
-                                JobStatus::Prepared
-                                | JobStatus::Submitting
-                                | JobStatus::Received
-                                | JobStatus::Ready
-                                | JobStatus::Uncertain => NodeStatus::Uncertain,
-                            };
+                            s.status = node_status(JobStatus::from_value(&value["status"])?);
                             s.error = value["error"].as_str().map(str::to_owned);
                             if s.status != NodeStatus::Waiting {
                                 stopped = true;
                             }
                         }
+                    }
+                    Err(e) if e.downcast_ref::<crate::generation::JobOutcome>().is_some() => {
+                        let outcome = e.downcast_ref::<crate::generation::JobOutcome>().unwrap();
+                        s.status = if outcome.job["id"].as_str() != s.planned_id.as_deref() {
+                            NodeStatus::Uncertain
+                        } else if outcome.code == "not_sent" {
+                            // Provably never sent: the next explicit run submits it.
+                            NodeStatus::Pending
+                        } else {
+                            node_status(outcome.status()?)
+                        };
+                        s.error = Some(format!("{e:#}"));
+                        stopped = true;
                     }
                     Err(e) => {
                         // Only this worker's observed pre-receipt failure proves

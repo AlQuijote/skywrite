@@ -14,7 +14,9 @@ Use `project status FILE` and `project resume FILE` to aggregate/recover jobs.
 Inspect `complete` and node errors; incomplete aggregate output is not success for
 every node. Never delete state to retry uncertainty. Resume never repeats a started
 submission. Reconcile uncertain jobs against provider activity before an explicit
-new take/new manifest/new output. No automatic paid regeneration.
+new take/new manifest/new output. No automatic paid regeneration. A node whose
+submission was `not_sent` (connection failed, nothing billed) is back to pending;
+`project resume` submits it once.
 
 Paths are manifest-relative, outputs must remain beneath the declared output root,
 and existing outputs and local inputs are preserved. Keep manifest bytes and source
