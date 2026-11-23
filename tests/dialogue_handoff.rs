@@ -54,7 +54,9 @@ fn cached_edit_request_uses_bounded_words_and_retains_subframe_dialogue_source_i
     let prompt = skywrite::analysis::suggest_prompt(brief, &schema["edit"], &encoded);
     let request = json!({"model":"fixture/dialogue","messages":[{"role":"user","content":prompt}],"response_format":{"type":"json_object"},"max_tokens":4000,"temperature":0.2});
     let key = skywrite::openrouter::cache_key(&[
-        b"https://openrouter.ai/api/v1",
+        skywrite::providers::Provider::builtin()
+            .identity()
+            .as_bytes(),
         b"chat/completions",
         &serde_json::to_vec(&request).unwrap(),
     ]);

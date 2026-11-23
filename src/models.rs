@@ -96,6 +96,9 @@ fn selected_model(
     {
         bail!("model ID must contain 1..256 UTF-8 bytes without whitespace or controls");
     }
+    if let Some(model) = &model {
+        crate::providers::split_reference(model)?;
+    }
     Ok(ModelSelection {
         task: task.into(),
         model,
@@ -134,12 +137,26 @@ pub fn selection_with_defaults(
 }
 
 /// No automatic "best model" substitution; a missing model is actionable.
-pub fn resolve_model(task: &str, explicit: Option<&str>) -> Result<String> {
+/// Resolves the provider too: an unknown provider, or a custom provider for a
+/// task that needs OpenRouter-specific APIs, fails here before any work.
+pub fn resolve_target(task: &str, explicit: Option<&str>) -> Result<crate::providers::ModelRef> {
     let selection = selection(task, explicit)?;
-    selection.model.with_context(|| format!(
+    let reference = selection.model.with_context(|| format!(
         "{} requires --model, {}, or skywrite defaults {} set MODEL (skywrite init can add starter preferences)",
         selection.task, selection.environment_variable, selection.task
-    ))
+    ))?;
+    let target = crate::providers::resolve_reference(&reference)?;
+    crate::providers::check_task(&selection.task, &target.provider)?;
+    Ok(target)
+}
+
+/// The OpenRouter model ID for a task that only OpenRouter serves.
+pub fn resolve_model(task: &str, explicit: Option<&str>) -> Result<String> {
+    let target = resolve_target(task, explicit)?;
+    if !target.provider.is_openrouter() {
+        bail!("{task} supports only provider openrouter");
+    }
+    Ok(target.model)
 }
 #[derive(Default)]
 pub struct ListOptions<'a> {
@@ -150,6 +167,8 @@ pub struct ListOptions<'a> {
     pub refresh: bool,
     pub offline: bool,
     pub cache_dir: Option<&'a Path>,
+    /// Provider whose catalog to list; `None` is the built-in OpenRouter.
+    pub provider: Option<&'a str>,
 }
 #[derive(Serialize, Deserialize)]
 struct CatalogCache {
@@ -162,8 +181,24 @@ fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 fn load_catalog(options: &ListOptions<'_>, endpoint: &str) -> Result<(Value, Value)> {
+    load_provider_catalog(options, &crate::providers::Provider::builtin(), endpoint)
+}
+fn load_provider_catalog(
+    options: &ListOptions<'_>,
+    provider: &crate::providers::Provider,
+    endpoint: &str,
+) -> Result<(Value, Value)> {
     let root = crate::cache::cache_root(options.cache_dir)?;
-    let key = crate::openrouter::cache_key(&[b"catalog-v1", endpoint.as_bytes()]);
+    // The built-in key is unchanged; custom catalogs also key on the provider.
+    let key = if provider.is_openrouter() {
+        crate::openrouter::cache_key(&[b"catalog-v1", endpoint.as_bytes()])
+    } else {
+        crate::openrouter::cache_key(&[
+            b"catalog-v1",
+            provider.identity().as_bytes(),
+            endpoint.as_bytes(),
+        ])
+    };
     let path = root.join("models").join(format!("{key}.json"));
     let cached = if path.exists() && !options.refresh {
         let metadata = std::fs::symlink_metadata(&path)?;
@@ -195,7 +230,7 @@ fn load_catalog(options: &ListOptions<'_>, endpoint: &str) -> Result<(Value, Val
     if options.offline {
         bail!("no usable offline model catalog for {endpoint}; run models list online first");
     }
-    let body = crate::openrouter::OpenRouter::new(None)?.catalog(endpoint)?;
+    let body = crate::openrouter::Client::new(provider, None)?.catalog(endpoint)?;
     let cache = CatalogCache {
         version: 1,
         endpoint: endpoint.into(),
@@ -262,6 +297,12 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
     }
     if options.search.is_some_and(|s| s.len() > 256) {
         bail!("model search exceeds 256 bytes");
+    }
+    if let Some(name) = options.provider {
+        let provider = crate::providers::get(name)?;
+        if !provider.is_openrouter() {
+            return list_custom(options, &provider);
+        }
     }
     let mut sources = Vec::new();
     let mut data = Vec::new();
@@ -405,6 +446,72 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
     };
     Ok(
         json!({"version":1,"task":task,"models":data,"sources":sources,"warnings":warnings,"catalog_ttl_seconds":TTL,"paid_inference_performed":false,"note":"Catalog capabilities and prices are provider claims, not successful compatibility tests. Word timestamp support is not guaranteed by transcription modality alone."}),
+    )
+}
+
+/// A custom provider's `/models` lists IDs; capabilities are reported only
+/// when the catalog states them, never guessed from names.
+fn list_custom(options: &ListOptions<'_>, provider: &crate::providers::Provider) -> Result<Value> {
+    let task = options.task.map(canonical_task).transpose()?;
+    if let Some(task) = task {
+        crate::providers::check_task(task, provider)?;
+    }
+    let wanted_input = match task {
+        Some("frame-description") => Some("image"),
+        Some("video-description") => Some("video"),
+        _ => None,
+    };
+    let (catalog, metadata) = load_provider_catalog(options, provider, "models")?;
+    let mut models = Vec::new();
+    for value in catalog["data"].as_array().into_iter().flatten() {
+        let Some(id) = value["id"].as_str() else {
+            continue;
+        };
+        let declared = value["architecture"]["input_modalities"].is_array();
+        if let Some(wanted) = wanted_input
+            && declared
+            && !has_modality(value, "input", wanted)
+        {
+            continue;
+        }
+        if options
+            .input
+            .is_some_and(|m| declared && !has_modality(value, "input", m))
+            || options.output.is_some_and(|m| {
+                value["architecture"]["output_modalities"].is_array()
+                    && !has_modality(value, "output", m)
+            })
+            || options
+                .search
+                .is_some_and(|s| !id.to_lowercase().contains(&s.to_lowercase()))
+        {
+            continue;
+        }
+        let mut entry = json!({"id":id,"reference":format!("{}:{id}", provider.name),"provider":provider.name,
+            "capabilities_verified":declared && wanted_input.is_some()});
+        if declared {
+            entry["architecture"] = value["architecture"].clone();
+        }
+        if !value["owned_by"].is_null() {
+            entry["owned_by"] = value["owned_by"].clone();
+        }
+        models.push(entry);
+    }
+    models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let mut warnings = Vec::new();
+    if catalog["skywrite_missing_catalog"] == true {
+        warnings.push(format!(
+            "{} has no /models catalog; any model ID is accepted unverified",
+            provider.name
+        ));
+    }
+    if models.iter().any(|m| m["capabilities_verified"] != true) && wanted_input.is_some() {
+        warnings.push("Models without declared input modalities are listed unverified: the catalog cannot vouch for image or video input. A request to a model without it fails with an error.".into());
+    }
+    Ok(
+        json!({"version":1,"provider":provider.summary(),"task":task,"models":models,"sources":[metadata],
+        "warnings":warnings,"catalog_ttl_seconds":TTL,"paid_inference_performed":false,
+        "note":"Listed IDs come from the provider's own /models. Use them as PROVIDER:MODEL. Capabilities are verified only when the catalog declares input modalities."}),
     )
 }
 

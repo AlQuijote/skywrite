@@ -362,7 +362,8 @@ fn seeded_frame_descriptions_are_reused_across_overlapping_passes() {
     let model = "fixture/frames";
     // Seed one second-spaced frames: 0, 1, 2 seconds.
     for second in 0..3 {
-        let key = skywrite::describe::frame_cache_key(&sha, second as f64, model, None).unwrap();
+        let target = skywrite::providers::resolve(model, &Default::default()).unwrap();
+        let key = skywrite::describe::frame_cache_key(&sha, second as f64, &target, None).unwrap();
         let path = cache.join("frame-descriptions").join(format!("{key}.json"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(

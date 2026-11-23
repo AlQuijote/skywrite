@@ -18,7 +18,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Check installed media tools without accessing the network.
+    /// Check installed media tools, and whether configured custom providers answer (no generation).
     Doctor,
     /// Inspect local media metadata using ffprobe.
     #[command(alias = "ingest")]
@@ -37,7 +37,7 @@ enum Command {
     Verify(skywrite::verify::VerifyArgs),
     /// Sample timestamped frames and optionally request structured model understanding.
     Analyze(AnalyzeArgs),
-    /// Transcribe bounded audio chunks through OpenRouter with real word timestamps.
+    /// Transcribe bounded audio chunks through OpenRouter or a provider, with real word timestamps.
     Transcribe(TranscribeArgs),
     /// Estimate asset-to-reference time offset and clock scale.
     Sync(SyncArgs),
@@ -50,6 +50,14 @@ enum Command {
     Models {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    /// Register OpenAI-compatible model providers (local llama.cpp, Ollama, LM Studio, other hosts).
+    #[command(
+        after_help = "Model references are PROVIDER:MODEL wherever a model ID is accepted (--model, SKYWRITE_<TASK>_MODEL, defaults set): local:qwen3.5-0.8b, local:qwen3:0.8b. A bare ID, or one with '/' before its first ':' (vendor/model:free), is an OpenRouter model.\n\nCustom providers serve analysis, frame-description, video-description, transcription and editing. SKYWRITE_DATA_POLICY routing, usage accounting and other OpenRouter-only fields are never sent to them; their own retention applies.\n\nExamples:\n  skywrite providers add local --base-url http://127.0.0.1:8080/v1\n  skywrite providers add ollama --base-url http://127.0.0.1:11434/v1 --timeout 900\n  skywrite providers add hosted --base-url https://api.example.com/v1 --key-env EXAMPLE_API_KEY\n  skywrite models list --provider local\n  skywrite describe frames clip.mp4 --every 30 --model local:qwen3.5-0.8b"
+    )]
+    Providers {
+        #[command(subcommand)]
+        command: skywrite::providers::ProvidersCommand,
     },
     /// Inspect or set effective task model defaults.
     #[command(alias = "default")]
@@ -188,10 +196,10 @@ struct AnalyzeArgs {
     start: f64,
     #[arg(long)]
     duration: Option<f64>,
-    /// Only sample local frames and metadata; do not call OpenRouter.
+    /// Only sample local frames and metadata; do not call a model.
     #[arg(long, conflicts_with = "model")]
     local: bool,
-    /// OpenRouter model ID; alternatively set SKYWRITE_ANALYSIS_MODEL.
+    /// Model reference (vendor/model on OpenRouter, or PROVIDER:MODEL); alternatively set SKYWRITE_ANALYSIS_MODEL.
     #[arg(long)]
     model: Option<String>,
     /// Existing timestamped transcript of this same media file.
@@ -382,7 +390,7 @@ enum ImageCommand {
 
 #[derive(Subcommand)]
 enum ModelCommand {
-    /// List capabilities and prices from free cached OpenRouter catalogs.
+    /// List capabilities and prices from free cached OpenRouter catalogs, or a provider's /models.
     List {
         #[arg(long,value_parser=skywrite::models::task_parser())]
         task: Option<String>,
@@ -398,6 +406,9 @@ enum ModelCommand {
         offline: bool,
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// List a configured provider's own /models instead of OpenRouter's catalogs.
+        #[arg(long, value_name = "NAME")]
+        provider: Option<String>,
     },
 }
 
@@ -459,9 +470,12 @@ fn main() {
         }
     }
 }
-fn api(options: &ApiOptions) -> Result<skywrite::openrouter::OpenRouter> {
+fn api(
+    options: &ApiOptions,
+    provider: &skywrite::providers::Provider,
+) -> Result<skywrite::openrouter::Client> {
     let cache = skywrite::cache::cache_root(options.cache_dir.as_deref())?.join("responses");
-    skywrite::openrouter::OpenRouter::new(if options.no_cache { None } else { Some(&cache) })
+    skywrite::openrouter::Client::new(provider, if options.no_cache { None } else { Some(&cache) })
 }
 fn finish(value: Value, output: &OutputOptions) -> Result<Value> {
     if let Some(path) = &output.output {
@@ -539,6 +553,7 @@ fn execute(command: Command) -> Result<Value> {
                 );
                 tools.insert(tool.to_owned(),match result {Ok(out)=>json!({"available":true,"version":String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("")}),Err(error)=>json!({"available":false,"reason":error.to_string()})});
             }
+            let (providers, network_checked) = provider_health();
             let (audio_stretcher, burned_captions) = match skywrite::media::ffmpeg_filters() {
                 Ok(listing) => {
                     let rubberband = skywrite::media::has_filter(&listing, "rubberband");
@@ -561,7 +576,7 @@ fn execute(command: Command) -> Result<Value> {
                 ),
             };
             Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"network_checked":false,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":skywrite::image::TAKUMI_VERSION,"available":true},"audio_stretcher":audio_stretcher,"burned_captions":burned_captions}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"tools":tools,"openrouter_key_present":std::env::var_os("OPENROUTER_API_KEY").is_some(),"providers":providers,"network_checked":network_checked,"required_tools":["ffmpeg","ffprobe"],"optional_tools":["hyperframes","node (Remotion)"],"native_image_renderer":{"name":"takumi","version":skywrite::image::TAKUMI_VERSION,"available":true},"audio_stretcher":audio_stretcher,"burned_captions":burned_captions}),
             )
         }
         Command::Verify(args) => skywrite::verify::execute(args),
@@ -615,12 +630,13 @@ fn execute(command: Command) -> Result<Value> {
             preflight_output(&args.output)?;
             protect_inputs(&args.output, std::slice::from_ref(&args.input))?;
             let info = skywrite::media::probe(&args.input)?;
-            let model = skywrite::models::resolve_model("transcription", args.model.as_deref())?;
+            let target = skywrite::models::resolve_target("transcription", args.model.as_deref())?;
             let result = skywrite::transcript::transcribe(
                 &info,
-                &api(&args.api)?,
+                &api(&args.api, &target.provider)?,
                 &skywrite::transcript::TranscribeOptions {
-                    model: &model,
+                    model: &target.model,
+                    reference: &target.reference(),
                     language: args.language.as_deref(),
                     start: args.start,
                     duration: args.duration,
@@ -636,10 +652,10 @@ fn execute(command: Command) -> Result<Value> {
                 .collect();
             protect_inputs(&args.output, &inputs)?;
             let info = skywrite::media::probe_for_timing(&args.input)?;
-            let model = if args.local {
+            let target = if args.local {
                 None
             } else {
-                Some(skywrite::models::resolve_model(
+                Some(skywrite::models::resolve_target(
                     "analysis",
                     args.model.as_deref(),
                 )?)
@@ -648,11 +664,11 @@ fn execute(command: Command) -> Result<Value> {
                 Some(path) => path,
                 None => skywrite::cache::cache_root(args.api.cache_dir.as_deref())?.join("assets"),
             };
-            let client = if args.local {
-                None
-            } else {
-                Some(api(&args.api)?)
-            };
+            let reference = target.as_ref().map(|target| target.reference());
+            let client = target
+                .as_ref()
+                .map(|target| api(&args.api, &target.provider))
+                .transpose()?;
             let result = skywrite::analysis::analyze(
                 info,
                 client.as_ref(),
@@ -661,7 +677,8 @@ fn execute(command: Command) -> Result<Value> {
                     frames_dir: &frames_dir,
                     start: args.start,
                     duration: args.duration,
-                    model: if args.local { None } else { model.as_deref() },
+                    model: target.as_ref().map(|target| target.model.as_str()),
+                    reference: reference.as_deref(),
                     transcript: args.transcript.as_deref(),
                     prompt: args.prompt.as_deref(),
                 },
@@ -822,6 +839,7 @@ fn execute(command: Command) -> Result<Value> {
                 refresh,
                 offline,
                 cache_dir,
+                provider,
             } => skywrite::models::list(&skywrite::models::ListOptions {
                 task: task.as_deref(),
                 input: input.as_deref(),
@@ -830,8 +848,10 @@ fn execute(command: Command) -> Result<Value> {
                 refresh,
                 offline,
                 cache_dir: cache_dir.as_deref(),
+                provider: provider.as_deref(),
             }),
         },
+        Command::Providers { command } => skywrite::providers::execute(command),
         Command::Styles { command } => {
             skywrite::workspace::execute_content(skywrite::workspace::ContentKind::Styles, command)
         }
@@ -868,6 +888,65 @@ fn execute(command: Command) -> Result<Value> {
             }),
         },
     }
+}
+/// Configured providers and whether each custom one answers its `/models`
+/// (a free listing; never a generation). OpenRouter is not contacted.
+fn provider_health() -> (Value, bool) {
+    let providers = match skywrite::providers::all() {
+        Ok(providers) => providers,
+        Err(error) => return (json!({"error":format!("{error:#}")}), false),
+    };
+    let mut checked = false;
+    let report = providers
+        .iter()
+        .map(|provider| {
+            let mut value = provider.summary();
+            value
+                .as_object_mut()
+                .map(|object| object.remove("openrouter_only_features"));
+            if provider.is_openrouter() {
+                value["reachable"] = json!(null);
+                value["check"] =
+                    json!("not checked; doctor contacts only configured custom providers");
+                return value;
+            }
+            if let Err(error) = provider.api_key() {
+                value["reachable"] = json!(null);
+                value["error"] = json!(format!("not checked: {error:#}"));
+                return value;
+            }
+            checked = true;
+            let mut probe = provider.clone();
+            probe.timeout = Duration::from_secs(10);
+            let started = std::time::Instant::now();
+            let result = skywrite::openrouter::Client::new(&probe, None)
+                .and_then(|client| client.catalog("models"));
+            value["latency_ms"] = json!(started.elapsed().as_millis() as u64);
+            match result {
+                Ok(catalog) => {
+                    value["reachable"] = json!(true);
+                    value["catalog"] = if catalog["skywrite_missing_catalog"] == true {
+                        json!("no /models endpoint")
+                    } else {
+                        json!(format!(
+                            "{} models listed",
+                            catalog["data"].as_array().map_or(0, Vec::len)
+                        ))
+                    };
+                }
+                Err(error) => {
+                    value["reachable"] = json!(
+                        error
+                            .downcast_ref::<skywrite::openrouter::Unreachable>()
+                            .is_none()
+                    );
+                    value["error"] = json!(format!("{error:#}"));
+                }
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    (json!(report), checked)
 }
 fn preflight_output(output: &OutputOptions) -> Result<()> {
     if output.output.as_ref().is_some_and(|p| p.exists()) && !output.overwrite {
@@ -928,7 +1007,7 @@ fn suggest(
     protect_inputs(output, &dependencies)?;
     let identities =
         skywrite::analysis::attach_transcripts_with_identities(&mut reports, &attached)?;
-    let model = skywrite::models::resolve_model("editing", model)?;
+    let target = skywrite::models::resolve_target("editing", model)?;
     let encoded = serde_json::to_vec(&skywrite::analysis::suggestion_context_with_identities(
         &reports,
         &identities,
@@ -938,7 +1017,7 @@ fn suggest(
     }
     let prompt =
         skywrite::analysis::suggest_prompt(brief, &schema()["edit"], &String::from_utf8(encoded)?);
-    let response=api(options)?.request("chat/completions",&json!({"model":model,"messages":[{"role":"user","content":prompt}],"response_format":{"type":"json_object"},"max_tokens":4000,"temperature":0.2}))?;
+    let response=api(options, &target.provider)?.request("chat/completions",&json!({"model":target.model,"messages":[{"role":"user","content":prompt}],"response_format":{"type":"json_object"},"max_tokens":4000,"temperature":0.2}))?;
     let draft = skywrite::openrouter::assistant_json(&response.body)?;
     let mut referenced = Vec::new();
     for kind in ["video", "audio"] {

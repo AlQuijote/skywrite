@@ -15,7 +15,7 @@ skywrite inspect camera.mp4 recorder.wav            # both need an audio stream,
 skywrite sync --reference camera.mp4 --asset recorder.wav --method audio -o recorder.sync.json
 ```
 
-`--method audio` is local and free (waveform). `--method auto` uses transcripts only when both inputs are `.json`; for speech without shared sound, transcribe each file (`skywrite transcribe FILE -o FILE.transcript.json`, a paid API call) and sync the two transcripts. Only the first `--max-audio-seconds` (default 3600) of each file is analyzed.
+`--method audio` is local and free (waveform). `--method auto` uses transcripts only when both inputs are `.json`; for speech without shared sound, transcribe each file (`skywrite transcribe FILE -o FILE.transcript.json`, a paid API call on OpenRouter, or a request to the user's own provider for a `PROVIDER:MODEL` model) and sync the two transcripts. Only the first `--max-audio-seconds` (default 3600) of each file is analyzed.
 
 ## 3. Place it
 

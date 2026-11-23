@@ -287,7 +287,10 @@ impl TranscriptBudget {
 }
 
 pub struct TranscribeOptions<'a> {
+    /// The ID sent to the provider.
     pub model: &'a str,
+    /// The canonical reference recorded in the transcript (`local:whisper` or a bare OpenRouter ID).
+    pub reference: &'a str,
     pub language: Option<&'a str>,
     pub start: f64,
     pub duration: Option<f64>,
@@ -295,7 +298,7 @@ pub struct TranscribeOptions<'a> {
 }
 pub fn transcribe(
     info: &crate::media::MediaInfo,
-    api: &crate::openrouter::OpenRouter,
+    api: &crate::openrouter::Client,
     options: &TranscribeOptions<'_>,
 ) -> Result<Transcript> {
     transcribe_with_limits(
@@ -308,7 +311,7 @@ pub fn transcribe(
 }
 fn transcribe_with_limits(
     info: &crate::media::MediaInfo,
-    api: &crate::openrouter::OpenRouter,
+    api: &crate::openrouter::Client,
     options: &TranscribeOptions<'_>,
     max_bytes: usize,
     max_words: usize,
@@ -360,7 +363,7 @@ fn transcribe_with_limits(
         duration: info.duration,
         text: String::new(),
         words: Vec::new(),
-        model: Some(options.model.to_owned()),
+        model: Some(options.reference.to_owned()),
         usage: Some(
             json!({"chunks":[],"cache_hits":chunks,"total_chunks":chunks,"source_sha256":source_sha256,"low_audio_words":max_words,"word_ordering":{"method":"stable_start_time","provider_reordered_chunks":chunks,"chunk_boundary_reordered":false}}),
         ),
@@ -468,7 +471,7 @@ fn transcribe_with_limits(
         duration: info.duration,
         text: texts.join(" "),
         words,
-        model: Some(options.model.to_owned()),
+        model: Some(options.reference.to_owned()),
         usage: Some(
             json!({"chunks":usages,"cache_hits":cache_hits,"total_chunks":chunks,"source_sha256":source_sha256,
                 "low_audio_words":low_audio_count,"word_ordering":{"method":"stable_start_time","provider_reordered_chunks":provider_reordered_chunks,"chunk_boundary_reordered":chunk_boundary_reordered}}),
@@ -826,7 +829,7 @@ mod tests {
         let info = crate::media::probe(&source).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let api = crate::openrouter::OpenRouter::for_test(
+        let api = crate::openrouter::Client::for_test(
             format!("http://{}", listener.local_addr().unwrap()),
             None,
             std::time::Duration::from_secs(2),
@@ -884,6 +887,7 @@ mod tests {
         });
         let options = TranscribeOptions {
             model: "fixture",
+            reference: "fixture",
             language: None,
             start: 0.,
             duration: None,
@@ -929,7 +933,7 @@ mod tests {
             crate::media::extract_audio(&info, &chunk, index as f64 * 10., 10.).unwrap();
             let request = json!({"model":"fixture","input_audio":{"data":STANDARD.encode(std::fs::read(chunk).unwrap()),"format":"wav"},"response_format":"verbose_json","timestamp_granularities":["word"]});
             let key = crate::openrouter::cache_key(&[
-                b"https://openrouter.ai/api/v1",
+                crate::providers::Provider::builtin().identity().as_bytes(),
                 b"audio/transcriptions",
                 &serde_json::to_vec(&request).unwrap(),
             ]);
@@ -944,9 +948,12 @@ mod tests {
             )
             .unwrap();
         }
-        let api = crate::openrouter::OpenRouter::new(Some(&cache)).unwrap();
+        let api =
+            crate::openrouter::Client::new(&crate::providers::Provider::builtin(), Some(&cache))
+                .unwrap();
         let options = TranscribeOptions {
             model: "fixture",
+            reference: "fixture",
             language: None,
             start: 0.,
             duration: None,

@@ -402,7 +402,76 @@ fn read_config(path: &Path) -> Result<Value> {
         bail!("personal config must be a JSON object");
     }
     defaults_from(&value)?;
+    providers_from(&value)?;
     Ok(value)
+}
+fn providers_from(config: &Value) -> Result<BTreeMap<String, crate::providers::ProviderConfig>> {
+    let providers: BTreeMap<String, crate::providers::ProviderConfig> =
+        match config.get("providers") {
+            Some(value) => serde_json::from_value(value.clone()).context(
+                "config providers must map names to {base_url, key_env, headers, timeout_seconds}",
+            )?,
+            None => BTreeMap::new(),
+        };
+    crate::providers::validate_all(&providers)?;
+    Ok(providers)
+}
+/// Configured custom providers (the built-in openrouter is not stored).
+pub fn provider_configs() -> Result<BTreeMap<String, crate::providers::ProviderConfig>> {
+    let home = personal_home()?;
+    check_directory(&home, false)?;
+    providers_from(&read_config(&home.join("config.json"))?)
+}
+fn publish_config(path: &Path, config: &Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(config)?;
+    bytes.push(b'\n');
+    if bytes.len() > CONFIG_LIMIT {
+        bail!("personal config exceeds {CONFIG_LIMIT} bytes");
+    }
+    publish(path, &bytes, true)
+}
+/// Store a new provider; an existing name is never replaced silently.
+pub fn add_provider(
+    name: &str,
+    config: &crate::providers::ProviderConfig,
+) -> Result<crate::providers::ProviderConfig> {
+    let normalized = crate::providers::validate_config(name, config)?;
+    let (path, _lock) = lock_config()?;
+    let mut document = read_config(&path)?;
+    let mut providers = providers_from(&document)?;
+    if providers.contains_key(name) {
+        bail!("provider {name} already exists; remove it first to change it");
+    }
+    providers.insert(name.to_owned(), normalized.clone());
+    crate::providers::validate_all(&providers)?;
+    document["providers"] = serde_json::to_value(&providers)?;
+    publish_config(&path, &document)?;
+    Ok(normalized)
+}
+/// Remove a provider unless a saved task default still refers to it.
+pub fn remove_provider(name: &str) -> Result<()> {
+    let (path, _lock) = lock_config()?;
+    let mut document = read_config(&path)?;
+    let mut providers = providers_from(&document)?;
+    if providers.remove(name).is_none() {
+        bail!("no provider named {name}; see skywrite providers list");
+    }
+    let users: Vec<String> = defaults_from(&document)?
+        .into_iter()
+        .filter(|(_, model)| {
+            crate::providers::split_reference(model)
+                .is_ok_and(|(provider, _)| provider == Some(name))
+        })
+        .map(|(task, _)| task)
+        .collect();
+    if !users.is_empty() {
+        bail!(
+            "provider {name} is the saved default for {}; change those first (skywrite defaults TASK set MODEL or unset)",
+            users.join(", ")
+        );
+    }
+    document["providers"] = serde_json::to_value(&providers)?;
+    publish_config(&path, &document)
 }
 fn defaults_from(config: &Value) -> Result<BTreeMap<String, String>> {
     let mut defaults = BTreeMap::new();
@@ -435,6 +504,12 @@ pub fn set_default_model(task: &str, model: &str) -> Result<Value> {
     validate_task(task)?;
     validate_model(model)?;
     change_default(task, Some(model))
+}
+/// A saved reference must name an existing provider that serves the task.
+fn check_reference(task: &str, model: &str, config: &Value) -> Result<String> {
+    let resolved = crate::providers::resolve(model, &providers_from(config)?)?;
+    crate::providers::check_task(task, &resolved.provider)?;
+    Ok(resolved.reference())
 }
 pub fn unset_default_model(task: &str) -> Result<Value> {
     let task = crate::models::canonical_task(task)?;
@@ -475,21 +550,16 @@ fn change_default(task: &str, model: Option<&str>) -> Result<Value> {
     let mut defaults = defaults_from(&config)?;
     match model {
         Some(model) => {
-            defaults.insert(task.to_owned(), model.to_owned());
+            defaults.insert(task.to_owned(), check_reference(task, model, &config)?);
         }
         None => {
             defaults.remove(task);
         }
     }
     config["model_defaults"] = serde_json::to_value(&defaults)?;
-    let mut bytes = serde_json::to_vec_pretty(&config)?;
-    bytes.push(b'\n');
-    if bytes.len() > CONFIG_LIMIT {
-        bail!("personal config exceeds {CONFIG_LIMIT} bytes");
-    }
-    publish(&path, &bytes, true)?;
+    publish_config(&path, &config)?;
     Ok(
-        json!({"task":task,"model":model,"model_defaults":defaults,"path":path.display().to_string()}),
+        json!({"task":task,"model":defaults.get(task),"model_defaults":defaults,"path":path.display().to_string()}),
     )
 }
 

@@ -1,8 +1,11 @@
 # Frame and video descriptions
 
 `skywrite describe` asks a vision model about exact frames or a short video range.
-Requests carry your media, so they follow the [data policy](configuration.md#data-policy-for-media-understanding)
-(zero retention by default). Discover models with `skywrite models list --task frame-description`
+Requests carry your media, so OpenRouter requests follow the [data policy](configuration.md#data-policy-for-media-understanding)
+(zero retention by default). `--model local:MODEL` sends them to a
+[local or other provider](configuration.md#local-and-other-providers) instead; the
+report then names the `provider`, has `data_policy: null` and a `routing_note`, and
+reports `cost_usd: null` when the server does not report a cost. Discover models with `skywrite models list --task frame-description`
 or `--task video-description`; defaults come from `skywrite init` and the
 [model evaluation](model-evaluation.md).
 
@@ -44,7 +47,10 @@ words spoken around each frame without sending them to the model.
 
 `--max-frames` (default 600) refuses runs that would describe more uncached frames;
 raise it deliberately for long sources. `--concurrency` (default 4, up to 16) sets
-parallel requests. The report includes the billed cost of new descriptions.
+parallel requests; a single local server usually answers one at a time, so
+`--concurrency 1` avoids queueing past its deadline. The report includes the billed
+cost of new descriptions. If the provider cannot be reached, the run stops at the
+first attempt with one error instead of failing every frame.
 
 A useful cut workflow:
 
@@ -83,6 +89,7 @@ The range is re-encoded to H.264 at 480p without audio (`--height` 240–1080) a
 sent inline. The model reports shots, timed events (gestures, head turns,
 expression changes, visible speech onsets) and people, with clip-relative times plus
 `source_*` times. Ranges are limited to 600 seconds and 17 MiB encoded; shorter
-ranges give finer timing. Results are cached by source content, range, encoding,
+ranges give finer timing. A custom provider must accept `video_url` input; one
+that does not fails with that explanation. Results are cached by source content, range, encoding,
 model, prompt version and cast. Descriptions are observations of a reduced clip:
 confirm important moments with `review sheet`.

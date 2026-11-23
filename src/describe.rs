@@ -4,10 +4,12 @@
 //! is cached by what it depends on: source content hash, exact presentation
 //! time, image settings, model, prompt version and cast. A coarse survey and
 //! a later dense "focus in" pass around a cut share every frame they have in
-//! common, and nothing is paid for twice. Requests use the data policy in
-//! `openrouter::data_policy` (zero retention by default).
+//! common, and nothing is paid for twice. OpenRouter requests use the data
+//! policy in `openrouter::data_policy` (zero retention by default); other
+//! providers receive no OpenRouter-only fields and apply their own retention.
 use crate::{
     media, openrouter,
+    providers::ModelRef,
     review::{self, FrameSelection},
     transcript::Transcript,
 };
@@ -213,7 +215,7 @@ Return only a JSON object:
 pub fn frame_cache_key(
     source_sha256: &str,
     time: f64,
-    model: &str,
+    target: &ModelRef,
     cast: Option<&Cast>,
 ) -> Result<String> {
     let cast = serde_json::to_vec(&cast)?;
@@ -222,9 +224,26 @@ pub fn frame_cache_key(
         source_sha256.as_bytes(),
         format!("{time:.6}").as_bytes(),
         format!("fit{FRAME_FIT}-q{JPEG_QUALITY}").as_bytes(),
-        model.as_bytes(),
+        target.provider.identity().as_bytes(),
+        target.model.as_bytes(),
         &cast,
     ]))
+}
+
+/// What a report says about routing: the OpenRouter data policy, or that a
+/// custom provider received none of it.
+fn routing(target: &ModelRef) -> Result<(Value, Value)> {
+    Ok(if target.provider.is_openrouter() {
+        (json!(openrouter::data_policy()?), Value::Null)
+    } else {
+        (
+            Value::Null,
+            json!(format!(
+                "provider {} is not OpenRouter: SKYWRITE_DATA_POLICY routing is not applied and the server's own retention applies",
+                target.provider.name
+            )),
+        )
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -256,27 +275,31 @@ fn write_cached(path: &Path, entry: &CachedDescription) -> Result<()> {
 
 /// One request; disables reasoning where allowed (a per-frame task does not
 /// need it), and repeats without that setting when a model requires reasoning.
-/// A rejected request is not billed, so this cannot double-charge.
+/// A rejected request is not billed, so this cannot double-charge. A completed
+/// request returns its usage even when the answer is not valid JSON, so the
+/// caller can account for what it cost before reporting the failure.
 fn ask(
-    api: &openrouter::OpenRouter,
+    api: &openrouter::Client,
     model: &str,
     content: Value,
     max_tokens: u32,
-) -> Result<(Value, Value)> {
+) -> Result<(Result<Value>, Value)> {
     let mut request = json!({"model":model,"messages":[{"role":"user","content":content}],
         "response_format":{"type":"json_object"},"temperature":0.2,"max_tokens":max_tokens,
         "reasoning":{"enabled":false}});
     let response = match api.request("chat/completions", &request) {
         Ok(response) => response,
-        Err(error) if error.to_string().contains("Reasoning is mandatory") => {
+        Err(error)
+            if api.provider().is_openrouter()
+                && error.to_string().contains("Reasoning is mandatory") =>
+        {
             request.as_object_mut().expect("object").remove("reasoning");
             api.request("chat/completions", &request)?
         }
         Err(error) => return Err(error),
     };
-    let description = openrouter::assistant_json(&response.body)?;
     Ok((
-        description,
+        openrouter::assistant_json(&response.body),
         response.body.get("usage").cloned().unwrap_or(Value::Null),
     ))
 }
@@ -295,8 +318,9 @@ fn fit_width(info: &media::MediaInfo) -> u32 {
     ((width / 2.0).round() as u32 * 2).clamp(2, FRAME_FIT)
 }
 
-fn cost(usage: &Value) -> f64 {
-    usage["cost"].as_f64().unwrap_or(0.0)
+/// Billed cost when the provider reports one; `None` is unknown, not free.
+fn cost(usage: &Value) -> Option<f64> {
+    usage["cost"].as_f64()
 }
 
 pub fn execute(command: DescribeCommand) -> Result<Value> {
@@ -314,12 +338,12 @@ fn finish(value: Value, output: Option<&Path>, overwrite: bool) -> Result<Value>
 }
 
 fn frames(args: &FrameArgs) -> Result<Value> {
-    frames_with_api(args, || openrouter::OpenRouter::new(None))
+    frames_with_api(args, |provider| openrouter::Client::new(provider, None))
 }
 
 fn frames_with_api(
     args: &FrameArgs,
-    api: impl FnOnce() -> Result<openrouter::OpenRouter>,
+    api: impl FnOnce(&crate::providers::Provider) -> Result<openrouter::Client>,
 ) -> Result<Value> {
     ensure!(
         (1..=16).contains(&args.concurrency),
@@ -372,7 +396,8 @@ fn frames_with_api(
     if let (Some(transcript), Some(path)) = (&transcript, args.transcript.as_deref()) {
         transcript.verify_media(path, &info.path, &source_sha256)?;
     }
-    let model = crate::models::resolve_model("frame-description", args.model.as_deref())?;
+    let target = crate::models::resolve_target("frame-description", args.model.as_deref())?;
+    let model = target.reference();
     let root = crate::cache::cache_root(args.cache_dir.as_deref())?;
     let assets = root.join("assets");
     crate::cache::private_dir(&assets)?;
@@ -399,7 +424,7 @@ fn frames_with_api(
     // Persist frame images by exact time so agents can view what was described.
     let mut work = Vec::new();
     for frame in &extracted {
-        let key = frame_cache_key(&source_sha256, frame.time, &model, cast.as_ref())?;
+        let key = frame_cache_key(&source_sha256, frame.time, &target, cast.as_ref())?;
         let image = image_dir.join(format!("{:015.6}-fit{FRAME_FIT}.jpg", frame.time));
         let bytes = std::fs::read(&frame.path)?;
         crate::io::atomic_write(&image, &bytes, true)?;
@@ -429,7 +454,7 @@ fn frames_with_api(
         - info.start_time;
     if args.dry_run {
         return finish(
-            json!({"source":info.path,"model":model,"frames":work.len(),"cached":work.len()-uncached,"to_describe":uncached,
+            json!({"source":info.path,"model":model,"provider":target.provider.name,"frames":work.len(),"cached":work.len()-uncached,"to_describe":uncached,
                 "range":{"start":start,"duration":duration},"requests":0,
                 "note":"Dry run: frames were extracted locally; no model requests were made."}),
             args.output.as_deref(),
@@ -441,16 +466,22 @@ fn frames_with_api(
         "{uncached} frames need descriptions, above --max-frames {}; narrow the range, sample less often, or raise --max-frames deliberately (see --dry-run)",
         args.max_frames
     );
-    let api = api()?;
+    let api = api(&target.provider)?;
     let prompt = frame_prompt(cast.as_ref());
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<Option<Value>>> = Mutex::new(vec![None; work.len()]);
     let spent = Mutex::new(0.0f64);
+    let uncosted = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    // An unreachable provider fails every request the same way: stop at once.
+    let unreachable: Mutex<Option<String>> = Mutex::new(None);
     std::thread::scope(|scope| {
         for _ in 0..args.concurrency.min(work.len().max(1)) {
             scope.spawn(|| {
                 loop {
+                    if unreachable.lock().expect("lock").is_some() {
+                        break;
+                    }
                     let index = next.fetch_add(1, Ordering::SeqCst);
                     let Some((time, _, cache, fresh_image)) = work.get(index) else {
                         break;
@@ -463,8 +494,14 @@ fn frames_with_api(
                         let bytes = std::fs::read(fresh_image)?;
                         let content = json!([{"type":"text","text":prompt},
                             {"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{}",STANDARD.encode(bytes))}}]);
-                        let (description, usage) = ask(&api, &model, content, 1500)?;
-                        *spent.lock().expect("lock") += cost(&usage);
+                        let (description, usage) = ask(&api, &target.model, content, 1500)?;
+                        match cost(&usage) {
+                            Some(cost) => *spent.lock().expect("lock") += cost,
+                            None => {
+                                uncosted.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        let description = description?;
                         write_cached(cache, &CachedDescription {
                             version: 1,
                             model: model.clone(),
@@ -478,7 +515,12 @@ fn frames_with_api(
                             value["source_time"] = json!(time);
                             value
                         }
-                        Err(error) => json!({"source_time":time,"error":format!("{error:#}")}),
+                        Err(error) => {
+                            if let Some(down) = error.downcast_ref::<openrouter::Unreachable>() {
+                                unreachable.lock().expect("lock").get_or_insert(down.to_string());
+                            }
+                            json!({"source_time":time,"error":format!("{error:#}")})
+                        }
                     };
                     results.lock().expect("lock")[index] = Some(value);
                     let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
@@ -489,6 +531,17 @@ fn frames_with_api(
             });
         }
     });
+    if let Some(message) = unreachable.into_inner().expect("lock") {
+        // Requests that completed before the server went away may be billed.
+        let spent = *spent.lock().expect("lock");
+        let uncosted = uncosted.load(Ordering::SeqCst);
+        if spent > 0.0 || uncosted > 0 {
+            bail!(
+                "{message}. Earlier requests in this run completed and cost ${spent} ({uncosted} more without a reported cost); a rerun requests only frames without a cached description"
+            );
+        }
+        bail!("{message}");
+    }
     let mut frames = Vec::new();
     let (mut cached, mut failed) = (0usize, 0usize);
     for ((time, image, _, _), value) in work.iter().zip(results.into_inner().expect("lock")) {
@@ -512,22 +565,29 @@ fn frames_with_api(
         }
         frames.push(value);
     }
+    let spent = spent.into_inner().expect("lock");
+    let uncosted = uncosted.into_inner();
+    // Completed requests may have been billed even when no answer was usable.
     ensure!(
         failed < frames.len() || frames.is_empty(),
-        "every frame description failed; first error: {}",
+        "every frame description failed; first error: {}. Completed requests cost ${spent} ({uncosted} more without a reported cost); failed frames are not cached",
         frames[0]["error"]
     );
-    let spent = spent.into_inner().expect("lock");
+    let (data_policy, routing_note) = routing(&target)?;
     finish(
         json!({
             "source": info.path,
             "source_sha256": source_sha256,
             "model": model,
+            "provider": target.provider.name,
             "prompt_version": FRAME_PROMPT_VERSION,
-            "data_policy": openrouter::data_policy()?,
+            "data_policy": data_policy,
+            "routing_note": routing_note,
             "range": {"start": start, "duration": duration, "every": every, "interval": args.interval},
             "counts": {"frames": frames.len(), "cached": cached, "described": frames.len() - cached - failed, "failed": failed},
-            "cost_usd": spent,
+            // Unknown when any new description came without a billed cost.
+            "cost_usd": if uncosted == 0 { json!(spent) } else { Value::Null },
+            "uncosted_requests": uncosted,
             "cast": cast.as_ref().map(|c| c.people.iter().map(|p| &p.name).collect::<Vec<_>>()),
             "frames": frames,
             "notes": [
@@ -563,7 +623,8 @@ fn video(args: &VideoArgs) -> Result<Value> {
         );
     }
     let cast = args.cast.as_deref().map(load_cast).transpose()?;
-    let model = crate::models::resolve_model("video-description", args.model.as_deref())?;
+    let target = crate::models::resolve_target("video-description", args.model.as_deref())?;
+    let model = target.reference();
     let root = crate::cache::cache_root(args.cache_dir.as_deref())?;
     let source_sha256 = media::file_sha256(&info.path)?;
     let encode = format!("h264-crf28-h{}-noaudio", args.height);
@@ -572,7 +633,8 @@ fn video(args: &VideoArgs) -> Result<Value> {
         source_sha256.as_bytes(),
         format!("{:.6}:{:.6}", args.start, args.duration).as_bytes(),
         encode.as_bytes(),
-        model.as_bytes(),
+        target.provider.identity().as_bytes(),
+        target.model.as_bytes(),
         &serde_json::to_vec(&cast)?,
     ]);
     let cache = root.join("video-descriptions").join(format!("{key}.json"));
@@ -591,8 +653,9 @@ fn video(args: &VideoArgs) -> Result<Value> {
         }
         description
     };
-    let base = json!({"source":info.path,"model":model,"prompt_version":VIDEO_PROMPT_VERSION,
-        "range":{"start":args.start,"duration":args.duration},"encoding":encode,"data_policy":openrouter::data_policy()?,
+    let (data_policy, routing_note) = routing(&target)?;
+    let base = json!({"source":info.path,"model":model,"provider":target.provider.name,"prompt_version":VIDEO_PROMPT_VERSION,
+        "range":{"start":args.start,"duration":args.duration},"encoding":encode,"data_policy":data_policy,"routing_note":routing_note,
         "notes":["Times in the model output are approximate clip-relative seconds; source_* fields add the range start.","Descriptions are model observations of a reduced-resolution clip; confirm important moments with review sheet."]});
     if let Some(entry) = read_cached(&cache) {
         let mut value = base;
@@ -659,8 +722,12 @@ fn video(args: &VideoArgs) -> Result<Value> {
     }
     let content = json!([{"type":"text","text":prompt},
         {"type":"video_url","video_url":{"url":format!("data:video/mp4;base64,{}",STANDARD.encode(std::fs::read(&clip)?))}}]);
-    let api = openrouter::OpenRouter::new(None)?;
-    let (description, usage) = ask(&api, &model, content, 2500)?;
+    let api = openrouter::Client::new(&target.provider, None)?;
+    let (description, usage) = ask(&api, &target.model, content, 2500)?;
+    let description = description.with_context(|| match cost(&usage) {
+        Some(cost) => format!("the completed request cost ${cost} and was not cached"),
+        None => "the completed request was not cached; the provider reported no cost".into(),
+    })?;
     write_cached(
         &cache,
         &CachedDescription {
@@ -736,7 +803,7 @@ mod tests {
         std::fs::write(&private, b"private input must never be sent").unwrap();
         let mut fixture = None;
         let mut expected = Vec::new();
-        let result = frames_with_api(&args, || {
+        let result = frames_with_api(&args, |_| {
             expected = std::fs::read(&image)?;
             assert!(expected.starts_with(b"\xff\xd8"));
             // Swap the published cache after extraction. Reading it for the
@@ -803,7 +870,7 @@ mod tests {
                 stream.write_all(&reply).unwrap();
                 sent
             }));
-            Ok(openrouter::OpenRouter::for_test(
+            Ok(openrouter::Client::for_test(
                 base,
                 None,
                 Duration::from_secs(5),
@@ -820,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_keys_depend_on_frame_model_and_cast_only() {
+    fn cache_keys_depend_on_frame_provider_model_and_cast_only() {
         let cast = Cast {
             version: 1,
             people: vec![CastMember {
@@ -828,11 +895,32 @@ mod tests {
                 description: "grey suit".into(),
             }],
         };
-        let a = frame_cache_key("ab", 1.0, "m", None).unwrap();
-        assert_eq!(a, frame_cache_key("ab", 1.0000001, "m", None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.04, "m", None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.0, "n", None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.0, "m", Some(&cast)).unwrap());
+        let target = |reference: &str| {
+            crate::providers::resolve(
+                reference,
+                &std::collections::BTreeMap::from([(
+                    "local".to_owned(),
+                    crate::providers::ProviderConfig {
+                        base_url: crate::providers::OPENROUTER_BASE.into(),
+                        key_env: None,
+                        headers: Default::default(),
+                        timeout_seconds: None,
+                    },
+                )]),
+            )
+            .unwrap()
+        };
+        let m = target("m");
+        let a = frame_cache_key("ab", 1.0, &m, None).unwrap();
+        assert_eq!(a, frame_cache_key("ab", 1.0000001, &m, None).unwrap());
+        assert_ne!(a, frame_cache_key("ab", 1.04, &m, None).unwrap());
+        assert_ne!(a, frame_cache_key("ab", 1.0, &target("n"), None).unwrap());
+        assert_ne!(a, frame_cache_key("ab", 1.0, &m, Some(&cast)).unwrap());
+        // Same model name and base URL on another provider never shares entries.
+        assert_ne!(
+            a,
+            frame_cache_key("ab", 1.0, &target("local:m"), None).unwrap()
+        );
         assert!(frame_prompt(Some(&cast)).contains("- Ralph: grey suit"));
     }
 }

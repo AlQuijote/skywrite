@@ -9,6 +9,7 @@ pub mod media;
 pub mod models;
 pub mod openrouter;
 pub mod process;
+pub mod providers;
 pub mod stretch;
 pub mod sync;
 pub mod sync_apply;

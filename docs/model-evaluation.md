@@ -23,6 +23,29 @@ answered "details unclear" instead of inventing figures. It miscounts people in
 fisheye wide shots. A one-frame-per-second survey of an hour at 25 fps costs about
 $0.66 with Luna.
 
+### Local model check, 2026-11-23 (synthetic known-content frames, not the set above)
+
+The AMI frames above were not available for this check, so a local model was
+measured on 8 synthetic 640x360 frames with known content: black, SMPTE bars,
+a Mandelbrot fractal, FFmpeg `testsrc2`, and four text cards ("SKYWRITE 42",
+"EXIT", "Chapter 3 / The Harbor", "OPEN 9:30"). None contains people. The local
+model ran through `llama-server` (llama.cpp b12650, Metal, `-c 8192`,
+`--reasoning-budget 0`) on an Apple M4 Mac mini, with GPT-6 Luna on the same
+frames for comparison.
+
+| Model | Valid JSON | Correct zero-people | Expected text read | Invented text on text-free frames | Speed | Cost |
+|---|---|---|---|---|---|---|
+| local:qwen3.5-0.8b (Q8_0 + BF16 mmproj) | 8/8 | 8/8 | 5/5 | 0/3 | ~2.1 s/frame, server peak RSS 1.8 GiB | none (local) |
+| openai/gpt-6-luna | 8/8 | 8/8 | 5/5 | 0/3 | API | $0.00018/frame |
+
+The small model matched Luna on this easy set. Its one wrong detail was calling a
+beige title card "a dark room", where Luna wrote "plain beige title card". The set
+has no people, so it measures nothing about people counts, expressions,
+mid-speech or cast matching. Those are where the evaluation above separated
+models, and a 0.8B model should be expected to do worse there. Use it for cheap
+survey passes, and confirm important frames with a stronger model or by viewing
+them.
+
 ## Cast matching from text descriptions (38 frames, two conditions)
 
 With distinct descriptions, every model reached precision 1.00 on close-ups, never

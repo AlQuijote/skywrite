@@ -626,7 +626,13 @@ fn read_state(l: &Loaded, root: &Path) -> Result<Option<State>> {
     for n in &l.manifest.nodes {
         let s = &state.nodes[&n.id];
         crate::models::resolve_model(n.action.task(), Some(&s.model))?;
-        if n.model.as_ref().is_some_and(|m| m != &s.model) {
+        // State stores the resolved ID; `openrouter:vendor/model` is that same model.
+        if n.model
+            .as_deref()
+            .map(|m| crate::models::resolve_model(n.action.task(), Some(m)))
+            .transpose()?
+            .is_some_and(|m| m != s.model)
+        {
             bail!("frozen model mismatch");
         }
         if let Some(id) = &s.planned_id

@@ -27,13 +27,16 @@ pub struct AnalyzeOptions<'a> {
     pub frames_dir: &'a Path,
     pub start: f64,
     pub duration: Option<f64>,
+    /// The ID sent to the provider.
     pub model: Option<&'a str>,
+    /// The canonical reference recorded in the report.
+    pub reference: Option<&'a str>,
     pub transcript: Option<&'a Path>,
     pub prompt: Option<&'a str>,
 }
 pub fn analyze(
     info: crate::media::MediaInfo,
-    api: Option<&crate::openrouter::OpenRouter>,
+    api: Option<&crate::openrouter::Client>,
     options: &AnalyzeOptions<'_>,
 ) -> Result<Analysis> {
     let info = crate::media::resolve_audio_only_timing(info)?;
@@ -92,7 +95,7 @@ pub fn analyze(
         coverage,
         transcript,
         understanding: None,
-        model: options.model.map(str::to_owned),
+        model: options.reference.map(str::to_owned),
         usage: None,
         cached: false,
         source_sha256,
@@ -569,7 +572,7 @@ mod cache_tests {
         );
         std::fs::copy(&original, &copy).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let api = crate::openrouter::OpenRouter::for_test(
+        let api = crate::openrouter::Client::for_test(
             format!("http://{}", listener.local_addr().unwrap()),
             Some(dir.path().join("responses")),
             std::time::Duration::from_secs(3),
@@ -618,6 +621,7 @@ mod cache_tests {
             start: 0.0,
             duration: Some(2.0),
             model: Some("test/model"),
+            reference: Some("test/model"),
             transcript: None,
             prompt: None,
         };
@@ -873,7 +877,7 @@ mod dialogue_tests {
         let words = dir.path().join("words.json");
         crate::io::write_json(&words, report.transcript.as_ref().unwrap(), false).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let api = crate::openrouter::OpenRouter::for_test(
+        let api = crate::openrouter::Client::for_test(
             format!("http://{}", listener.local_addr().unwrap()),
             None,
             std::time::Duration::from_secs(3),
@@ -928,6 +932,7 @@ mod dialogue_tests {
                 start: 1.0,
                 duration: Some(1.0),
                 model: Some("fixture"),
+                reference: Some("fixture"),
                 transcript: Some(&words),
                 prompt: None,
             },

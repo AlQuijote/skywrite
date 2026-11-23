@@ -1,134 +1,252 @@
-//! Explicit, bounded OpenRouter requests with content-addressed response caching.
+//! Explicit, bounded model requests with content-addressed response caching.
+//!
+//! One client serves the built-in OpenRouter provider and user-configured
+//! OpenAI-compatible providers. OpenRouter-only request fields (data policy
+//! routing, usage accounting, reasoning toggles) and its JSON transcription
+//! body go only to the built-in provider; other providers receive the standard
+//! OpenAI wire format and never another provider's key.
+use crate::providers::Provider;
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use reqwest::blocking::Client as HttpClient;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const API_BASE: &str = "https://openrouter.ai/api/v1";
 const MAX_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+/// Body fields only OpenRouter understands; stripped for every other provider.
+pub const OPENROUTER_ONLY_FIELDS: &[&str] = &[
+    "provider",
+    "usage",
+    "reasoning",
+    "transforms",
+    "models",
+    "route",
+    "plugins",
+];
 
-fn http_client(connect_timeout: Duration, request_timeout: Duration) -> Result<Client> {
-    Client::builder()
+/// A provider that could not be reached at all. No request was processed, so
+/// nothing was billed; callers stop instead of repeating the request.
+#[derive(Debug)]
+pub struct Unreachable(pub String);
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Unreachable {}
+
+fn http_client(connect_timeout: Duration, request_timeout: Duration) -> Result<HttpClient> {
+    HttpClient::builder()
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("initializing HTTPS client")
 }
-fn bounded_response(reader: impl Read) -> Result<Vec<u8>> {
+fn bounded_response(reader: impl Read, provider: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut bytes)
-        .context("reading OpenRouter response")?;
+        .with_context(|| format!("reading {provider} response"))?;
     if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-        bail!("OpenRouter response exceeded 8 MiB");
+        bail!("{provider} response exceeded 8 MiB");
     }
     Ok(bytes)
 }
 
-pub struct OpenRouter {
-    client: Client,
-    key: Option<String>,
+pub struct Client {
+    client: HttpClient,
+    provider: Provider,
     cache_dir: Option<PathBuf>,
-    base_url: String,
+    /// Test fixtures supply a dummy key without touching the environment.
+    key_override: Option<String>,
 }
 #[derive(Debug)]
 pub struct ApiResponse {
     pub body: Value,
     pub cached: bool,
 }
-impl OpenRouter {
-    pub fn new(cache_dir: Option<&Path>) -> Result<Self> {
-        let client = http_client(CONNECT_TIMEOUT, REQUEST_TIMEOUT)?;
-        let key = std::env::var("OPENROUTER_API_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+impl Client {
+    pub fn new(provider: &Provider, cache_dir: Option<&Path>) -> Result<Self> {
+        for warning in provider.warnings() {
+            eprintln!("Warning: provider {}: {warning}", provider.name);
+        }
         Ok(Self {
-            client,
-            key,
+            client: http_client(CONNECT_TIMEOUT, provider.timeout)?,
+            provider: provider.clone(),
             cache_dir: cache_dir.map(Path::to_owned),
-            base_url: API_BASE.to_owned(),
+            key_override: None,
         })
     }
+    fn api_key(&self) -> Result<Option<String>> {
+        match &self.key_override {
+            Some(key) => Ok(Some(key.clone())),
+            None => self.provider.api_key(),
+        }
+    }
+    pub fn provider(&self) -> &Provider {
+        &self.provider
+    }
+    /// A built-in OpenRouter client against a loopback fixture.
     #[cfg(test)]
     pub(crate) fn for_test(
         base_url: String,
         cache_dir: Option<PathBuf>,
         timeout: Duration,
     ) -> Self {
+        let mut provider = Provider::builtin();
+        provider.base_url = base_url;
         Self {
             client: http_client(timeout, timeout).unwrap(),
-            key: Some("DUMMY_TEST_ONLY".into()),
+            provider,
             cache_dir,
-            base_url,
+            key_override: Some("DUMMY_TEST_ONLY".into()),
         }
     }
-    /// Public catalog GETs never attach a key; response pagination URLs are data.
-    pub fn catalog(&self, endpoint: &str) -> Result<Value> {
-        if !matches!(
-            endpoint,
-            "models"
-                | "models?output_modalities=image"
-                | "models?output_modalities=video"
-                | "models?output_modalities=transcription"
-                | "models?output_modalities=speech"
-                | "models?output_modalities=audio"
-                | "images/models"
-                | "videos/models"
-        ) {
-            bail!("unsupported OpenRouter catalog endpoint");
+
+    fn send_error(&self, error: reqwest::Error, what: &str) -> anyhow::Error {
+        if error.is_connect() {
+            return anyhow::Error::new(Unreachable(format!(
+                "provider {} at {} is unreachable ({}); start the server or fix its base URL (skywrite providers show {}). this request was not sent, and Skywrite does not retry",
+                self.provider.name,
+                self.provider.base_url,
+                std::error::Error::source(&error)
+                    .map(|source| source.to_string())
+                    .unwrap_or_else(|| error.to_string()),
+                self.provider.name
+            )));
         }
-        let response = self
-            .client
-            .get(format!("{}/{endpoint}", self.base_url))
+        let hint = if error.is_timeout() {
+            self.deadline_hint()
+        } else {
+            String::new()
+        };
+        anyhow::Error::new(error).context(format!("{what} failed{hint}"))
+    }
+    fn deadline_hint(&self) -> String {
+        if self.provider.is_openrouter() {
+            return String::new();
+        }
+        format!(
+            " (provider {} deadline {} s; slow local models may need skywrite providers add ... --timeout SECONDS)",
+            self.provider.name,
+            self.provider.timeout.as_secs()
+        )
+    }
+    /// A body that stalls past the deadline fails while reading, after the
+    /// headers arrived; it gets the same deadline guidance as a slow reply.
+    fn read_body(&self, response: reqwest::blocking::Response) -> Result<Vec<u8>> {
+        bounded_response(response, &self.provider.name).map_err(|error| {
+            if format!("{error:#}").contains("timed out") {
+                error.context(format!(
+                    "reading the response timed out{}",
+                    self.deadline_hint()
+                ))
+            } else {
+                error
+            }
+        })
+    }
+
+    /// Catalog GETs. OpenRouter's public catalogs never get a key; a custom
+    /// provider's `/models` gets its configured key, since some servers
+    /// require it even for listing. A custom server without `/models` (404)
+    /// yields an empty catalog marked `skywrite_missing_catalog`.
+    pub fn catalog(&self, endpoint: &str) -> Result<Value> {
+        let name = &self.provider.name;
+        let mut request = if self.provider.is_openrouter() {
+            if !matches!(
+                endpoint,
+                "models"
+                    | "models?output_modalities=image"
+                    | "models?output_modalities=video"
+                    | "models?output_modalities=transcription"
+                    | "models?output_modalities=speech"
+                    | "models?output_modalities=audio"
+                    | "images/models"
+                    | "videos/models"
+            ) {
+                bail!("unsupported OpenRouter catalog endpoint");
+            }
+            self.client
+                .get(format!("{}/{endpoint}", self.provider.base_url))
+        } else {
+            if endpoint != "models" {
+                bail!("unsupported provider catalog endpoint");
+            }
+            let mut request = self
+                .client
+                .get(format!("{}/models", self.provider.base_url));
+            for (header, value) in &self.provider.headers {
+                request = request.header(header, value);
+            }
+            // A configured key variable that is unset fails before any request.
+            if let Some(token) = self.api_key()? {
+                request = request.bearer_auth(token);
+            }
+            request
+        };
+        request = request.header("Accept", "application/json");
+        let response = request
             .send()
-            .context("OpenRouter public catalog request failed")?;
+            .map_err(|error| self.send_error(error, &format!("{name} catalog request")))?;
         let status = response.status();
-        let bytes = bounded_response(response)?;
+        let bytes = self.read_body(response)?;
+        if status.as_u16() == 404 && !self.provider.is_openrouter() {
+            return Ok(serde_json::json!({"data":[],"skywrite_missing_catalog":true}));
+        }
         if !status.is_success() {
             bail!(
-                "OpenRouter catalog HTTP {}: {}",
+                "{name} catalog HTTP {}: {}",
                 status.as_u16(),
-                String::from_utf8_lossy(&bytes)
-                    .chars()
-                    .take(2048)
-                    .collect::<String>()
+                self.redact(&String::from_utf8_lossy(&bytes))
             );
         }
-        let body: Value =
-            serde_json::from_slice(&bytes).context("invalid OpenRouter catalog JSON")?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid {name} catalog JSON"))?;
         if !body["data"].is_array() {
-            bail!("OpenRouter catalog has no data array");
+            bail!("{name} catalog has no data array");
         }
         Ok(body)
     }
 
+    fn redact(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        if let Ok(Some(key)) = self.api_key() {
+            text = text.replace(&key, "<redacted API key>");
+        }
+        text.chars().take(2048).collect()
+    }
+
     pub fn request(&self, endpoint: &str, body: &Value) -> Result<ApiResponse> {
         if !matches!(endpoint, "audio/transcriptions" | "chat/completions") {
-            bail!("unsupported OpenRouter endpoint");
+            bail!("unsupported model endpoint");
+        }
+        let name = self.provider.name.clone();
+        let openrouter = self.provider.is_openrouter();
+        let mut body = body.clone();
+        if !openrouter && let Some(object) = body.as_object_mut() {
+            for field in OPENROUTER_ONLY_FIELDS {
+                object.remove(*field);
+            }
         }
         // Routing policy is not part of the content: keep it out of the cache key
         // so cached results survive policy changes and are never paid for twice.
-        let encoded = serde_json::to_vec(body)?;
-        let mut routed = body.clone();
-        if let Some(provider) = data_policy()? {
-            routed["provider"] = provider;
-        }
-        routed["usage"] = serde_json::json!({"include": true});
-        let sent = serde_json::to_vec(&routed)?;
+        let encoded = serde_json::to_vec(&body)?;
         if encoded.len() > MAX_REQUEST_BYTES {
-            bail!(
-                "OpenRouter request exceeds 24 MiB; shorten the selected range or reduce frame count"
-            );
+            bail!("model request exceeds 24 MiB; shorten the selected range or reduce frame count");
         }
-        let key = cache_key(&[self.base_url.as_bytes(), endpoint.as_bytes(), &encoded]);
+        let key = cache_key(&[
+            self.provider.identity().as_bytes(),
+            endpoint.as_bytes(),
+            &encoded,
+        ]);
         let cache = self
             .cache_dir
             .as_ref()
@@ -137,39 +255,63 @@ impl OpenRouter {
             // Cached provider data has the same byte budget as a live response.
             let file = std::fs::File::open(path)?;
             if !file.metadata()?.is_file() {
-                bail!("OpenRouter cache must be a regular file");
+                bail!("response cache must be a regular file");
             }
-            let cached: Value = serde_json::from_slice(&bounded_response(file)?)
-                .context("invalid OpenRouter cache JSON")?;
+            let cached: Value = serde_json::from_slice(&bounded_response(file, &name)?)
+                .context("invalid response cache JSON")?;
             return Ok(ApiResponse {
                 body: cached,
                 cached: true,
             });
         }
-        let token = self.key.as_deref().context("set OPENROUTER_API_KEY to enable this paid OpenRouter request (local inspection and cached results need no key)")?;
+        let token = self.api_key()?;
+        // Validate routing before announcing a request.
+        let policy = if openrouter { data_policy()? } else { None };
         eprintln!(
-            "OpenRouter: requesting {} from {}",
+            "{name}: requesting {} from {}",
             endpoint,
             body["model"].as_str().unwrap_or("selected model")
         );
-        let response = self
-            .client
-            .post(format!("{}/{endpoint}", self.base_url))
-            .bearer_auth(token)
-            .header("Content-Type", "application/json")
-            .header("X-Title", "Skywrite")
-            .body(sent)
+        let url = format!("{}/{endpoint}", self.provider.base_url);
+        let mut request = self.client.post(&url);
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        for (header, value) in &self.provider.headers {
+            request = request.header(header, value);
+        }
+        request = if openrouter {
+            let mut routed = body.clone();
+            if let Some(provider) = policy {
+                routed["provider"] = provider;
+            }
+            routed["usage"] = serde_json::json!({"include": true});
+            request
+                .header("Content-Type", "application/json")
+                .header("X-Title", "Skywrite")
+                .body(serde_json::to_vec(&routed)?)
+        } else if endpoint == "audio/transcriptions" {
+            let (boundary, form) = multipart_transcription(&body)?;
+            request
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(form)
+        } else {
+            request
+                .header("Content-Type", "application/json")
+                .body(encoded)
+        };
+        let response = request
             .send()
-            .context("OpenRouter request failed")?;
+            .map_err(|error| self.send_error(error, &format!("{name} request")))?;
         let status = response.status();
-        let bytes = bounded_response(response)?;
+        let bytes = self.read_body(response)?;
         if !status.is_success() {
-            let message: String = String::from_utf8_lossy(&bytes)
-                .replace(token, "<redacted API key>")
-                .chars()
-                .take(2048)
-                .collect();
-            if status.as_u16() == 404
+            let message = self.redact(&String::from_utf8_lossy(&bytes));
+            if openrouter
+                && status.as_u16() == 404
                 && (message.contains("data policy") || message.contains("No endpoints"))
             {
                 bail!(
@@ -179,23 +321,27 @@ impl OpenRouter {
                     policy_name()
                 );
             }
-            bail!("OpenRouter HTTP {}: {}", status.as_u16(), message);
-        }
-        let parsed: Value =
-            serde_json::from_slice(&bytes).context("OpenRouter returned invalid JSON")?;
-        if parsed.get("error").is_some() {
             bail!(
-                "OpenRouter returned an error: {}",
-                parsed["error"]
-                    .to_string()
-                    .replace(token, "<redacted API key>")
+                "{name} HTTP {}: {}{}",
+                status.as_u16(),
+                message,
+                self.media_hint(&body, &message)
+            );
+        }
+        let parsed: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{name} returned invalid JSON"))?;
+        if parsed.get("error").is_some() {
+            let message = self.redact(&parsed["error"].to_string());
+            bail!(
+                "{name} returned an error: {message}{}",
+                self.media_hint(&body, &message)
             );
         }
         if let Some(path) = cache {
             match crate::io::atomic_write(&path, &serde_json::to_vec(&parsed)?, false) {
                 Ok(()) => {}
                 Err(_) if path.is_file() => {}
-                Err(e) => return Err(e).context("saving OpenRouter response cache"),
+                Err(e) => return Err(e).context("saving response cache"),
             }
         }
         Ok(ApiResponse {
@@ -203,6 +349,97 @@ impl OpenRouter {
             cached: false,
         })
     }
+
+    /// Name the likely cause when a model rejects image or video input.
+    fn media_hint(&self, body: &Value, message: &str) -> String {
+        let sent = |kind: &str| {
+            body["messages"].as_array().into_iter().flatten().any(|m| {
+                m["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|part| part["type"] == kind)
+            })
+        };
+        let lower = message.to_lowercase();
+        let mentions = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+        let kind = if sent("image_url") && mentions(&["image", "vision", "multimodal", "mmproj"]) {
+            "image"
+        } else if sent("video_url") && mentions(&["video", "multimodal", "content type"]) {
+            "video"
+        } else {
+            return String::new();
+        };
+        format!(
+            "\nModel {} on provider {} appears not to accept {kind} input; choose a model with {kind} input (llama.cpp's llama-server also needs --mmproj for images)",
+            body["model"].as_str().unwrap_or("?"),
+            self.provider.name
+        )
+    }
+}
+
+/// The standard OpenAI `/audio/transcriptions` form (whisper.cpp, speaches,
+/// faster-whisper-server, OpenRouter) from Skywrite's JSON request.
+fn multipart_transcription(body: &Value) -> Result<(String, Vec<u8>)> {
+    let audio = STANDARD
+        .decode(
+            body["input_audio"]["data"]
+                .as_str()
+                .context("transcription request has no audio")?,
+        )
+        .context("transcription audio is not base64")?;
+    let format = body["input_audio"]["format"].as_str().unwrap_or("wav");
+    if !format.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        bail!("invalid audio format name");
+    }
+    let boundary = format!("skywrite-{}", &cache_key(&[&audio, b"boundary"])[..32]);
+    let mut form = Vec::with_capacity(audio.len() + 1024);
+    let mut field = |name: &str, value: &str| {
+        form.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    };
+    let text = |key: &str| -> Result<Option<&str>> {
+        match body.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.contains(['\r', '\n']) => Ok(Some(value)),
+            Some(_) => bail!("transcription field {key} must be a single-line string"),
+        }
+    };
+    field(
+        "model",
+        text("model")?.context("transcription request has no model")?,
+    );
+    if let Some(value) = text("response_format")? {
+        field("response_format", value);
+    }
+    if let Some(value) = text("language")? {
+        field("language", value);
+    }
+    for granularity in body["timestamp_granularities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        field(
+            "timestamp_granularities[]",
+            granularity
+                .as_str()
+                .context("timestamp granularity must be a string")?,
+        );
+    }
+    form.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.{format}\"\r\nContent-Type: audio/{format}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    form.extend_from_slice(&audio);
+    form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    Ok((boundary, form))
 }
 
 pub const DATA_POLICY_ENV: &str = "SKYWRITE_DATA_POLICY";
@@ -243,7 +480,13 @@ pub fn assistant_json(response: &Value) -> Result<Value> {
     let content = response["choices"][0]["message"]["content"]
         .as_str()
         .context("model returned no text content")?;
-    let content = content.trim();
+    let mut content = content.trim();
+    // Local reasoning models may prefix their answer with a thinking block.
+    if let Some(rest) = content.strip_prefix("<think>")
+        && let Some((_, answer)) = rest.split_once("</think>")
+    {
+        content = answer.trim();
+    }
     let content = content
         .strip_prefix("```json")
         .or_else(|| content.strip_prefix("```"))
@@ -273,15 +516,23 @@ mod tests {
     fn extracts_json_without_inventing_model_output() {
         assert_eq!(assistant_json(&serde_json::json!({"choices":[{"message":{"content":"```json\n{\"summary\":\"hi\"}\n```"}}]})).unwrap()["summary"], "hi");
         assert!(assistant_json(&serde_json::json!({"choices":[]})).is_err());
+        assert_eq!(assistant_json(&serde_json::json!({"choices":[{"message":{"content":"<think>\nhmm {\"x\":1}\n</think>\n{\"summary\":\"hi\"}"}}]})).unwrap()["summary"], "hi");
+        assert!(assistant_json(&serde_json::json!({"choices":[{"message":{"content":"<think>unterminated {\"summary\":\"hi\"}"}}]})).is_err());
     }
     #[test]
     fn request_cache_uses_actual_content_and_needs_no_key() {
         let dir = tempfile::tempdir().unwrap();
-        let mut api = OpenRouter::new(Some(dir.path())).unwrap();
-        api.key = None;
+        // A variable no environment sets: the built-in provider without a key.
+        let mut provider = Provider::builtin();
+        provider.key_env = Some("SKYWRITE_TEST_UNSET_OPENROUTER_KEY".into());
+        let api = Client::new(&provider, Some(dir.path())).unwrap();
         let request = serde_json::json!({"model":"test", "messages":[]});
         let encoded = serde_json::to_vec(&request).unwrap();
-        let hash = cache_key(&[API_BASE.as_bytes(), b"chat/completions", &encoded]);
+        let hash = cache_key(&[
+            provider.identity().as_bytes(),
+            b"chat/completions",
+            &encoded,
+        ]);
         crate::io::write_json(
             &dir.path().join(format!("{hash}.json")),
             &serde_json::json!({"cached":"yes"}),
@@ -314,7 +565,7 @@ mod tests {
     }
     // A single owned loopback request, with real reqwest transport and bounded
     // server lifetime. No runtime credentials or remote endpoints are involved.
-    fn fixture(reply: Vec<u8>, stall: Stall) -> (OpenRouter, std::thread::JoinHandle<()>) {
+    fn fixture(reply: Vec<u8>, stall: Stall) -> (Client, std::thread::JoinHandle<()>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -364,7 +615,7 @@ mod tests {
             let _ = stream.write_all(&reply[split..]);
         });
         (
-            OpenRouter::for_test(base, None, Duration::from_millis(120)),
+            Client::for_test(base, None, Duration::from_millis(120)),
             handle,
         )
     }
@@ -380,7 +631,11 @@ mod tests {
     #[test]
     fn actual_http_success_cache_and_non_success() {
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(15));
-        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(180));
+        assert_eq!(
+            Provider::builtin().timeout,
+            Duration::from_secs(crate::providers::BUILTIN_TIMEOUT_SECONDS)
+        );
+        assert_eq!(crate::providers::BUILTIN_TIMEOUT_SECONDS, 180);
         let dir = tempfile::tempdir().unwrap();
         let (mut api, server) = fixture(reply("200 OK", br#"{"ok":true}"#), Stall::None);
         api.cache_dir = Some(dir.path().to_owned());
@@ -473,16 +728,24 @@ mod tests {
     }
     #[test]
     fn actual_http_deadline_covers_slow_headers_and_body() {
-        for stall in [Stall::Headers, Stall::Body] {
-            let (api, server) = fixture(reply("200 OK", br#"{"ok":true}"#), stall);
-            let started = std::time::Instant::now();
-            let error = api
-                .request("chat/completions", &serde_json::json!({"model":"fixture"}))
-                .unwrap_err();
-            assert!(started.elapsed() >= Duration::from_millis(80));
-            assert!(started.elapsed() < Duration::from_secs(2));
-            assert!(format!("{error:#}").contains("timed out"), "{error:#}");
-            server.join().unwrap();
+        for custom in [false, true] {
+            for stall in [Stall::Headers, Stall::Body] {
+                let (mut api, server) = fixture(reply("200 OK", br#"{"ok":true}"#), stall);
+                if custom {
+                    // Same loopback fixture, as a custom provider.
+                    api.provider.name = "local".into();
+                }
+                let started = std::time::Instant::now();
+                let error = api
+                    .request("chat/completions", &serde_json::json!({"model":"fixture"}))
+                    .unwrap_err();
+                assert!(started.elapsed() >= Duration::from_millis(80));
+                assert!(started.elapsed() < Duration::from_secs(2));
+                let message = format!("{error:#}");
+                assert!(message.contains("timed out"), "{message}");
+                assert_eq!(message.contains("--timeout"), custom, "{message}");
+                server.join().unwrap();
+            }
         }
     }
 }
@@ -494,7 +757,7 @@ mod catalog_tests {
     #[test]
     fn public_catalog_get_omits_auth_and_rejects_unlisted_routes() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let api = OpenRouter::for_test(
+        let api = Client::for_test(
             format!("http://{}", listener.local_addr().unwrap()),
             None,
             Duration::from_secs(2),
@@ -523,5 +786,37 @@ mod catalog_tests {
         server.join().unwrap();
         assert!(api.catalog("https://example.invalid").is_err());
         assert!(api.catalog("../credits").is_err());
+    }
+    #[test]
+    fn custom_catalog_body_stall_names_the_provider_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut api = Client::for_test(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            Duration::from_millis(150),
+        );
+        api.provider.name = "local".into();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            // Headers now, then hold the body until the client gives up.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"da");
+            let mut buffer = [0; 64];
+            while matches!(stream.read(&mut buffer), Ok(n) if n > 0) {}
+        });
+        let message = format!("{:#}", api.catalog("models").unwrap_err());
+        assert!(
+            message.contains("timed out") && message.contains("--timeout"),
+            "{message}"
+        );
+        server.join().unwrap();
     }
 }

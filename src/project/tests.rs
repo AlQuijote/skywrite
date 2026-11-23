@@ -1166,3 +1166,18 @@ fn long_speech_node_is_one_combined_job() {
     stop.store(true, Ordering::SeqCst);
     handle.join().unwrap();
 }
+
+#[test]
+fn prefixed_openrouter_model_matches_its_frozen_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut node = image_node("a", "x");
+    node["model"] = json!("openrouter:fixture/image");
+    let path = manifest(temp.path(), "prefixed", vec![node]);
+    let l = load(&path).unwrap();
+    let state = initial(&l).unwrap();
+    assert_eq!(state.nodes["a"].model, "fixture/image");
+    let root = temp.path().join("state-root");
+    std::fs::create_dir(&root).unwrap();
+    save(&root, &state).unwrap();
+    assert!(read_state(&l, &root).unwrap().is_some());
+}

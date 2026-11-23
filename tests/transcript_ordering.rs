@@ -42,7 +42,9 @@ fn cached_provider_words_and_chunk_boundaries_keep_source_timestamps() {
         skywrite::media::extract_audio(&info, &audio, offset, 10.0).unwrap();
         let request = json!({"model":"provider-order-fixture","input_audio":{"data":STANDARD.encode(std::fs::read(audio).unwrap()),"format":"wav"},"response_format":"verbose_json","timestamp_granularities":["word"]});
         let key = skywrite::openrouter::cache_key(&[
-            b"https://openrouter.ai/api/v1",
+            skywrite::providers::Provider::builtin()
+                .identity()
+                .as_bytes(),
             b"audio/transcriptions",
             &serde_json::to_vec(&request).unwrap(),
         ]);

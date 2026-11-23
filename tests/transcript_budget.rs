@@ -35,7 +35,9 @@ fn excessive_cached_response_stops_cli_and_preserves_source_and_output() {
     let cache = dir.path().join("cache");
     std::fs::create_dir_all(cache.join("responses")).unwrap();
     let hash = skywrite::openrouter::cache_key(&[
-        b"https://openrouter.ai/api/v1",
+        skywrite::providers::Provider::builtin()
+            .identity()
+            .as_bytes(),
         b"audio/transcriptions",
         &serde_json::to_vec(&request).unwrap(),
     ]);
