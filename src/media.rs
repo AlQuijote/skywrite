@@ -274,6 +274,34 @@ fn pixel_format_alpha_flags(raw: &Value) -> HashMap<String, bool> {
         })
         .collect()
 }
+/// Whether every pixel of a still image is fully opaque, from one bounded
+/// FFmpeg decode of its alpha (opaque formats give 255 everywhere); `None`
+/// when it cannot be decoded.
+pub fn still_is_opaque(path: &Path) -> Option<bool> {
+    let out = crate::process::run(
+        "ffmpeg",
+        &[
+            "-v".into(),
+            "error".into(),
+            "-i".into(),
+            path.as_os_str().to_owned(),
+            "-frames:v".into(),
+            "1".into(),
+            "-vf".into(),
+            "format=rgba,alphaextract".into(),
+            "-f".into(),
+            "rawvideo".into(),
+            "-pix_fmt".into(),
+            "gray".into(),
+            "-".into(),
+        ],
+        Duration::from_secs(30),
+        256 * 1024 * 1024,
+    )
+    .ok()?;
+    (!out.stdout.is_empty()).then(|| out.stdout.iter().all(|&alpha| alpha == 255))
+}
+
 /// Accept regular local files; canonical absolute paths cannot become flags or URLs.
 pub fn canonical_file(path: &Path) -> Result<PathBuf> {
     let meta =

@@ -377,6 +377,10 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     wash["opacity"] = json!(0.3);
     let wash = json!([base, cutaway, {"clips":[wash]}]);
     assert_eq!(brief_shots(d, "wash.json", wash), []);
+    // A black gap shows around a transparent logo over the whole edit.
+    let gap = json!({"clips":[talk(0.0, 0.0, 2.0), talk(2.0667, 3.0, 1.9333)]});
+    let logo = json!([gap, {"clips":[{"start":0,"source":"title.png","duration":4.0}]}]);
+    assert_eq!(brief_shots(d, "logo.json", logo), [(2, 2.0)]);
     // An opaque full-frame still hides jump cuts beneath it, 2 frames apart.
     let jumps =
         json!({"clips":[talk(0.0, 0.0, 2.0), talk(2.0, 3.0, 0.0667), talk(2.0667, 1.0, 1.9333)]});
@@ -588,7 +592,8 @@ fn lint_help_explains_brief_shots_for_agents() {
         "not pixels",
         "on screen while its opacity times",
         "pieces of one still always continue",
-        "its length is exact from the edit",
+        "its length is exact on the edit's frame grid",
+        "the timeline's start and end count as hard cuts",
         "source (null for black)",
         "brief_shots_not_checked",
         "a title or overlay edge near a cut is not a shot",
@@ -657,6 +662,60 @@ fn lint_reports_objective_problems_and_stays_quiet_otherwise() {
         !kinds(&report).contains(&"visible_speaker_without_dialogue".to_owned()),
         "{report}"
     );
+
+    // A full-frame still hides the speaker only when every pixel is opaque:
+    // an opaque RGB PNG, RGBA PNG or palette PNG does; a transparent RGBA
+    // title does not.
+    for (name, filter, pix_fmt, hides) in [
+        ("rgb.png", "color=blue:s=160x90", "rgb24", true),
+        ("rgba.png", "color=blue:s=160x90,format=rgba", "rgba", true),
+        ("pal.png", "color=blue:s=160x90", "pal8", true),
+        (
+            "clear.png",
+            "color=white@0.0:s=160x90,format=rgba",
+            "rgba",
+            false,
+        ),
+    ] {
+        let still = dir.path().join(name);
+        ffmpeg(&[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            filter,
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            pix_fmt,
+            still.to_str().unwrap(),
+        ]);
+        let edit = write_edit(
+            dir.path(),
+            &format!("{name}.json"),
+            base(
+                json!([{"clips":[{"start":0,"source":"talk.mp4","duration":3.5,"audio":{"volume":0}}]},
+                   {"clips":[{"start":0,"source":name,"duration":3.5}]}]),
+                json!([{"clips":[{"start":0,"source":"bed.wav","duration":3.5,"volume":0.2}]}]),
+            ),
+        );
+        let report = skywrite(&[
+            "review",
+            "lint",
+            &edit,
+            "--transcript",
+            transcript,
+            "--no-levels",
+        ]);
+        assert_eq!(
+            !kinds(&report).contains(&"visible_speaker_without_dialogue".to_owned()),
+            hides,
+            "{name}: {report}"
+        );
+        assert_eq!(report["checked"]["uncertain_cover_sources"], json!([]));
+    }
 
     // Audible dialogue with a stumble and a filler.
     let talking = write_edit(

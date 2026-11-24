@@ -111,9 +111,9 @@ Warnings (kind):
   bed_close_to_dialogue             music or ambience within 10 dB of the dialogue
   brief_shot                        a picture on screen for less than --min-shot-seconds (default 0.5 s) between two hard cuts: a flash frame, a short cutaway or a black gap. Fades and dissolves are not checked yet.
 
-Brief shots (brief_shot) are checked only between hard cuts; fades and dissolves are not checked yet. They are judged from clip placement and opacity, not pixels. A take is one clip, or clips continuing it across straight splits (same source and track, contiguous within one frame of the slower clip's source step; pieces of one still always continue). A take is on screen while its opacity times what full-frame opaque cover above it lets through is at least 0.25; black is on screen while no take is. A brief shot is a take, or black between pictures, on screen for less than --min-shot-seconds, and its length is exact from the edit. It is reported only when both its edges are hard cuts: no visible clip fades in it or in the frame on either side of it, and no take continues at another opacity at its edges or inside it. That catches a flash frame, a short cutaway, a short overlay or title (also at partial opacity), or a black gap cut in and out, while a title or overlay edge near a cut is not a shot. A stretch with a fade, dissolve or opacity change at either edge is never reported; when it is under the threshold it is listed in checked.brief_shots_not_checked (timeline_start, timeline_end, source) and counted in not_checked, to watch with skywrite review cuts. Clips at opacity 0 show nothing, and cuts under full-frame opaque video or stills on a higher track are hidden. Only a full-frame picture whose pixel format has no alpha channel is cover: letterboxed pictures, alpha-capable video (ProRes 4444, QTRLE argb) and stills with alpha (RGBA PNG titles) never hide or dim what is beneath them, and video or stills whose pixel format FFmpeg does not describe are listed in checked.uncertain_cover_sources and never cover. Each brief_shot warning has frames, timeline_start, timeline_end and source (null for black); checked.min_shot_seconds is the threshold used.
+Brief shots (brief_shot) are checked only between hard cuts; fades and dissolves are not checked yet. They are judged from clip placement and opacity, not pixels. A take is one clip, or clips continuing it across straight splits on one track (same source, contiguous within one frame of the slower clip's source step; pieces of one still always continue; the same take continued on another track counts as a cut). A take is on screen while its opacity times what full-frame opaque cover above it lets through is at least 0.25; black is on screen while at least 0.25 of the light reaches the bottom through cover, also around titles and letterboxed pictures. A brief shot is a take, or black between pictures, on screen for less than --min-shot-seconds, and its length is exact on the edit's frame grid. It is reported only when both its edges are hard cuts (the timeline's start and end count as hard cuts): no visible clip fades anywhere in it or in the frame on either side of it, and no take continues at another opacity at its edges or inside it. That catches a flash frame, a short cutaway, a short overlay or title (also at partial opacity), or a black gap cut in and out, while a title or overlay edge near a cut is not a shot. A stretch with a fade, dissolve or opacity change is never reported; when it is under the threshold it is listed in checked.brief_shots_not_checked (timeline_start, timeline_end, source) and counted in not_checked, to watch with skywrite review cuts. Clips at opacity 0 show nothing, and cuts under full-frame opaque cover on a higher track are hidden. Cover is a full-frame picture at full opacity that is certainly opaque: video whose pixel format has no alpha channel, or a still whose decoded pixels are all opaque. Letterboxed pictures, alpha-capable video (QTRLE argb, ProRes 4444 with alpha) and stills with transparent pixels never hide or dim what is beneath them; video whose pixel format FFmpeg does not describe, and stills that cannot be decoded, are listed in checked.uncertain_cover_sources and never cover. Each brief_shot warning has frames, timeline_start, timeline_end and source (null for black); checked.min_shot_seconds is the threshold used.
 
-Transcript checks are only as good as the transcript: missing words (laughter, crosstalk) read as silence, and word times are alignment estimates (Parakeet, for example, uses 80 ms steps). The JSON's checked object says what was and was not measured. Cost: no network; only the level checks decode audio (at most 256 short windows; --no-levels skips them). Exit status is 0 with warnings; it fails only on unreadable inputs or mismatched transcripts.";
+Transcript checks are only as good as the transcript: missing words (laughter, crosstalk) read as silence, and word times are alignment estimates (Parakeet, for example, uses 80 ms steps). The JSON's checked object says what was and was not measured. Cost: no network; only the level checks decode audio (at most 256 short windows; --no-levels skips them), and each still that may carry alpha is decoded once to see whether it covers. Exit status is 0 with warnings; it fails only on unreadable inputs or mismatched transcripts.";
 
 const LINT_EXAMPLES: &str = "Examples:
   skywrite review lint edit.json --transcript talk.transcript.json
@@ -731,13 +731,25 @@ fn lint(args: &LintArgs) -> Result<Value> {
     let words = merged;
 
     // 1. A visible picture of someone speaking with no dialogue audible.
-    // Only a full-frame picture (video or still) whose pixel format has no
-    // alpha channel covers what lies beneath; letterboxed pictures and
-    // alpha-capable video and stills (lower thirds in ProRes 4444 or QTRLE,
-    // RGBA PNG titles) leave it visible.
+    // Only a full-frame picture covers what lies beneath: video whose pixel
+    // format has no alpha channel, or a still whose pixels are all opaque
+    // (decoded once when its format can carry alpha, as palette and RGBA PNGs
+    // can). Letterboxed pictures, alpha-capable video (lower thirds in ProRes
+    // 4444 or QTRLE) and stills with transparent pixels leave it visible.
+    let mut still_opaque = HashMap::<&Path, Option<bool>>::new();
+    for clip in edit.video_clips() {
+        let known_opaque = clip.media.video().is_some_and(|v| v.is_opaque_format());
+        if clip.kind == MediaKind::Image && !known_opaque {
+            still_opaque
+                .entry(clip.source.as_path())
+                .or_insert_with(|| media::still_is_opaque(&clip.source));
+        }
+    }
     let covers_frame = |c: &timeline::ValidatedVideoClip| {
         c.media.video().is_some_and(|v| {
-            v.is_opaque_format()
+            (v.is_opaque_format()
+                || (c.kind == MediaKind::Image
+                    && still_opaque.get(c.source.as_path()) == Some(&Some(true))))
                 && v.display_size().is_some_and(|(w, h)| {
                     let (w, h) = (w as f64, h as f64);
                     h > 0.0
@@ -856,7 +868,7 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "frames": frames,
             "source": span["source"],
             "message": format!(
-                "{what} is on screen for only {frames} frames ({:.2}s) between two hard cuts, from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
+                "{what} is on screen for only {frames} frames ({:.2}s) between hard cuts, from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
                 end - start, args.min_shot_seconds
             ),
         }));
@@ -866,6 +878,9 @@ fn lint(args: &LintArgs) -> Result<Value> {
     let mut uncertain_cover: Vec<&Path> = edit
         .video_clips()
         .filter(|c| {
+            if c.kind == MediaKind::Image {
+                return still_opaque.get(c.source.as_path()) == Some(&None);
+            }
             c.media.video().is_some_and(|v| {
                 v.pix_fmt
                     .as_deref()
@@ -1132,8 +1147,8 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "Checks are objective signals, not editorial judgement: they cannot assess delivery, emotional fit, B-roll relevance or music choice.",
             "Speaker and repetition checks only cover sources whose transcripts were supplied, and only as well as those transcripts capture what was said.",
             "Level checks measure short windows of the source audio with the edit's gains applied; they do not replace listening to the mix (skywrite review cuts).",
-            "Brief shots are checked only between hard cuts; fades and dissolves are not checked yet: a stretch with a fade, dissolve or opacity change at either edge is never reported as brief, and when it is under the threshold it is listed in checked.brief_shots_not_checked instead, to watch with skywrite review cuts. Lengths are counted on the edit's frame grid; a render can differ (at 29.97 fps a clip after a cut has been measured to start one frame late, and a video whose picture starts after its source_in shows black for that lead).",
-            "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement and opacity, not pixels: only a full-frame picture whose pixel format has no alpha channel covers what is beneath it, so cuts under letterboxed pictures, alpha-capable video (even fully opaque ProRes 4444) and stills with alpha count as visible and can add warnings; pictures whose pixel format FFmpeg does not describe are listed in checked.uncertain_cover_sources and never cover; and changes inside a clip's own picture (a cut baked into the source) are not seen."
+            "Brief shots are checked only between hard cuts; fades and dissolves are not checked yet: a stretch with a fade, dissolve or opacity change is never reported as brief, and when it is under the threshold it is listed in checked.brief_shots_not_checked instead, to watch with skywrite review cuts. Lengths are counted on the edit's frame grid, and a render can be a frame off it (measured with FFmpeg 8.0.1: at 29.97 fps a clip after a cut starts one frame late; at 30 fps a clip after a gap can start one frame late or end one frame early; a video whose picture starts after its source_in shows black for that lead).",
+            "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement and opacity, not pixels: only a full-frame picture that is certainly opaque (video whose pixel format has no alpha channel, or a still whose decoded pixels are all opaque) covers what is beneath it, so cuts under letterboxed pictures, alpha-capable video (even fully opaque ProRes 4444 with alpha) and stills with transparent pixels count as visible and can add warnings; video whose pixel format FFmpeg does not describe and stills that cannot be decoded are listed in checked.uncertain_cover_sources and never cover; and changes inside a clip's own picture (a cut baked into the source) are not seen."
         ],
     }))
 }
@@ -1624,7 +1639,7 @@ mod ending_tests {
 /// times what full-frame opaque cover above it lets through.
 const ON_SCREEN: f64 = 0.25;
 
-/// Black (no take on screen) as a take id.
+/// Black (the bottom of the picture) as a take id.
 const BLACK: usize = usize::MAX;
 
 /// A take (or black) on screen for a stretch of frames. `hard` when no visible
@@ -1701,9 +1716,10 @@ fn shots(
         };
         [fade_in, fade_out]
     };
-    // At frame n, from the top track down: the takes on screen (black when
-    // there are none); whether a visible clip is fading; and whether a
-    // visible take continues at another opacity.
+    // At frame n, from the top track down: the takes on screen, and black
+    // when at least ON_SCREEN of the light reaches the bottom through cover;
+    // whether a visible clip is fading; and whether a visible take continues
+    // at another opacity.
     let picture = |n: u64| {
         let mut through = 1.0;
         let (mut fades, mut steps) = (false, false);
@@ -1732,7 +1748,9 @@ fn shots(
                 through *= 1.0 - clip.opacity;
             }
         }
-        if on.is_empty() {
+        // Black shows wherever enough light reaches the bottom through cover,
+        // also around titles and letterboxed pictures.
+        if through >= ON_SCREEN - 1e-9 {
             on.push(BLACK);
         }
         on.sort_unstable();
