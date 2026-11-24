@@ -348,8 +348,24 @@ fn timing_cache_keys_on_the_whole_ffmpeg_build_but_stores_it_compactly() {
         assert!(std::fs::metadata(&entry).unwrap().len() < 1024);
     }
 }
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
 #[test]
 fn verify_checks_the_displayed_size_of_rotated_phone_footage() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping verify_checks_the_displayed_size_of_rotated_phone_footage: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
     let d = scratch();
     let stored = d.path().join("stored.mp4");
     ffmpeg(

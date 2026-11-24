@@ -805,8 +805,24 @@ fn unreachable_and_slow_servers_fail_once_with_a_clear_error() {
     );
 }
 
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
 #[test]
 fn video_ranges_of_rotated_phone_footage_keep_their_displayed_height() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping video_ranges_of_rotated_phone_footage_keep_their_displayed_height: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
     let env = Env::new();
     let server = Server::start(env.path());
     env.ok(&["providers", "add", "local", "--base-url", &server.base()]);

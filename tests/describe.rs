@@ -489,8 +489,24 @@ fn seeded_frame_descriptions_are_reused_across_overlapping_passes() {
     assert!(!invalid.status.success());
 }
 
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
 #[test]
 fn frames_of_rotated_phone_footage_fit_their_displayed_shape() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping frames_of_rotated_phone_footage_fit_their_displayed_shape: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let stored = dir.path().join("stored.mp4");
     fixture_video(&stored);

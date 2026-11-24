@@ -548,6 +548,12 @@ fn contact_sheets_use_exact_consecutive_frames() {
 
 #[test]
 fn contact_sheet_tiles_of_rotated_phone_footage_are_upright() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping contact_sheet_tiles_of_rotated_phone_footage_are_upright: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
     ffmpeg(&[
