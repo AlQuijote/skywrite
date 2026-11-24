@@ -274,10 +274,19 @@ fn pixel_format_alpha_flags(raw: &Value) -> HashMap<String, bool> {
         })
         .collect()
 }
-/// Whether every pixel of a still image is fully opaque, from one bounded
-/// FFmpeg decode of its alpha (opaque formats give 255 everywhere); `None`
-/// when it cannot be decoded.
-pub fn still_is_opaque(path: &Path) -> Option<bool> {
+/// A still image as FFmpeg decodes it for a render: its size after any
+/// orientation FFmpeg applies (the EXIF rotation of phone photos, on FFmpeg
+/// versions that read it), and whether every pixel is fully opaque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StillPixels {
+    pub width: u32,
+    pub height: u32,
+    pub opaque: bool,
+}
+
+/// Decode a still once, bounded, to its alpha as a PGM image (opaque formats
+/// give 255 everywhere); `None` when it cannot be decoded.
+pub fn decode_still(path: &Path) -> Option<StillPixels> {
     let formats = format_whitelist().ok()?;
     let out = crate::process::run(
         "ffmpeg",
@@ -294,17 +303,46 @@ pub fn still_is_opaque(path: &Path) -> Option<bool> {
             "1".into(),
             "-vf".into(),
             "format=rgba,alphaextract".into(),
+            "-c:v".into(),
+            "pgm".into(),
             "-f".into(),
-            "rawvideo".into(),
-            "-pix_fmt".into(),
-            "gray".into(),
+            "image2pipe".into(),
             "-".into(),
         ],
         Duration::from_secs(30),
         256 * 1024 * 1024,
     )
     .ok()?;
-    (!out.stdout.is_empty()).then(|| out.stdout.iter().all(|&alpha| alpha == 255))
+    parse_pgm_alpha(&out.stdout)
+}
+
+/// Size and opacity from a binary 8-bit PGM (`P5`) of alpha values.
+fn parse_pgm_alpha(pgm: &[u8]) -> Option<StillPixels> {
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while fields.len() < 4 {
+        while pgm.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while !pgm.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(std::str::from_utf8(&pgm[start..at]).ok()?);
+    }
+    let [magic, width, height, max] = fields[..] else {
+        return None;
+    };
+    let (width, height): (u32, u32) = (width.parse().ok()?, height.parse().ok()?);
+    if magic != "P5" || max != "255" || width == 0 || height == 0 {
+        return None;
+    }
+    let pixels = pgm.get(at + 1..)?;
+    (pixels.len() as u64 == u64::from(width) * u64::from(height)).then(|| StillPixels {
+        width,
+        height,
+        opaque: pixels.iter().all(|&alpha| alpha == 255),
+    })
 }
 
 /// Accept regular local files; canonical absolute paths cannot become flags or URLs.
@@ -1094,6 +1132,29 @@ mod duration_tests {
             (presentation_duration("wav", None, 1.0, &[stream(Some(1.5), Some(2.0))]) - 2.5).abs()
                 < 1e-12
         );
+    }
+}
+#[cfg(test)]
+mod pgm_tests {
+    use super::*;
+    #[test]
+    fn still_size_and_opacity_come_from_the_decoded_alpha() {
+        let pgm = |header: &str, pixels: &[u8]| [header.as_bytes(), pixels].concat();
+        assert_eq!(
+            parse_pgm_alpha(&pgm("P5\n3 2\n255\n", &[255; 6])),
+            Some(StillPixels {
+                width: 3,
+                height: 2,
+                opaque: true
+            })
+        );
+        let some_clear = parse_pgm_alpha(&pgm("P5 2 1 255\n", &[255, 0])).unwrap();
+        assert!(!some_clear.opaque);
+        // Truncated, 16-bit or plain (P2) images are not read.
+        assert_eq!(parse_pgm_alpha(&pgm("P5\n3 2\n255\n", &[255; 5])), None);
+        assert_eq!(parse_pgm_alpha(&pgm("P5\n1 1\n65535\n", &[255; 2])), None);
+        assert_eq!(parse_pgm_alpha(b"P2\n1 1\n255\n255\n"), None);
+        assert_eq!(parse_pgm_alpha(b""), None);
     }
 }
 #[cfg(test)]

@@ -210,6 +210,31 @@ fn lint_accepts_matching_transcript_fingerprint_case_insensitively() {
     );
 }
 
+/// Width and height of a picture file's first video stream.
+fn run_ffprobe_size(path: &Path) -> (u64, u64) {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let probe: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stream = &probe["streams"][0];
+    (
+        stream["width"].as_u64().unwrap(),
+        stream["height"].as_u64().unwrap(),
+    )
+}
+
 /// `(frames, timeline_start)` of every brief_shot warning for these tracks.
 fn brief_shots(dir: &Path, name: &str, video: Value) -> Vec<(u64, f64)> {
     lint_shots(dir, name, video).0
@@ -472,6 +497,67 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         lint_shots(d, "near-gap.json", near_gap),
         (vec![], vec![(60, 62)])
     );
+    // Its shape is within 1% of the frame's, so it hides a cut beneath it.
+    let jumps =
+        json!({"clips":[talk(0.0, 0.0, 2.0), talk(2.0, 3.0, 0.0667), talk(2.0667, 1.0, 1.9333)]});
+    let near_cover = json!([jumps, {"clips":[{"start":0,"source":"near.png","duration":4.0}]}]);
+    assert_eq!(
+        lint_shots(d, "near-cover.json", near_cover),
+        (vec![], vec![])
+    );
+    // A phone photo stored landscape and marked to turn upright (EXIF
+    // orientation 6) is sized as FFmpeg decodes it, as the render shows it.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=green:s=160x90",
+        "-frames:v",
+        "1",
+        d.join("stored.jpg").to_str().unwrap(),
+    ]);
+    let jpeg = std::fs::read(d.join("stored.jpg")).unwrap();
+    // APP1 Exif, little-endian TIFF, one IFD entry: Orientation (0x0112),
+    // SHORT, 1, value 6.
+    let exif: &[u8] = &[
+        0xFF, 0xE1, 0x00, 0x22, b'E', b'x', b'i', b'f', 0, 0, b'I', b'I', 0x2A, 0, 8, 0, 0, 0, 1,
+        0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    std::fs::write(d.join("phone.jpg"), [&jpeg[..2], exif, &jpeg[2..]].concat()).unwrap();
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        d.join("phone.jpg").to_str().unwrap(),
+        "-frames:v",
+        "1",
+        d.join("phone-decoded.png").to_str().unwrap(),
+    ]);
+    let decoded = run_ffprobe_size(&d.join("phone-decoded.png"));
+    let upright = decoded == (90, 160);
+    assert!(upright || decoded == (160, 90), "{decoded:?}");
+    let photos = json!([{"clips":[{"start":0,"source":"phone.jpg","duration":2.0},
+        {"start":2.0667,"source":"phone.jpg","duration":1.9333}]}]);
+    let over = json!([jumps, {"clips":[{"start":0,"source":"phone.jpg","duration":4.0}]}]);
+    if upright {
+        // Pillarboxed: a gap between such photos is not checked, and a cut
+        // beneath one shows.
+        assert_eq!(
+            lint_shots(d, "photos.json", photos),
+            (vec![], vec![(60, 62)])
+        );
+        assert_eq!(brief_shots(d, "over.json", over), [(2, 2.0)]);
+    } else {
+        assert_eq!(
+            lint_shots(d, "photos.json", photos),
+            (vec![(2, 2.0)], vec![])
+        );
+        assert_eq!(brief_shots(d, "over.json", over), []);
+    }
     let boxed = json!([{"clips":[talk(0.0, 0.0, 2.0), wide(2.0, 0.0, 0.0667), talk(2.0667, 2.0667, 1.9333)]}]);
     assert_eq!(lint_shots(d, "boxed.json", boxed), (vec![(2, 2.0)], vec![]));
     // The same take continued on another track counts as a cut (documented).

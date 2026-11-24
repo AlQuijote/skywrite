@@ -107,7 +107,8 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   what full-frame opaque cover above it lets through is at least 0.25; black is
   on screen while at least 0.25 of the light reaches the bottom through cover.
   **Black gaps are checked only between full-frame pictures:** the picture goes
-  from fully covered to black, with nothing on it but titles that are not
+  from fully covered, by pictures that fill the frame to the pixel as the
+  renderer fits them, to black, with nothing on it but titles that are not
   opaque, and back. Every other black change (letterbox bars, black around a
   picture-in-picture or an opaque logo, black under a partial-opacity picture)
   is not checked yet. A shot's length is exact on the
@@ -143,11 +144,16 @@ Level checks decode short windows of the sources (at most 256 measurements);
 final mix, and do not replace listening.
 
 Cover is decided from metadata, and for stills from their pixels. Only a
-full-frame picture (by displayed size, so rotated phone footage counts; it must
-fill the frame to the pixel as the renderer fits it, so 1366x768 on a 1920x1080
-edit, fitted to 1920x1079, is letterboxed) at full opacity that is certainly opaque hides what lies beneath it: video whose pixel
-format has no alpha channel, per FFmpeg's pixel format list, or a still whose
-pixels all decode as opaque (palette and RGBA PNGs are decoded once to check).
+full-frame picture (by displayed size, so rotated phone footage counts, and its
+shape within 1% of the frame's) at full opacity that is certainly opaque hides
+what lies beneath it: video whose pixel format has no alpha channel, per
+FFmpeg's pixel format list, or a still whose pixels all decode as opaque. Stills
+are decoded once, as the renderer decodes them, for their alpha and their size
+after any EXIF rotation (phone photos are often stored landscape and marked to
+turn upright; measured: FFmpeg 8.0.1 turns them). Black
+gaps are checked only between pictures that fill the frame to the pixel as the
+renderer fits them: 1366x768 on a 1920x1080 edit is fitted to 1920x1079, so it
+hides what is beneath it but a black gap next to it is not checked.
 Letterboxed pictures, alpha-capable video (QTRLE `argb`, ProRes 4444 with alpha)
 and stills with transparent pixels (PNG titles) never count as cover, even when
 every pixel of the video is opaque, so a speaker or a cut under them stays
