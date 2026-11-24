@@ -184,6 +184,9 @@ pub struct MediaStream {
     pub start_time: Option<f64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Display-matrix rotation in degrees (phone footage is often stored
+    /// landscape with -90 or 90); players and FFmpeg show the picture turned.
+    pub rotation: Option<i32>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u32>,
     pub avg_frame_rate: Option<String>,
@@ -202,6 +205,18 @@ impl MediaInfo {
     }
     pub fn audio(&self) -> Option<&MediaStream> {
         self.streams.iter().find(|s| s.codec_type == "audio")
+    }
+}
+impl MediaStream {
+    /// Width and height as displayed: swapped for a quarter-turn rotation,
+    /// matching the upright frames FFmpeg decodes.
+    pub fn display_size(&self) -> Option<(u32, u32)> {
+        let (w, h) = (self.width?, self.height?);
+        Some(if self.rotation.unwrap_or(0).rem_euclid(180) == 90 {
+            (h, w)
+        } else {
+            (w, h)
+        })
     }
 }
 /// Accept regular local files; canonical absolute paths cannot become flags or URLs.
@@ -266,6 +281,11 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
             start_time: number(s, "start_time"),
             width: s["width"].as_u64().map(|v| v as u32),
             height: s["height"].as_u64().map(|v| v as u32),
+            rotation: s["side_data_list"].as_array().and_then(|list| {
+                list.iter()
+                    .find_map(|d| d["rotation"].as_f64())
+                    .map(|r| r.round() as i32)
+            }),
             sample_rate: s["sample_rate"].as_str().and_then(|v| v.parse().ok()),
             channels: s["channels"].as_u64().map(|v| v as u32),
             avg_frame_rate: string(s, "avg_frame_rate"),

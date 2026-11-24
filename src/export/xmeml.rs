@@ -111,6 +111,25 @@ fn time_remap(speed: f64, media: &str) -> String {
     )
 }
 
+/// Basic Motion Scale that fits the picture inside the sequence, preserving
+/// aspect ratio, as the renderer does; Premiere otherwise shows media at its
+/// own size (a 4K clip in an HD sequence is cropped to its center quarter).
+fn motion(clip: &ValidatedVideoClip, width: u32, height: u32) -> String {
+    let Some((w, h)) = clip.media.video().and_then(|v| v.display_size()) else {
+        return String::new();
+    };
+    if w == 0 || h == 0 {
+        return String::new();
+    }
+    let scale = (width as f64 / w as f64).min(height as f64 / h as f64) * 100.0;
+    if (scale - 100.0).abs() < 1e-6 {
+        return String::new();
+    }
+    format!(
+        "<filter><effect><name>Basic Motion</name><effectid>basic</effectid><effectcategory>motion</effectcategory><effecttype>motion</effecttype><mediatype>video</mediatype><parameter authoringApp=\"PremierePro\"><parameterid>scale</parameterid><name>Scale</name><valuemin>0</valuemin><valuemax>1000</valuemax><value>{scale:.6}</value></parameter></effect></filter>"
+    )
+}
+
 fn keyframes(points: &[(u64, f64)]) -> String {
     points
         .iter()
@@ -410,7 +429,7 @@ pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<(String,
             let file = files.element(&clip.source, &clip.media, still, fps, &rate)?;
             write!(
                 items,
-                "<clipitem id=\"clipitem-{id}\"><name>{}</name><enabled>TRUE</enabled>{}{}{file}{}{}{}</clipitem>",
+                "<clipitem id=\"clipitem-{id}\"><name>{}</name><enabled>TRUE</enabled>{}{}{file}{}{}{}{}</clipitem>",
                 name(&clip.source),
                 item_timing(
                     in_frame,
@@ -429,6 +448,7 @@ pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<(String,
                 } else {
                     String::new()
                 },
+                motion(clip, edit.width, edit.height),
                 opacity(clip, fps, in_frame),
                 video_links.get(&id).map(String::as_str).unwrap_or_default(),
             )?;

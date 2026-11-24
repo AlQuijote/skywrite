@@ -304,6 +304,57 @@ fn lint_reports_objective_problems_and_stays_quiet_otherwise() {
         "{report}"
     );
 
+    // Phone B-roll stored 90x160 with a quarter-turn rotation shows 160x90, so
+    // it covers the speaker as fully as landscape B-roll.
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=green:s=90x160:r=30:d=4",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        &p("stored.mp4"),
+    ]);
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-display_rotation",
+        "90",
+        "-i",
+        &p("stored.mp4"),
+        "-c",
+        "copy",
+        &p("phone.mp4"),
+    ]);
+    let phone = write_edit(
+        dir.path(),
+        "phone.json",
+        base(
+            json!([{"clips":[{"start":0,"source":"talk.mp4","duration":3.5,"audio":{"volume":0}}]},
+               {"clips":[{"start":0,"source":"phone.mp4","duration":3.5}]}]),
+            json!([{"clips":[{"start":0,"source":"bed.wav","duration":3.5,"volume":0.2}]}]),
+        ),
+    );
+    let report = skywrite(&[
+        "review",
+        "lint",
+        &phone,
+        "--transcript",
+        transcript,
+        "--no-levels",
+    ]);
+    assert!(
+        !kinds(&report).contains(&"visible_speaker_without_dialogue".to_owned()),
+        "{report}"
+    );
+
     // A cut inside a word is flagged; a straight split through the same word is not.
     let clipped = write_edit(
         dir.path(),

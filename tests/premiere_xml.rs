@@ -845,6 +845,62 @@ fn wide_sources_are_written_as_stereo_pairs_with_a_note() {
 }
 
 #[test]
+fn video_is_scaled_to_fit_the_sequence_like_the_render() {
+    let dir = tempfile::tempdir().unwrap();
+    media(dir.path());
+    let p = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+    // A phone clip: stored 320x180 with a quarter-turn display rotation, so it
+    // shows upright as 180x320.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=s=320x180:r=25:d=2",
+        "-c:v",
+        "libx264",
+        &p("landscape.mp4"),
+    ]);
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-display_rotation",
+        "-90",
+        "-i",
+        &p("landscape.mp4"),
+        "-c",
+        "copy",
+        &p("phone.mp4"),
+    ]);
+    let edit = json!({"version":1,"name":"Vertical","width":90,"height":160,"fps":{"num":25,"den":1},
+        "video":[{"clips":[
+            {"start":0,"source":"phone.mp4","duration":1},
+            {"start":1,"source":"cam.mp4","duration":1}]}]});
+    let (xml, _) = export_xml(edit, dir.path(), &ExportOptions::default());
+    let root = import::parse_xml(&xml).unwrap();
+    let scales: Vec<String> = kids(tracks(&root, "video")[0], "clipitem")
+        .map(|item| {
+            let effect = path(item, &["filter", "effect"]);
+            assert_eq!(text(effect, &["effectid"]), "basic");
+            assert_eq!(text(effect, &["parameter", "parameterid"]), "scale");
+            text(effect, &["parameter", "value"]).to_owned()
+        })
+        .collect();
+    // Phone 180x320 fills the 90x160 frame at 50%; the 160x90 camera clip is
+    // letterboxed at 90/160 = 56.25%.
+    assert_eq!(scales, ["50.000000", "56.250000"]);
+
+    // Media that already matches the sequence size carries no Basic Motion.
+    let (xml, _) = export_xml(tester_edit(), dir.path(), &ExportOptions::default());
+    assert!(!xml.contains("<effectid>basic</effectid>"), "{xml}");
+}
+
+#[test]
 fn media_root_warns_when_sources_leave_the_edit_tree() {
     // Media under target/ and the edit under the system temp folder usually
     // share only the filesystem root.

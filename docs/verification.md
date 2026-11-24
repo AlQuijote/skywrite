@@ -21,6 +21,8 @@ object for its audio and video decodes.
 presentation end includes source-relative delay and gaps. The decoder handles
 codec priming. The cache is regeneratable local evidence, not a signed attestation.
 Existing MediaInfo JSON remains readable; inspection adds explanatory fields.
+A video stream's `rotation` is its display-matrix rotation in degrees (phone
+footage stored landscape reports -90 or 90); FFmpeg decodes it upright.
 
 `skywrite verify FILE --expected-duration 10 --duration-tolerance 0.05
 --expected-width 1280 --expected-height 720 --expected-fps 30` performs a fresh
