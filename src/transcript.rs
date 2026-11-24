@@ -296,14 +296,26 @@ pub struct TranscribeOptions<'a> {
     pub duration: Option<f64>,
     pub chunk_seconds: f64,
 }
+/// Who turns each audio chunk into words: a provider over HTTP, or the
+/// built-in on-device engine. Both answer in the same verbose JSON shape and
+/// pass the same validation.
+pub enum Transcriber<'a> {
+    Api(&'a crate::openrouter::Client),
+    OnDevice(&'a mut dyn ChunkEngine),
+}
+/// An in-process engine: one 16 kHz mono chunk in, a verbose transcription
+/// body (`text`, `words` with chunk-relative times, optional `usage`) out.
+pub trait ChunkEngine {
+    fn transcribe_chunk(&mut self, samples: &[i16], language: Option<&str>) -> Result<Value>;
+}
 pub fn transcribe(
     info: &crate::media::MediaInfo,
-    api: &crate::openrouter::Client,
+    transcriber: Transcriber<'_>,
     options: &TranscribeOptions<'_>,
 ) -> Result<Transcript> {
     transcribe_with_limits(
         info,
-        api,
+        transcriber,
         options,
         crate::io::MAX_JSON_BYTES as usize,
         MAX_WORDS,
@@ -311,7 +323,7 @@ pub fn transcribe(
 }
 fn transcribe_with_limits(
     info: &crate::media::MediaInfo,
-    api: &crate::openrouter::Client,
+    mut transcriber: Transcriber<'_>,
     options: &TranscribeOptions<'_>,
     max_bytes: usize,
     max_words: usize,
@@ -389,16 +401,32 @@ fn transcribe_with_limits(
         if bytes.len() > 4 * 1024 * 1024 {
             bail!("encoded audio chunk exceeded 4 MiB");
         }
-        let mut request = json!({"model": options.model, "input_audio":{"data":STANDARD.encode(bytes),"format":"wav"},"response_format":"verbose_json","timestamp_granularities":["word"]});
-        if let Some(language) = options.language {
-            request["language"] = Value::String(language.to_owned());
-        }
         eprintln!(
             "Transcribing chunk {}/{} ({offset:.3}s + {length:.3}s)",
             index + 1,
             chunks
         );
-        let response = api.request("audio/transcriptions", &request)?;
+        let response = match &mut transcriber {
+            Transcriber::Api(api) => {
+                let mut request = json!({"model": options.model, "input_audio":{"data":STANDARD.encode(bytes),"format":"wav"},"response_format":"verbose_json","timestamp_granularities":["word"]});
+                if let Some(language) = options.language {
+                    request["language"] = Value::String(language.to_owned());
+                }
+                api.request("audio/transcriptions", &request)?
+            }
+            Transcriber::OnDevice(engine) => {
+                let (rate, samples) = chunk_audio
+                    .as_ref()
+                    .context("extracted audio chunk is not 16-bit mono PCM")?;
+                if *rate != 16_000 {
+                    bail!("extracted audio chunk is {rate} Hz, not 16 kHz");
+                }
+                crate::openrouter::ApiResponse {
+                    body: engine.transcribe_chunk(samples, options.language)?,
+                    cached: false,
+                }
+            }
+        };
         if response.cached {
             cache_hits += 1;
         }
@@ -893,7 +921,8 @@ mod tests {
             duration: None,
             chunk_seconds: 10.,
         };
-        let error = transcribe_with_limits(&info, &api, &options, 4096, 3).unwrap_err();
+        let error =
+            transcribe_with_limits(&info, Transcriber::Api(&api), &options, 4096, 3).unwrap_err();
         server.join().unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert!(
@@ -961,7 +990,8 @@ mod tests {
         };
         let expected_hash = crate::media::file_sha256(&source).unwrap();
         crate::media::hash_tests::READ_BYTES.with(|bytes| bytes.set(0));
-        let accepted = transcribe_with_limits(&info, &api, &options, 4096, 4).unwrap();
+        let accepted =
+            transcribe_with_limits(&info, Transcriber::Api(&api), &options, 4096, 4).unwrap();
         // Setup warmed exact timing. Transcription resolves timing once (a warm
         // lookup hashes before and after use), reusing that evidence for range
         // validation and its source fingerprint.
@@ -977,7 +1007,8 @@ mod tests {
             expected_hash
         );
         let exact = json_size(&accepted, 0).unwrap() + 1;
-        let transcript = transcribe_with_limits(&info, &api, &options, exact, 4).unwrap();
+        let transcript =
+            transcribe_with_limits(&info, Transcriber::Api(&api), &options, exact, 4).unwrap();
         assert_eq!(transcript.text, "second first  second first");
         assert_eq!(
             transcript
@@ -997,11 +1028,183 @@ mod tests {
         assert_eq!(usage["word_ordering"]["provider_reordered_chunks"], 2);
         assert_eq!(usage["chunks"].as_array().unwrap().len(), 3);
         assert!(
-            transcribe_with_limits(&info, &api, &options, exact - 1, 4)
+            transcribe_with_limits(&info, Transcriber::Api(&api), &options, exact - 1, 4)
                 .unwrap_err()
                 .to_string()
                 .contains("serialized output budget")
         );
+    }
+}
+
+#[cfg(test)]
+mod chunk_engine_tests {
+    use super::*;
+
+    /// Answers every chunk from a script and records what it was given.
+    struct Fake {
+        answers: Vec<Value>,
+        seen: Vec<(usize, Option<String>)>,
+    }
+    impl ChunkEngine for Fake {
+        fn transcribe_chunk(&mut self, samples: &[i16], language: Option<&str>) -> Result<Value> {
+            self.seen.push((samples.len(), language.map(str::to_owned)));
+            Ok(self.answers.remove(0))
+        }
+    }
+
+    /// 25 s at 16 kHz: a tone for the first 15 s, then digital silence.
+    fn source(dir: &Path) -> crate::media::MediaInfo {
+        let path = dir.join("source.wav");
+        assert!(
+            std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i"])
+                .arg("aevalsrc='if(lt(t,15),0.2*sin(2*PI*440*t),0)':s=16000:d=25")
+                .args(["-c:a", "pcm_s16le"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        crate::media::probe(&path).unwrap()
+    }
+
+    fn options(chunk_seconds: f64) -> TranscribeOptions<'static> {
+        TranscribeOptions {
+            model: "parakeet-tdt-0.6b-v3",
+            reference: "ondevice:parakeet-tdt-0.6b-v3",
+            language: Some("en"),
+            start: 0.0,
+            duration: None,
+            chunk_seconds,
+        }
+    }
+
+    #[test]
+    fn on_device_chunks_keep_every_transcript_guarantee() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = source(dir.path());
+        let usage = json!({"engine":"fake","cost":0});
+        let mut engine = Fake {
+            answers: vec![
+                json!({"text":"one two","words":[{"word":"one","start":0.24,"end":0.48},{"word":"two","start":9.92,"end":10.0}],"usage":usage}),
+                json!({"text":"three quiet","words":[{"word":"three","start":1.04,"end":1.36},{"word":"quiet","start":7.2,"end":7.6}],"usage":usage}),
+                // The last chunk is 5 s long: a word may end within the
+                // provider tolerance past it, never further.
+                json!({"text":"tail","words":[{"word":"tail","start":4.96,"end":5.12}]}),
+            ],
+            seen: Vec::new(),
+        };
+        let transcript =
+            transcribe(&info, Transcriber::OnDevice(&mut engine), &options(10.0)).unwrap();
+        assert_eq!(
+            engine.seen,
+            vec![
+                (160_000, Some("en".into())),
+                (160_000, Some("en".into())),
+                (80_000, Some("en".into()))
+            ]
+        );
+        assert_eq!(
+            transcript.model.as_deref(),
+            Some("ondevice:parakeet-tdt-0.6b-v3")
+        );
+        assert_eq!(transcript.text, "one two three quiet tail");
+        let words: Vec<_> = transcript
+            .words
+            .iter()
+            .map(|w| (w.text.as_str(), w.start, w.end))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                ("one", 0.24, 0.48),
+                ("two", 9.92, 10.0),
+                ("three", 11.04, 11.36),
+                ("quiet", 17.2, 17.6),
+                ("tail", 24.96, 25.12)
+            ]
+        );
+        // Only the word placed in the silent half is flagged, never dropped.
+        let flagged: Vec<_> = transcript
+            .words
+            .iter()
+            .filter(|w| w.audio_level_dbfs.is_some())
+            .map(|w| w.text.as_str())
+            .collect();
+        assert_eq!(flagged, ["quiet", "tail"]);
+        assert!(transcript.words.iter().all(|w| w.confidence.is_none()));
+        let usage = transcript.usage.unwrap();
+        assert_eq!(
+            usage["source_sha256"],
+            crate::media::file_sha256(&info.path).unwrap()
+        );
+        assert_eq!(usage["low_audio_words"], 2);
+        assert_eq!(usage["cache_hits"], 0);
+        assert_eq!(usage["total_chunks"], 3);
+        assert_eq!(
+            usage["chunks"],
+            json!([{"cached":false,"usage":{"engine":"fake","cost":0}},{"cached":false,"usage":{"engine":"fake","cost":0}}])
+        );
+        assert_eq!(usage["word_ordering"]["provider_reordered_chunks"], 0);
+        assert_eq!(usage["word_ordering"]["chunk_boundary_reordered"], false);
+    }
+
+    #[test]
+    fn on_device_answers_without_real_word_times_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = source(dir.path());
+        for (answer, message) in [
+            (
+                json!({"text":"words but no times"}),
+                "without word timestamps",
+            ),
+            (json!({"text":"hello","words":[]}), "no word timestamps"),
+            (
+                json!({"text":"late","words":[{"word":"late","start":9.0,"end":10.2}]}),
+                "invalid word timestamps",
+            ),
+            (
+                json!({"text":"blank","words":[{"word":" ","start":1.0,"end":1.1}]}),
+                "invalid transcript word text",
+            ),
+        ] {
+            let mut engine = Fake {
+                answers: vec![answer],
+                seen: Vec::new(),
+            };
+            let error =
+                transcribe(&info, Transcriber::OnDevice(&mut engine), &options(10.0)).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+            assert_eq!(engine.seen.len(), 1, "stops at the first bad chunk");
+        }
+        // Silence is a valid empty chunk, not an error.
+        let mut engine = Fake {
+            answers: vec![json!({"text":"","words":[]}); 3],
+            seen: Vec::new(),
+        };
+        let transcript =
+            transcribe(&info, Transcriber::OnDevice(&mut engine), &options(10.0)).unwrap();
+        assert!(transcript.words.is_empty() && transcript.text.trim().is_empty());
+    }
+
+    #[test]
+    fn on_device_range_starts_are_shifted_into_source_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = source(dir.path());
+        let mut engine = Fake {
+            answers: vec![json!({"text":"mid","words":[{"word":"mid","start":0.5,"end":0.9}]})],
+            seen: Vec::new(),
+        };
+        let mut options = options(10.0);
+        options.start = 3.25;
+        options.duration = Some(4.0);
+        let transcript = transcribe(&info, Transcriber::OnDevice(&mut engine), &options).unwrap();
+        assert_eq!(engine.seen, vec![(64_000, Some("en".into()))]);
+        assert_eq!(
+            (transcript.words[0].start, transcript.words[0].end),
+            (3.75, 4.15)
+        );
+        assert_eq!(transcript.duration, 25.0);
     }
 }
 

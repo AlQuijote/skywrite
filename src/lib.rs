@@ -7,6 +7,7 @@ pub mod image;
 pub mod io;
 pub mod media;
 pub mod models;
+pub mod ondevice;
 pub mod openrouter;
 pub mod process;
 pub mod providers;

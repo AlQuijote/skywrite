@@ -200,7 +200,7 @@ fn provider_config_lifecycle_and_reference_rules() {
         .iter()
         .map(|p| p["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["openrouter", "local", "remote"]);
+    assert_eq!(names, ["openrouter", "ondevice", "local", "remote"]);
     assert_eq!(listed["providers"][0]["builtin"], true);
     assert_eq!(listed["providers"][0]["key_env"], "OPENROUTER_API_KEY");
 

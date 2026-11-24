@@ -111,28 +111,43 @@ jobs:
         with:
           name: release-metadata
           path: metadata
-      # musl-gcc compiles the C dependencies (aws-lc-sys, libwebp-sys) and links.
-      - name: Install musl toolchain
+      # Only for the musl licence notice shipped with the static binaries.
+      - name: Install musl notice
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends musl-tools
+          sudo apt-get install --yes --no-install-recommends musl-dev
       - name: Build and package
         shell: bash
+        env:
+          # rust:1.100.0-alpine3.24 (multi-arch index); keep in sync with ci.yml.
+          ALPINE_RUST: rust:1.100.0-alpine3.24@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
         run: |
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
-            export "CC_${TARGET//-/_}=musl-gcc"
-            linker_target=${TARGET//-/_}
-            export "CARGO_TARGET_${linker_target^^}_LINKER=musl-gcc"
-          fi
-          cargo build --release --locked --target "$TARGET"
-          if [[ "$RUNNER_OS" == Linux ]]; then
+            # The on-device engine (transcribe.cpp/ggml) is C++ and musl-tools
+            # has no C++ compiler, so Linux builds run natively in Alpine
+            # (musl gcc/g++, static libstdc++; see build.rs). ggml's CPU code
+            # gets a fixed floor instead of the runner's CPU: x86_64 requires
+            # Haswell-class AVX2/FMA/F16C/BMI2 (checked at run time before the
+            # engine loads), aarch64 plain ARMv8-A NEON.
+            cmake_args="-DCMAKE_POSITION_INDEPENDENT_CODE=ON -DGGML_NATIVE=OFF"
+            if [[ "$TARGET" == x86_64-* ]]; then
+              cmake_args+=" -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF"
+            fi
+            docker run --rm -v "$PWD:/src" -w /src -e TARGET -e "TRANSCRIBE_CMAKE_ARGS=$cmake_args" \
+              "$ALPINE_RUST" sh -euc '
+                apk add --no-cache musl-dev g++ cmake make
+                cargo build --release --locked --target "$TARGET"
+              '
+            sudo chown -R "$(id -u):$(id -g)" target
             # The distributed Linux binary must be statically linked.
-            if readelf -l "target/$TARGET/release/skywrite" | grep -q INTERP; then
+            if readelf -l "target/$TARGET/release/skywrite" | grep -q INTERP || readelf -d "target/$TARGET/release/skywrite" | grep -q NEEDED; then
               echo "Expected a static musl binary" >&2
               exit 1
             fi
+          else
+            cargo build --release --locked --target "$TARGET"
           fi
           # Smoke test targets the runner can execute natively.
           if [[ "$(rustc -vV | sed -n 's/^host: //p')" == "${TARGET/-musl/-gnu}" || "$(rustc -vV | sed -n 's/^host: //p')" == "$TARGET" ]]; then
@@ -149,6 +164,10 @@ jobs:
           if [[ "$RUNNER_OS" == Linux ]]; then
             cp /usr/share/doc/musl-dev/copyright "staging/$name/musl-COPYRIGHT.txt"
           fi
+          # The on-device engine vendors ggml, miniz and Silero VAD (MIT); their
+          # notices live in transcribe-cpp-sys, beside its own crate licence.
+          sys_dir=$(cargo metadata --locked --format-version 1 | python3 -c 'import json,sys; print(next(p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"]=="transcribe-cpp-sys").rsplit("/",1)[0])')
+          cp "$sys_dir/THIRD-PARTY-LICENSES.md" "staging/$name/transcribe-cpp-THIRD-PARTY-LICENSES.md"
           tar -C staging -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

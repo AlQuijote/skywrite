@@ -23,10 +23,19 @@ pub const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 pub const MAX_TIMEOUT_SECONDS: u64 = 3600;
 const MAX_PROVIDERS: usize = 32;
 const MAX_HEADERS: usize = 16;
-/// Words OpenRouter uses as model variant suffixes (`vendor/model:free`);
-/// reserved so `free:x` can never be mistaken for a variant.
+/// The built-in providers, plus words OpenRouter uses as model variant
+/// suffixes (`vendor/model:free`), reserved so `free:x` can never be mistaken
+/// for a variant.
 const RESERVED: &[&str] = &[
-    BUILTIN, "free", "thinking", "nitro", "floor", "online", "extended", "exacto",
+    BUILTIN,
+    crate::ondevice::PROVIDER,
+    "free",
+    "thinking",
+    "nitro",
+    "floor",
+    "online",
+    "extended",
+    "exacto",
 ];
 /// Tasks whose wire format is standard OpenAI chat/completions or
 /// /audio/transcriptions, and so may use any provider.
@@ -68,6 +77,20 @@ impl Provider {
             headers: BTreeMap::new(),
             timeout: Duration::from_secs(BUILTIN_TIMEOUT_SECONDS),
         }
+    }
+    /// The in-process on-device engine (`ondevice:MODEL`). It has no URL or
+    /// key and serves only transcription; see `crate::ondevice`.
+    pub fn ondevice() -> Self {
+        Self {
+            name: crate::ondevice::PROVIDER.into(),
+            base_url: String::new(),
+            key_env: None,
+            headers: BTreeMap::new(),
+            timeout: Duration::ZERO,
+        }
+    }
+    pub fn is_ondevice(&self) -> bool {
+        self.name == crate::ondevice::PROVIDER
     }
     fn from_config(name: &str, config: &ProviderConfig) -> Result<Self> {
         let config = validate_config(name, config)?;
@@ -123,6 +146,9 @@ impl Provider {
         insecure_http_warning(&self.base_url).into_iter().collect()
     }
     pub fn summary(&self) -> Value {
+        if self.is_ondevice() {
+            return crate::ondevice::provider_summary();
+        }
         json!({
             "name": self.name,
             "builtin": self.is_openrouter(),
@@ -198,6 +224,10 @@ pub fn resolve(reference: &str, configured: &BTreeMap<String, ProviderConfig>) -
     let (name, model) = split_reference(reference)?;
     let provider = match name {
         None | Some(BUILTIN) => Provider::builtin(),
+        Some(crate::ondevice::PROVIDER) => {
+            crate::ondevice::spec(model)?;
+            Provider::ondevice()
+        }
         Some(name) => match configured.get(name) {
             Some(config) => Provider::from_config(name, config)?,
             None => {
@@ -220,6 +250,12 @@ pub fn resolve(reference: &str, configured: &BTreeMap<String, ProviderConfig>) -
 
 /// Generation tasks use OpenRouter-specific APIs and durable jobs.
 pub fn check_task(task: &str, provider: &Provider) -> Result<()> {
+    if provider.is_ondevice() && task != "transcription" {
+        bail!(
+            "provider {} runs on-device transcription models only, not {task}",
+            provider.name
+        );
+    }
     if !provider.is_openrouter() && !PORTABLE_TASKS.contains(&task) {
         bail!(
             "{task} uses OpenRouter-specific generation APIs, so it supports only provider openrouter, not {}. Custom providers serve {}",
@@ -385,7 +421,7 @@ pub fn insecure_http_warning(base_url: &str) -> Option<String> {
 
 /// Every configured provider plus the built-in one, by name.
 pub fn all() -> Result<Vec<Provider>> {
-    let mut providers = vec![Provider::builtin()];
+    let mut providers = vec![Provider::builtin(), Provider::ondevice()];
     for (name, config) in crate::workspace::provider_configs()? {
         providers.push(Provider::from_config(&name, &config)?);
     }
@@ -395,6 +431,9 @@ pub fn all() -> Result<Vec<Provider>> {
 pub fn get(name: &str) -> Result<Provider> {
     if name == BUILTIN {
         return Ok(Provider::builtin());
+    }
+    if name == crate::ondevice::PROVIDER {
+        return Ok(Provider::ondevice());
     }
     validate_name(name)?;
     let configs = crate::workspace::provider_configs()?;
@@ -408,7 +447,9 @@ pub fn get(name: &str) -> Result<Provider> {
 /// custom provider (OpenRouter users never depend on the providers section).
 pub fn resolve_reference(reference: &str) -> Result<ModelRef> {
     match split_reference(reference)? {
-        (None | Some(BUILTIN), _) => resolve(reference, &BTreeMap::new()),
+        (None | Some(BUILTIN | crate::ondevice::PROVIDER), _) => {
+            resolve(reference, &BTreeMap::new())
+        }
         (Some(_), _) => resolve(reference, &crate::workspace::provider_configs()?),
     }
 }
@@ -475,8 +516,15 @@ pub fn execute(command: ProvidersCommand) -> Result<Value> {
         }
         ProvidersCommand::Show { name } => json!({"provider": get(&name)?.summary()}),
         ProvidersCommand::Remove { name } => {
-            if name == BUILTIN {
-                bail!("the built-in provider openrouter cannot be removed");
+            if name == BUILTIN || name == crate::ondevice::PROVIDER {
+                bail!(
+                    "the built-in provider {name} cannot be removed{}",
+                    if name == BUILTIN {
+                        ""
+                    } else {
+                        "; delete a downloaded model with skywrite models remove ondevice:MODEL"
+                    }
+                );
             }
             validate_name(&name)?;
             crate::workspace::remove_provider(&name)?;

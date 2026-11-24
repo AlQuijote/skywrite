@@ -230,6 +230,10 @@ struct TranscribeArgs {
     duration: Option<f64>,
     #[arg(long, default_value_t = 60.0)]
     chunk_seconds: f64,
+    /// With an on-device model (ondevice:MODEL): download its pinned files
+    /// first if they are missing. Without this flag nothing is downloaded.
+    #[arg(long)]
+    download: bool,
     #[command(flatten)]
     api: ApiOptions,
     #[command(flatten)]
@@ -406,9 +410,23 @@ enum ModelCommand {
         offline: bool,
         #[arg(long)]
         cache_dir: Option<PathBuf>,
-        /// List a configured provider's own /models instead of OpenRouter's catalogs.
+        /// List a configured provider's own /models instead of OpenRouter's
+        /// catalogs, or `ondevice` for the free on-device models and their status.
         #[arg(long, value_name = "NAME")]
         provider: Option<String>,
+    },
+    /// Download an on-device model's pinned files into the shared cache
+    /// (resumable; size and SHA-256 checked). Example: ondevice:parakeet-tdt-0.6b-v3
+    Download {
+        reference: String,
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Delete a downloaded on-device model (and any partial download).
+    Remove {
+        reference: String,
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
 }
 
@@ -631,18 +649,44 @@ fn execute(command: Command) -> Result<Value> {
             protect_inputs(&args.output, std::slice::from_ref(&args.input))?;
             let info = skywrite::media::probe(&args.input)?;
             let target = skywrite::models::resolve_target("transcription", args.model.as_deref())?;
-            let result = skywrite::transcript::transcribe(
-                &info,
-                &api(&args.api, &target.provider)?,
-                &skywrite::transcript::TranscribeOptions {
-                    model: &target.model,
-                    reference: &target.reference(),
-                    language: args.language.as_deref(),
-                    start: args.start,
-                    duration: args.duration,
-                    chunk_seconds: args.chunk_seconds,
-                },
-            )?;
+            let options = skywrite::transcript::TranscribeOptions {
+                model: &target.model,
+                reference: &target.reference(),
+                language: args.language.as_deref(),
+                start: args.start,
+                duration: args.duration,
+                chunk_seconds: args.chunk_seconds,
+            };
+            let result = if target.provider.is_ondevice() {
+                let spec = skywrite::ondevice::spec(&target.model)?;
+                let cache_dir = args.api.cache_dir.as_deref();
+                // Never download (or hash) for an engine that cannot run here.
+                if let Some(reason) = skywrite::ondevice::engine_unavailable() {
+                    bail!("{reason}");
+                }
+                if args.download {
+                    skywrite::ondevice::check_input_is_not_model(spec, cache_dir, &args.input)?;
+                    skywrite::ondevice::download(spec, cache_dir)?;
+                }
+                let mut engine = skywrite::ondevice::Engine::load(spec, cache_dir)?;
+                skywrite::transcript::transcribe(
+                    &info,
+                    skywrite::transcript::Transcriber::OnDevice(&mut engine),
+                    &options,
+                )?
+            } else {
+                if args.download {
+                    bail!(
+                        "--download applies only to on-device models (ondevice:MODEL); {} is a hosted model",
+                        target.reference()
+                    );
+                }
+                skywrite::transcript::transcribe(
+                    &info,
+                    skywrite::transcript::Transcriber::Api(&api(&args.api, &target.provider)?),
+                    &options,
+                )?
+            };
             finish(serde_json::to_value(result)?, &args.output)
         }
         Command::Analyze(args) => {
@@ -850,6 +894,20 @@ fn execute(command: Command) -> Result<Value> {
                 cache_dir: cache_dir.as_deref(),
                 provider: provider.as_deref(),
             }),
+            ModelCommand::Download {
+                reference,
+                cache_dir,
+            } => skywrite::ondevice::download(
+                skywrite::ondevice::spec_for_reference(&reference)?,
+                cache_dir.as_deref(),
+            ),
+            ModelCommand::Remove {
+                reference,
+                cache_dir,
+            } => skywrite::ondevice::remove(
+                skywrite::ondevice::spec_for_reference(&reference)?,
+                cache_dir.as_deref(),
+            ),
         },
         Command::Providers { command } => skywrite::providers::execute(command),
         Command::Styles { command } => {
@@ -904,6 +962,14 @@ fn provider_health() -> (Value, bool) {
             value
                 .as_object_mut()
                 .map(|object| object.remove("openrouter_only_features"));
+            if provider.is_ondevice() {
+                value["reachable"] = json!(null);
+                value["check"] = json!("runs in this process; no network");
+                value["models"] = skywrite::ondevice::list(None, None)
+                    .map(|mut listed| listed["models"].take())
+                    .unwrap_or_else(|error| json!({"error":format!("{error:#}")}));
+                return value;
+            }
             if provider.is_openrouter() {
                 value["reachable"] = json!(null);
                 value["check"] =

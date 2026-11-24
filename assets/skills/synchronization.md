@@ -67,7 +67,7 @@ Never apply a failed or refused result, or one with a `limited` segment (`sync a
 - `drift_estimated: false` or `quality: limited` with a short overlap: there is not enough shared sound to measure the speed. Get a longer overlap; do not guess a speed.
 - `method: audio_envelope`: only 50 ms resolution; get a longer or cleaner overlap, or use transcripts.
 - A segment whose quality is `limited`, or a warning that strong matches "fit no mapping": a short cut or dropout the analysis could not separate. Sync the material on each side separately (trim with ffmpeg) or ask the user.
-- Speech recorded by different microphones with little shared sound: transcribe both and use `--method transcript` (with the user's API budget); word timestamps are approximate, so check by listening.
+- Speech recorded by different microphones with little shared sound: transcribe both and use `--method transcript` (with the user's API budget, or free with `--model ondevice:parakeet-tdt-0.6b-v3` once its model is downloaded); word timestamps are approximate, so check by listening.
 
 ## Dialogue cuts from real words
 

@@ -143,8 +143,8 @@ Use `PROVIDER:MODEL` wherever a model is accepted: `--model`,
 - A reference without a colon, or with a `/` before its first colon, is an OpenRouter
   ID, so `openai/gpt-6-luna` and `meta-llama/llama-3.3-70b:free` work unchanged.
   `openrouter:vendor/model` is the same model; it is saved as `vendor/model`.
-- Provider names are 1-32 lowercase letters, digits, `_` or `-`. `openrouter` and
-  OpenRouter's variant words (`free`, `thinking`, `nitro`, `floor`, `online`,
+- Provider names are 1-32 lowercase letters, digits, `_` or `-`. The built-in
+  `openrouter` and [`ondevice`](#on-device-transcription) and OpenRouter's variant words (`free`, `thinking`, `nitro`, `floor`, `online`,
   `extended`, `exacto`) are reserved.
 - An unknown provider is an error, never a silent fallback to OpenRouter:
   `qwen3:0.8b` fails with a hint to write `local:qwen3:0.8b`.
@@ -241,3 +241,64 @@ measure people, expressions or mid-speech, which is where small models are weake
 Treat its descriptions as a cheap first pass, and confirm important frames by viewing
 them or re-describing them with a stronger model. See
 [model evaluation](model-evaluation.md#local-model-check-2026-11-23-synthetic-known-content-frames-not-the-set-above).
+
+## On-device transcription
+
+The built-in `ondevice` provider runs NVIDIA Parakeet TDT 0.6B v3 inside Skywrite,
+through transcribe.cpp on ggml (MIT; compiled into the release binaries). It needs no
+key or account, costs nothing, and sends no audio anywhere. It serves only
+`transcription`; any other task with an `ondevice:` model is an error.
+
+```sh
+skywrite models download ondevice:parakeet-tdt-0.6b-v3   # once; 739,508,576 bytes
+skywrite transcribe interview.mp4 --model ondevice:parakeet-tdt-0.6b-v3 -o words.json
+skywrite defaults transcription set ondevice:parakeet-tdt-0.6b-v3   # optional
+skywrite models list --provider ondevice                  # status, size, licence
+skywrite models remove ondevice:parakeet-tdt-0.6b-v3      # frees the disk space
+```
+
+- **Consent.** Nothing is downloaded unless you run `models download` or add
+  `--download` to `transcribe`. Without the file, `transcribe` fails with the size,
+  the licence and both commands. `--download` with a hosted model is an error.
+- **Pinned files.** The model is the 8-bit (Q8_0) GGUF conversion by handy-computer
+  of `nvidia/parakeet-tdt-0.6b-v3`, from a Hugging Face URL pinned to one revision,
+  with a pinned size and SHA-256. A download continues where an interrupted one
+  stopped (HTTP range request), never writes more than the pinned size, and is
+  published under its final name only after the whole file matches the SHA-256; a
+  mismatch deletes it. Each `transcribe` checks the size and SHA-256 again before
+  loading (about a second), so a damaged file is refused, not used. One download or
+  removal runs at a time per model.
+- **Where.** `<cache>/ondevice/parakeet-tdt-0.6b-v3/` under the shared cache
+  (`--cache-dir`, `SKYWRITE_CACHE_DIR`, `XDG_CACHE_HOME/skywrite` or
+  `~/.cache/skywrite`). Use the same `--cache-dir` for download and transcription.
+  Only `models remove` deletes it.
+- **Needs.** 740 MB of disk, about 1.5 GB of RAM on CPU or 0.3 GB with Metal.
+  Apple silicon uses Metal (the first run compiles GPU shaders once, about 20 s);
+  Intel Macs and Linux use the CPU. Linux x86-64 needs AVX2, FMA, F16C and BMI2
+  (Intel Haswell, AMD Excavator, 2013 on); without them `transcribe` refuses to load
+  the engine instead of crashing. Linux ARM64 needs plain ARMv8-A. The engine uses half
+  the logical CPUs (1 to 8); results do not depend on the count.
+- **Speed.** One 60-second chunk: 1.8 s on an Apple M4 with Metal, 9.5–12 s on its
+  CPU, 16 s on 4 cores of a busy 8-core x86-64 (see
+  [model evaluation](model-evaluation.md#on-device-parakeet-2026-11-23-rebuilt-windows-not-the-chunks-above)).
+- **Output.** The transcript has the usual shape: `model` is
+  `ondevice:parakeet-tdt-0.6b-v3`, words carry the model's own token timings (80 ms
+  steps, never estimated; a result without them is rejected), chunks are shifted
+  into source time, quiet words are flagged, `usage.source_sha256` fingerprints the
+  media, and each `usage.chunks[].usage` records the engine, backend (`CPU` or a Metal
+  device), threads, model SHA-256, encode and decode milliseconds and `cost: 0`.
+  Nothing is cached (`cache_hits` is 0); running again gives the same words.
+- **Languages.** Bulgarian, Croatian, Czech, Danish, Dutch, English, Estonian,
+  Finnish, French, German, Greek, Hungarian, Italian, Latvian, Lithuanian, Maltese,
+  Polish, Portuguese, Romanian, Russian, Slovak, Slovenian, Spanish, Swedish and
+  Ukrainian, detected automatically. `--language` must be one of these codes.
+- **Quality.** On dense meeting speech it keeps fewer fillers ("um") and restarts
+  than Scribe v2, which stays the default; see the
+  [evaluation](model-evaluation.md#on-device-parakeet-2026-11-23-rebuilt-windows-not-the-chunks-above).
+- **Licence.** Parakeet TDT 0.6B v3 by NVIDIA, licensed
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the attribution is
+  shown wherever the model is listed (`models list --provider ondevice`, the
+  `ondevice_models` of `models list --task transcription`, and `doctor`).
+- **Building from source.** The engine needs cmake and a C++ compiler. `cargo build
+  --no-default-features` leaves it out; `ondevice:` models then report that the
+  engine is missing.

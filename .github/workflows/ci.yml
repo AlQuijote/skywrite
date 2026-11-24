@@ -91,32 +91,35 @@ jobs:
           env CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" HOME="$test_home" cargo test --locked --no-fail-fast
 
   # Release Linux binaries are static musl builds; catch musl-only breakage
-  # (missing libc symbols, C dependencies) before a tag.
+  # (missing libc symbols, C/C++ dependencies) before a tag. The on-device
+  # engine is C++, and musl-tools has no C++ compiler, so the build runs in the
+  # same pinned Alpine image as the release (native musl gcc/g++).
   musl:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     env:
       TARGET: x86_64-unknown-linux-musl
-      CC_x86_64_unknown_linux_musl: musl-gcc
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # rust:1.100.0-alpine3.24 (multi-arch index); keep in sync with release.yml.
+      ALPINE_RUST: rust:1.100.0-alpine3.24@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: musl
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+          persist-credentials: false
       - name: Build and check a static binary
         run: |
-          cargo build --locked --target "$TARGET"
-          if readelf -l "target/$TARGET/debug/skywrite" | grep -q INTERP; then
+          docker run --rm -v "$PWD:/src" -w /src -e TARGET \
+            -e TRANSCRIBE_CMAKE_ARGS=-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            "$ALPINE_RUST" sh -euc '
+              apk add --no-cache musl-dev g++ cmake make
+              cargo build --locked --target "$TARGET" --no-default-features
+              cargo build --locked --target "$TARGET"
+            '
+          if readelf -l "target/$TARGET/debug/skywrite" | grep -q INTERP || readelf -d "target/$TARGET/debug/skywrite" | grep -q NEEDED; then
             echo "Expected a static musl binary" >&2
             exit 1
           fi
           "target/$TARGET/debug/skywrite" --version
+          "target/$TARGET/debug/skywrite" models list --provider ondevice > /dev/null
 
   msrv:
     if: github.event_name != 'schedule'
@@ -128,6 +131,8 @@ jobs:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --all-targets --locked
+      # Building without the C++ engine must keep working (no cmake needed).
+      - run: cargo check --all-targets --locked --no-default-features
 
   # Licenses, bans and sources block PRs; advisories run on the schedule.
   deny:

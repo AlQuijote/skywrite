@@ -14,7 +14,7 @@
 
 ## Build and test
 
-Requires Rust 1.91+ (2024 edition), FFmpeg 5.1+ with libx264/AAC, `ffprobe`, and `python3` (loopback test servers and exported render scripts). Unix only.
+Requires Rust 1.91+ (2024 edition), cmake and a C++ compiler (the on-device transcription engine, transcribe.cpp; `--no-default-features` leaves it out), FFmpeg 5.1+ with libx264/AAC, `ffprobe`, and `python3` (loopback test servers and exported render scripts). Unix only. The first build compiles the engine's C++ (several minutes). Static musl builds need a musl C++ toolchain (Alpine's `g++`); `build.rs` links its static `libstdc++.a`, and `TRANSCRIBE_CMAKE_ARGS=-DCMAKE_POSITION_INDEPENDENT_CODE=ON` is required (see `.github/workflows/release.yml`).
 
 ```sh
 cargo build --release                               # target/release/skywrite
@@ -45,6 +45,7 @@ Tests must not use the network, paid accounts or the real `~/.config`/`~/.cache`
 | NLE import | `src/import.rs` |
 | Audio finishing | `src/audio.rs` |
 | Clip/tempo speed filters and the `--stretcher` choice (rubberband detection, latency calibration) | `src/stretch.rs` (`SpeedFilters`, resolved once per command; used by the renderer, FFmpeg script and `audio tempo`) |
+| On-device transcription (`ondevice:` provider: pinned model download/remove, transcribe.cpp engine) | `src/ondevice.rs`, `build.rs` (static musl C++ runtime) |
 | Analysis, transcripts, captions, review, describe | `src/analysis.rs`, `src/transcript.rs`, `src/captions.rs`, `src/review.rs`, `src/describe.rs`, `src/verify.rs` |
 | Generation (durable paid jobs), models, OpenRouter, public-URL diagnostics | `src/generation.rs`, `src/project.rs` (+ `src/project/tests.rs`), `src/audio_generation.rs`, `src/speech_split.rs`, `src/models.rs`, `src/openrouter.rs`, `src/public_access.rs` |
 | Storage, outputs, cache, workspace, fonts, images | `src/storage.rs`, `src/outputs.rs`, `src/cache.rs`, `src/workspace.rs`, `src/fonts.rs`, `src/image.rs` |

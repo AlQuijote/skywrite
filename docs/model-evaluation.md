@@ -81,6 +81,46 @@ which drops all fillers. Scribe v2 keeps "um", restarts and repeated words (the
 "Evanston Evanston" case) and returns tight word timestamps. It also returns
 non-speech events such as `[laughs]`, which Skywrite excludes from words.
 
+### On-device Parakeet, 2026-11-23 (rebuilt windows, not the chunks above)
+
+`ondevice:parakeet-tdt-0.6b-v3` runs the same NVIDIA model as the hosted row above,
+quantized to 8 bits, inside Skywrite (transcribe.cpp 0.4.2 on ggml). The original
+three chunks were not kept, so this check rebuilt the set from the ES2002a
+headset mix and its manual word annotations (AMI manual annotations 1.6.2): the
+three densest non-overlapping 60-second windows, starting at 562.5 s, 771.5 s and
+907.5 s (666 reference words, 14 fillers, 11 immediately repeated words). Scoring:
+lowercase, punctuation removed, Levenshtein alignment; a filler or repetition
+counts as kept when it aligns to the identical word; start error is measured on
+identical aligned words. The numbers are not directly comparable with the table
+above (different chunks); no hosted model was re-run, to keep the check free.
+
+| Model | WER | Filler recall | Repetition recall | Median start error | p90 start error | $ per audio minute |
+|---|---|---|---|---|---|---|
+| ondevice:parakeet-tdt-0.6b-v3 (Q8_0, x86-64 CPU; 0.231 on Apple M4 CPU) | 0.230 | 0.43 (6/14) | 0.55 (6/11) | 0.08 s | 0.20 s | 0 |
+| same, Metal (Apple M4) | 0.227 | 0.43 | 0.55 | 0.08 s | 0.20 s | 0 |
+| F16 weights (not shipped), Apple M4 CPU | 0.228 | 0.43 | 0.55 | 0.08 s | 0.20 s | 0 |
+| Q4_K_M weights (not shipped), Apple M4 CPU | 0.236 | 0.43 | 0.55 | 0.07 s | 0.21 s | 0 |
+
+Parakeet drops more fillers and restarts than Scribe v2, so Scribe v2 stays the
+default; the on-device model is the free option when audio must stay on the
+computer. Word times come from the model's own token timings on its 80 ms encoder
+frames. Q8_0 is pinned: F16 is no more accurate here at 1.7 times the download and
+runs slower; Q4_K_M is slightly worse and not faster on Apple silicon.
+
+Speed (engine time for one 60-second window; output is identical for any thread
+count):
+
+| Machine | Backend | Time for 60 s | Real-time factor | Memory |
+|---|---|---|---|---|
+| Mac mini, Apple M4 (10 CPUs, 16 GB) | Metal | 1.8 s (4 threads; 4.3 s using all CPUs) | 0.03 | 0.3 GB |
+| same | CPU | 9.5 s (6 threads) to 12.1 s (4 threads) | 0.16–0.20 | 1.5 GB |
+| x86-64, 8 CPUs, AVX2, shared machine at load average 15–20 | CPU | 16.4 s (4 threads; 38.5 s using all CPUs) | 0.27 | 1.4 GB |
+
+The first Metal run after installing compiles GPU shaders once (about 20 s).
+Skywrite uses half the logical CPUs (1 to 8). CoreML and the Neural Engine are not
+used. Linux release binaries are CPU-only: transcribe.cpp's Vulkan and CUDA
+backends load system libraries at run time, which a static musl binary cannot do.
+
 ## Data policy findings
 
 Every candidate had a provider honouring `data_collection: deny`, but several such

@@ -300,6 +300,19 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
     }
     if let Some(name) = options.provider {
         let provider = crate::providers::get(name)?;
+        if provider.is_ondevice() {
+            if let Some(task) = options.task {
+                crate::providers::check_task(canonical_task(task)?, &provider)?;
+            }
+            let mut listed = crate::ondevice::list(options.cache_dir, options.search)?;
+            // On-device models take audio in and give text out.
+            if options.input.is_some_and(|m| m != "audio")
+                || options.output.is_some_and(|m| m != "text")
+            {
+                listed["models"] = json!([]);
+            }
+            return Ok(listed);
+        }
         if !provider.is_openrouter() {
             return list_custom(options, &provider);
         }
@@ -444,9 +457,17 @@ pub fn list(options: &ListOptions<'_>) -> Result<Value> {
     } else {
         vec![]
     };
-    Ok(
-        json!({"version":1,"task":task,"models":data,"sources":sources,"warnings":warnings,"catalog_ttl_seconds":TTL,"paid_inference_performed":false,"note":"Catalog capabilities and prices are provider claims, not successful compatibility tests. Word timestamp support is not guaranteed by transcription modality alone."}),
-    )
+    let mut result = json!({"version":1,"task":task,"models":data,"sources":sources,"warnings":warnings,"catalog_ttl_seconds":TTL,"paid_inference_performed":false,"note":"Catalog capabilities and prices are provider claims, not successful compatibility tests. Word timestamp support is not guaranteed by transcription modality alone."});
+    // Free on-device transcription is listed beside the hosted catalog (no network).
+    if options.provider.is_none()
+        && (task.is_none() || task == Some("transcription"))
+        && options.input.is_none_or(|m| m == "audio")
+        && options.output.is_none_or(|m| m == "text")
+    {
+        result["ondevice_models"] =
+            crate::ondevice::list(options.cache_dir, options.search)?["models"].take();
+    }
+    Ok(result)
 }
 
 /// A custom provider's `/models` lists IDs; capabilities are reported only

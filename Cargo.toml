@@ -41,6 +41,19 @@ tokio = { version = "1", features = ["rt", "time", "net"] }
 futures-util = "0.3"
 async-trait = "0.1"
 
+# On-device transcription engine (transcribe.cpp on ggml, MIT; C/C++ built with
+# cmake). Statically linked, CPU-only except Metal on Apple silicon. Building
+# without it (`--no-default-features`) needs no C++ toolchain; `ondevice:`
+# models then report that the engine is missing.
+transcribe-cpp = { version = "=0.4.2", default-features = false, optional = true }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+transcribe-cpp = { version = "=0.4.2", default-features = false, features = ["metal"], optional = true }
+
+[features]
+default = ["ondevice"]
+ondevice = ["dep:transcribe-cpp"]
+
 [dev-dependencies]
 # TEST ONLY: owned-loopback TLS chains generated per test run with short validity,
 # so platform verifiers (macOS caps server certificate lifetimes) accept them and
