@@ -175,6 +175,19 @@ inside its media, with a warning, because an NLE may treat the tail as missing
 media. Longer overruns are rejected. Use rational rates such as
 `{"num":30000,"den":1001}` for NTSC.
 
+Renders and exported FFmpeg scripts show each clip on exactly its frames: a
+clip that starts on frame S and lasts F frames is on screen for output frames S
+to S + F - 1, after cuts and gaps, for one-frame clips and on upper tracks, at
+integer and NTSC rates alike (each frame decoded at 23.976, 25, 29.97 and 30
+fps; see [validation](validation.md#frame-exact-placement)). FCPXML and Premiere
+XML place clips on the same frames.
+
+Which source frame each of those frames shows is FFmpeg `fps` sampling of the
+clip from the first source frame at or after `source_in`. It can show a frame
+ahead of the exact source time, by an amount that depends on the two frame rates,
+`speed` and the source's timestamp precision. Sound follows `source_in` to the
+48-kHz sample.
+
 ## Pictures
 
 Video and stills scale to fit the canvas, preserving aspect ratio; phone footage

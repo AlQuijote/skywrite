@@ -1577,6 +1577,44 @@ mod tests {
         assert_eq!(fps.frames(fps.seconds(12345)), 12345);
         assert_eq!(fps.samples_48k(30000), 48_048_000);
     }
+
+    /// Renderers place clip frame N on output frame N, so the grid must hold
+    /// exactly: a clip written as seconds(start) and seconds(end) - seconds(start)
+    /// gets frames [start, end) at every supported length, without warnings, and
+    /// adjacent clips meet on one frame and one 48-kHz sample.
+    #[test]
+    fn grid_seconds_place_on_exact_frames_at_every_rate() {
+        for (num, den) in [
+            (30, 1),
+            (30000, 1001),
+            (24000, 1001),
+            (25, 1),
+            (60000, 1001),
+        ] {
+            let fps = Rational { num, den };
+            let last = fps.frames(MAX_TIMELINE_SECONDS);
+            let mut warnings = Vec::new();
+            for start in (0..last).step_by(997).chain([0, 1, 2, last - 2]) {
+                assert_eq!(fps.frames(fps.seconds(start)), start, "{num}/{den} {start}");
+                for frames in [1u64, 2, 14] {
+                    let end = start + frames;
+                    let placed = place(
+                        fps,
+                        fps.seconds(start),
+                        fps.seconds(end) - fps.seconds(start),
+                        "clip",
+                        &mut warnings,
+                    )
+                    .unwrap();
+                    assert_eq!(placed, (start, frames), "{num}/{den} {start}+{frames}");
+                }
+                let sample =
+                    |f: u64| (u128::from(f) * 48_000 * u128::from(den)) as f64 / f64::from(num);
+                assert!((fps.samples_48k(start) as f64 - sample(start)).abs() <= 0.5);
+            }
+            assert!(warnings.is_empty(), "{num}/{den}: {warnings:?}");
+        }
+    }
     #[test]
     fn parse_explains_versions() {
         assert_eq!(

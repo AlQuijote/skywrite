@@ -183,6 +183,66 @@ nine builds now pass the whole suite:
   Opus's 7-ms pre-skip (the test measures the 3 s of video from the video's own
   start).
 
+## Frame-exact placement
+
+Checked 2026-11-24 on Linux (AMD Ryzen AI Max+ 395, Ubuntu FFmpeg 8.0.1), with the
+renderer and the exported FFmpeg script. Each clip had its own synthetic H.264
+source with AAC sound, whose frames show the clip's id and the source frame
+number as luma blocks, so decoding every output frame tells which clip and which
+source frame is on screen. The cases ran at 30, 30000/1001, 24000/1001 and 25 fps:
+- cuts between 1-, 2- and 14-frame clips;
+- gaps of 1 to 3 frames, including one before the first clip;
+- `source_in` 0, 2 and 0.37;
+- sources at 30, 29.97, 25, 24, 23.976 and 60 fps;
+- speeds 0.5, 1.5 and 2;
+- 1- and 2-frame shots on an upper track;
+- a 606-frame edit.
+
+Before the change, 35 of the 36 cases put a wrong clip on some frames. Wrong
+frames per case:
+
+| fps | cuts | gaps | lead gap | speeds | upper track | 606 frames |
+|---|---|---|---|---|---|---|
+| 30 | 3–5 | 6 | 6 | 1 | 3 | 3 |
+| 29.97 | 2–3 | 8 | 5 | 1 | 3 | 3 |
+| 23.976 | 3–5 | 6 | 6 | 1 | 3 | 3 |
+| 25 | 1–3 | 6 | 5 | 0 | 2 | 1 |
+
+The effects:
+- At 29.97 a 2-frame shot after a cut showed 3 frames and a 14-frame shot 15.
+- At 23.976 clips started a frame early and the edit's last 1–2 frames were black.
+- At every rate, a one-frame clip after another clip or a gap could vanish.
+
+Cause: each track's clips and gaps were joined by FFmpeg `concat`, which:
+- counts in microseconds, which cannot hold a 1001/30000-s frame;
+- starts each piece at the previous piece's end, which it estimates from that
+  piece's last frame time and frame duration.
+
+That estimate failed in two ways:
+- A one-frame piece advanced time by nothing. At 25 fps, pieces of 2, 1 and 2
+  frames were timed 0, 40, 80, 80 and 120 ms.
+- Longer pieces drifted a microsecond either side of the canvas frames.
+
+Either way, `overlay` showed the previous frame, dropped a frame with an equal
+time, or ran out before the end.
+
+Each track is now retimed on the output frame clock (`settb=1/fps`, frame N
+at N) after its join, as is the canvas. With that change, all 36 cases are
+exact in both renderers:
+- each output frame shows the clip the edit's grid puts there;
+- frame counts are exact;
+- every frame's time is n/fps within 0.5 ms;
+- the renderer and the script give identical frames.
+
+`tests/frame_exact_render.rs` renders a mixed case at the four rates through both
+renderers and checks every frame, and that Premiere XML and FCPXML place each
+clip on the same frames.
+
+Inside a clip, which source frame is shown is FFmpeg `fps` sampling from the
+first source frame at or after `source_in` (unchanged here). For the MP4
+fixtures above, the test also checks each frame's source frame number against
+that sampling.
+
 ## Dual-system sound: camera scratch track and separate recorder
 
 Measured 2026-11-15 with FFmpeg 8.0.1 on Linux. What is real and what is
