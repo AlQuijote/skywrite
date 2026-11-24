@@ -381,6 +381,45 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     let gap = json!({"clips":[talk(0.0, 0.0, 2.0), talk(2.0667, 3.0, 1.9333)]});
     let logo = json!([gap, {"clips":[{"start":0,"source":"title.png","duration":4.0}]}]);
     assert_eq!(brief_shots(d, "logo.json", logo), [(2, 2.0)]);
+    // Black between pictures is found when black also shows around them: a
+    // gap between letterboxed shots, between partial-opacity shots, and under
+    // a picture-in-picture or a 0.3 wash. A 2-frame letterboxed shot is one
+    // warning, for the shot.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=green:s=160x44:r=30:d=6",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        d.join("wide.mp4").to_str().unwrap(),
+    ]);
+    let wide = |start: f64, source_in: f64, duration: f64| json!({"start":start,"source":"wide.mp4","source_in":source_in,"duration":duration});
+    let letterboxed = json!([{"clips":[wide(0.0, 0.0, 2.0), wide(2.0667, 3.0, 1.9333)]}]);
+    assert_eq!(brief_shots(d, "letterboxed.json", letterboxed), [(2, 2.0)]);
+    let mut faint_a = talk(0.0, 0.0, 2.0);
+    faint_a["opacity"] = json!(0.3);
+    let mut faint_b = talk(2.0667, 3.0, 1.9333);
+    faint_b["opacity"] = json!(0.3);
+    let faint_gap = json!([{"clips":[faint_a, faint_b]}]);
+    assert_eq!(brief_shots(d, "faint-gap.json", faint_gap), [(2, 2.0)]);
+    let pip = json!([gap, {"clips":[wide(0.0, 0.0, 4.0)]}]);
+    assert_eq!(brief_shots(d, "pip.json", pip), [(2, 2.0)]);
+    let mut veil = broll(0.0, 0.0, 4.0);
+    veil["opacity"] = json!(0.3);
+    let veiled = json!([gap, {"clips":[veil]}]);
+    assert_eq!(brief_shots(d, "veiled.json", veiled), [(2, 2.0)]);
+    let boxed = json!([{"clips":[talk(0.0, 0.0, 2.0), wide(2.0, 0.0, 0.0667), talk(2.0667, 2.0667, 1.9333)]}]);
+    assert_eq!(brief_shots(d, "boxed.json", boxed), [(2, 2.0)]);
+    // The same take continued on another track counts as a cut (documented).
+    let across = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(2.3, 2.3, 1.7)]},
+        {"clips":[talk(2.0, 2.0, 0.3)]}]);
+    assert_eq!(brief_shots(d, "across.json", across), [(9, 2.0)]);
     // An opaque full-frame still hides jump cuts beneath it, 2 frames apart.
     let jumps =
         json!({"clips":[talk(0.0, 0.0, 2.0), talk(2.0, 3.0, 0.0667), talk(2.0667, 1.0, 1.9333)]});

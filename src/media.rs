@@ -278,11 +278,16 @@ fn pixel_format_alpha_flags(raw: &Value) -> HashMap<String, bool> {
 /// FFmpeg decode of its alpha (opaque formats give 255 everywhere); `None`
 /// when it cannot be decoded.
 pub fn still_is_opaque(path: &Path) -> Option<bool> {
+    let formats = format_whitelist().ok()?;
     let out = crate::process::run(
         "ffmpeg",
         &[
             "-v".into(),
             "error".into(),
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-format_whitelist".into(),
+            formats.into(),
             "-i".into(),
             path.as_os_str().to_owned(),
             "-frames:v".into(),
