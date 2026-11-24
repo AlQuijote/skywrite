@@ -352,6 +352,9 @@ rotated phone footage (a clip stored 3840x2160 with rotation -90 is written as
 3840x2160), and no transform is written, so fitting is left to Final Cut Pro's
 own conform. Whether Final Cut Pro expects the stored or the displayed size for
 rotated media has not been checked; check the framing of rotated clips after import.
+Premiere XML likewise writes the stored size in each file's `samplecharacteristics`
+(Premiere reads the media itself), while its Basic Motion Scale uses the
+displayed size.
 
 Composition projects copy unique media into their output directory, with a
 20 GiB total media limit; `external_sources` in the result lists every copied
