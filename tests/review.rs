@@ -252,7 +252,23 @@ fn lint_shots(dir: &Path, name: &str, video: Value) -> (Vec<(u64, f64)>, Vec<(u6
         .unwrap_or_else(|| panic!("{report}"))
         .iter()
         .map(|s| (frame(&s["timeline_start"]), frame(&s["timeline_end"])))
+        .collect::<Vec<_>>();
+    // not_checked says how many short stretches brief_shot skipped.
+    let lines: Vec<&str> = report["not_checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l.as_str())
+        .filter(|l| l.contains("brief_shot did not check"))
         .collect();
+    match not_checked.len() {
+        0 => assert!(lines.is_empty(), "{report}"),
+        n => {
+            assert_eq!(lines.len(), 1, "{report}");
+            assert!(lines[0].starts_with(&format!("{n} shot")), "{report}");
+            assert!(lines[0].contains("fades and dissolves are not checked yet"));
+        }
+    }
     (brief, not_checked)
 }
 
@@ -302,6 +318,10 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         [(2, 0.0), (2, at(118.0))]
     );
 
+    // Black before the first picture continues the black before the timeline.
+    let leader = json!([{"clips":[talk(0.0667, 0.0, 3.9333)]}]);
+    assert_eq!(brief_shots(d, "leader.json", leader), []);
+
     // A 2-frame hole in the only track flashes black.
     let gap = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(2.0667, 3.0, 1.9333)]}]);
     assert_eq!(brief_shots(d, "black.json", gap), [(2, 2.0)]);
@@ -314,9 +334,8 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         let faint = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[faint]}]);
         assert_eq!(brief_shots(d, "faint.json", faint), expected, "{opacity}");
     }
-    // Stills and other overlays that do not cover the frame never dim what is
-    // beneath, so a partial-opacity one needs about twice the opacity to count:
-    // a 2-frame PNG at 0.3 is quiet, at 0.6 it is a flash.
+    // A 2-frame still at opacity 0.3 is a flash; at 0.2 it is under a quarter
+    // of the picture.
     ffmpeg(&[
         "-v",
         "error",
@@ -329,17 +348,54 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         "1",
         d.join("blue.png").to_str().unwrap(),
     ]);
-    for (opacity, expected) in [(0.3, vec![]), (0.6, vec![(2, 2.0)])] {
+    for (opacity, expected) in [(0.2, vec![]), (0.3, vec![(2, 2.0)])] {
         let still = json!({"start":2.0,"source":"blue.png","duration":0.0667,"opacity":opacity});
         let still = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[still]}]);
         assert_eq!(brief_shots(d, "still.json", still), expected, "{opacity}");
     }
-    // An opacity-0 piece inside a split upper take shows the base for 2 frames.
-    let mut gap = broll(1.0, 1.0, 0.0667);
-    gap["opacity"] = json!(0);
-    let seam = json!([{"clips":[talk(0.0, 0.0, 4.0)]},
-        {"clips":[broll(0.0, 0.0, 1.0), gap, broll(1.0667, 1.0667, 2.9333)]}]);
-    assert_eq!(brief_shots(d, "seam.json", seam), [(2, 1.0)]);
+    // Title and overlay edges near a cut are not shots: a transparent PNG
+    // lower third, or a 0.3 full-frame wash, starting 6 frames before a B-roll
+    // shot ends.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=white@0.0:s=160x90,format=rgba",
+        "-frames:v",
+        "1",
+        d.join("title.png").to_str().unwrap(),
+    ]);
+    let base = json!({"clips":[talk(0.0, 0.0, 4.0)]});
+    let cutaway = json!({"clips":[broll(1.0, 0.0, 1.0)]});
+    let title =
+        json!([base, cutaway, {"clips":[{"start":1.8,"source":"title.png","duration":2.2}]}]);
+    assert_eq!(brief_shots(d, "title.json", title), []);
+    let mut wash = broll(1.8, 0.0, 2.2);
+    wash["opacity"] = json!(0.3);
+    let wash = json!([base, cutaway, {"clips":[wash]}]);
+    assert_eq!(brief_shots(d, "wash.json", wash), []);
+    // An opaque full-frame still hides jump cuts beneath it, 2 frames apart.
+    let jumps =
+        json!({"clips":[talk(0.0, 0.0, 2.0), talk(2.0, 3.0, 0.0667), talk(2.0667, 1.0, 1.9333)]});
+    let slide = json!([jumps, {"clips":[{"start":1.8,"source":"blue.png","duration":0.6}]}]);
+    assert_eq!(brief_shots(d, "slide.json", slide), []);
+    // Pieces of one still (source_in is always 0) are one take.
+    let pieces = json!([{"clips":[{"start":0,"source":"blue.png","duration":0.2},
+        {"start":0.2,"source":"blue.png","duration":3.8}]}]);
+    assert_eq!(brief_shots(d, "pieces.json", pieces), []);
+    // A take stepping 0.6, 0.3, 0 (2 frames), 0.3, 0.6 over a base never
+    // leaves either picture on screen briefly.
+    let step = |start: f64, duration: f64, opacity: f64| {
+        let mut clip = broll(start, start, duration);
+        clip["opacity"] = json!(opacity);
+        clip
+    };
+    let dip = json!([base, {"clips":[step(0.0, 1.0, 0.6), step(1.0, 0.2, 0.3),
+        step(1.2, 0.0667, 0.0), step(1.2667, 0.2, 0.3), step(1.4667, 2.5333, 0.6)]}]);
+    assert_eq!(lint_shots(d, "dip.json", dip), (vec![], vec![]));
 
     // Fast B-roll jumping back 0.25 s into a slow clip is a cut: the slower
     // clip's source step bounds continuity, not the faster one's.
@@ -486,9 +542,8 @@ fn lint_does_not_check_brief_shots_at_fades_or_dissolves() {
         (vec![], vec![(60, 62)])
     );
 
-    // Review round 4: a short shot between two longer dissolves (B fades in
-    // over A for 0.2 s, C over B for 0.9 s), and a 12-frame card with 0.1 s
-    // fades over a still.
+    // A short shot between two longer dissolves (B fades in over A for 0.2 s,
+    // C over B for 0.9 s), and a 12-frame card with 0.1 s fades over a still.
     let chain = json!([{"clips":[talk(0.0, 0.0, 1.2)]},
         {"clips":[with(broll(1.0, 0.0, 1.2), "fade_in", 0.2)]},
         {"clips":[with(talk(1.3, 2.0, 2.7), "fade_in", 0.9)]}]);
@@ -506,6 +561,12 @@ fn lint_does_not_check_brief_shots_at_fades_or_dissolves() {
     let step = json!([base, {"clips":[broll(0.0, 0.0, 1.0),
         with(broll(1.0, 1.0, 0.0667), "opacity", 0.4), broll(1.0667, 1.0667, 2.9333)]}]);
     assert_eq!(lint_shots(d, "step.json", step), (vec![], vec![(30, 32)]));
+
+    // An opacity-0 piece inside a split take is an opacity change at both
+    // edges of the 2 frames of base it shows.
+    let seam = json!([base, {"clips":[broll(0.0, 0.0, 1.0),
+        with(broll(1.0, 1.0, 0.0667), "opacity", 0.0), broll(1.0667, 1.0667, 2.9333)]}]);
+    assert_eq!(lint_shots(d, "seam.json", seam), (vec![], vec![(30, 32)]));
 
     // A fade far from the flash does not stop it being checked.
     let far = json!([{"clips":[with(talk(0.0, 0.0, 4.0), "fade_out", 0.5)]},
@@ -525,13 +586,15 @@ fn lint_help_explains_brief_shots_for_agents() {
         "fades and dissolves are not checked yet",
         "checked only between hard cuts",
         "not pixels",
-        "half the sum of their weight differences",
+        "on screen while its opacity times",
+        "pieces of one still always continue",
         "its length is exact from the edit",
+        "source (null for black)",
         "brief_shots_not_checked",
-        "about twice as opaque to count",
+        "a title or overlay edge near a cut is not a shot",
         "or a black gap",
         "opacity 0",
-        "straight split continuing the same take",
+        "clips continuing it across straight splits",
         "uncertain_cover_sources",
         "alpha-capable video",
         "timeline_start",
