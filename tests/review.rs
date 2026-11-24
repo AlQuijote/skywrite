@@ -201,6 +201,52 @@ fn lint_accepts_matching_transcript_fingerprint_case_insensitively() {
 }
 
 #[test]
+fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
+    let dir = tempfile::tempdir().unwrap();
+    fixtures(dir.path());
+    // A straight split of one take at 1s, a jump cut at 1.5s hidden under
+    // B-roll, and two B-roll shots 2 frames apart: the speaker flashes back.
+    let edit = write_edit(
+        dir.path(),
+        "flash.json",
+        json!({"version":1,"width":160,"height":90,"fps":{"num":30,"den":1},
+            "video":[
+                {"clips":[{"start":0,"source":"talk.mp4","duration":1},
+                          {"start":1,"source":"talk.mp4","source_in":1,"duration":0.5},
+                          {"start":1.5,"source":"talk.mp4","source_in":3,"duration":2.5}]},
+                {"clips":[{"start":1,"source":"broll.mp4","duration":1},
+                          {"start":2.0667,"source":"broll.mp4","source_in":2,"duration":0.9333}]}]}),
+    );
+    let report = skywrite(&["review", "lint", &edit, "--no-levels"]);
+    let brief: Vec<&Value> = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["kind"] == "brief_shot")
+        .collect();
+    assert_eq!(brief.len(), 1, "{report}");
+    assert_eq!(brief[0]["frames"], 2, "{report}");
+    assert_eq!(brief[0]["timeline_start"], 2.0, "{report}");
+    assert_eq!(report["checked"]["min_shot_seconds"], 0.5);
+
+    // A threshold of zero turns the check off; an invalid one is refused.
+    let report = skywrite(&[
+        "review",
+        "lint",
+        &edit,
+        "--no-levels",
+        "--min-shot-seconds",
+        "0",
+    ]);
+    assert!(
+        !kinds(&report).contains(&"brief_shot".to_owned()),
+        "{report}"
+    );
+    let out = run(&["review", "lint", &edit, "--min-shot-seconds", "-1"]);
+    assert!(!out.status.success());
+}
+
+#[test]
 fn lint_reports_objective_problems_and_stays_quiet_otherwise() {
     let dir = tempfile::tempdir().unwrap();
     fixtures(dir.path());

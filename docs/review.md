@@ -67,6 +67,11 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   omits fillers, so their absence proves nothing.
 - `sound_cut_mid_flow`: a clip ends without a fade while its source keeps sounding
   at a similar level, as when applause or a music tail is cut off.
+- `brief_shot`: the visible picture changes twice within `--min-shot-seconds`
+  (default 0.5; `0` turns the check off), such as a talking shot showing for a
+  few frames between two B-roll clips. A straight split that continues the same
+  take is not a change, nor is a cut under opaque full-frame video on a higher
+  track. Raise the threshold to match your pacing (for example `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
   `role` are classified by it; otherwise a source without a transcript is a bed.

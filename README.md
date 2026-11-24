@@ -234,7 +234,7 @@ skywrite review cuts edit.json --handles 1.5 --output-dir cut-review
 skywrite review lint edit.json --transcript presenter.transcript.json
 ```
 
-Contact sheets tile consecutive exact frames with source times, so expressions and motion around a candidate cut are visible rather than guessed from sparse samples. Cut auditions are short clips of the rendered edit around every cut for watching and listening. Lint reports objective problems: a visible speaker with no audible dialogue, repeated words at or inside a cut, words clipped by a cut, filler words, sound cut off mid-flow (applause, music tails), and beds close to dialogue level. None of these judge taste. Supplied transcripts require `usage.source_sha256` matching their media before level checks. See [reviewing an edit](docs/review.md).
+Contact sheets tile consecutive exact frames with source times, so expressions and motion around a candidate cut are visible rather than guessed from sparse samples. Cut auditions are short clips of the rendered edit around every cut for watching and listening. Lint reports objective problems: a visible speaker with no audible dialogue, repeated words at or inside a cut, words clipped by a cut, filler words, sound cut off mid-flow (applause, music tails), beds close to dialogue level, and brief shots that flash on screen. None of these judge taste. Supplied transcripts require `usage.source_sha256` matching their media before level checks. See [reviewing an edit](docs/review.md).
 
 ### Export and render
 

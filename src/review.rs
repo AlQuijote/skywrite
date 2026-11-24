@@ -26,7 +26,7 @@ pub enum ReviewCommand {
     Sheet(SheetArgs),
     /// Short audition clips around every cut in an edit, for listening and watching.
     Cuts(CutsArgs),
-    /// Objective checks: silent visible speakers, repeated or clipped words, sound cut off mid-flow, beds near dialogue level.
+    /// Objective checks: silent visible speakers, repeated or clipped words, sound cut off mid-flow, beds near dialogue level, brief shots.
     Lint(LintArgs),
 }
 
@@ -78,6 +78,9 @@ pub struct LintArgs {
     /// Skip audio level measurements (faster; disables level checks).
     #[arg(long)]
     pub no_levels: bool,
+    /// Report shots on screen for less than this many seconds (flash frames).
+    #[arg(long, default_value_t = 0.5)]
+    pub min_shot_seconds: f64,
 }
 
 pub fn execute(command: ReviewCommand) -> Result<Value> {
@@ -619,6 +622,10 @@ fn level(path: &Path, start: f64, duration: f64) -> Result<Option<f64>> {
 }
 
 fn lint(args: &LintArgs) -> Result<Value> {
+    ensure!(
+        args.min_shot_seconds.is_finite() && (0.0..=10.0).contains(&args.min_shot_seconds),
+        "--min-shot-seconds must be 0..10 seconds"
+    );
     let edit = timeline::load_and_validate(&args.edit)?;
     let mut transcripts = HashMap::<PathBuf, Transcript>::new();
     for path in &args.transcript {
@@ -755,6 +762,50 @@ fn lint(args: &LintArgs) -> Result<Value> {
                 "message": format!(
                     "{} is visible speaking ({:?}…) from {:.2}s to {:.2}s, but no dialogue source is audible then. Viewers will see a silent speaker; start the picture at the dialogue, cover it with B-roll, or make its sound audible.",
                     file_name(&clip.source), text.join(" "), silent[0].0, silent[silent.len()-1].1
+                ),
+            }));
+        }
+    }
+
+    // 1b. Brief shots: the visible picture changes twice within --min-shot-seconds.
+    // A straight split that continues the same take is not a change, nor is a
+    // cut hidden under opaque full-frame video on a higher track.
+    let continues = |a: &timeline::ValidatedVideoClip, b: &timeline::ValidatedVideoClip| {
+        a.track == b.track
+            && a.source == b.source
+            && a.end_frames() == b.start_frames
+            && (a.source_in + fps.seconds(a.duration_frames) * a.speed - b.source_in).abs()
+                <= frame * a.speed * 1.01
+    };
+    let hidden = |track: usize, frames: u64| {
+        let at = fps.seconds(frames);
+        opaque
+            .iter()
+            .any(|(t, i)| *t > track && i.start < at && at < i.end)
+    };
+    let mut changes = std::collections::BTreeSet::from([0, edit.duration_frames()]);
+    for clip in edit.video_clips() {
+        if !edit.video_clips().any(|o| continues(o, clip)) && !hidden(clip.track, clip.start_frames)
+        {
+            changes.insert(clip.start_frames);
+        }
+        if !edit.video_clips().any(|o| continues(clip, o)) && !hidden(clip.track, clip.end_frames())
+        {
+            changes.insert(clip.end_frames());
+        }
+    }
+    let changes: Vec<u64> = changes.into_iter().collect();
+    for pair in changes.windows(2) {
+        let (start, end) = (fps.seconds(pair[0]), fps.seconds(pair[1]));
+        if end - start < args.min_shot_seconds - 1e-9 {
+            warnings.push(json!({
+                "kind": "brief_shot",
+                "timeline_start": start,
+                "timeline_end": end,
+                "frames": pair[1] - pair[0],
+                "message": format!(
+                    "The picture holds for only {} frames ({:.2}s) from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
+                    pair[1] - pair[0], end - start, args.min_shot_seconds
                 ),
             }));
         }
@@ -982,6 +1033,7 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "dialogue_sources": transcripts.keys().collect::<Vec<_>>(),
             "dialogue_words_heard": words.len(),
             "levels": levels_checked,
+            "min_shot_seconds": args.min_shot_seconds,
             "level_measurements": measurements,
         },
         "limitations": [
