@@ -510,7 +510,7 @@ pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<(String,
     if wide {
         notes.push("Sources with more than two audio channels are written as stereo from their first two channels; assign other channels in Premiere (Modify > Audio Channels).".into());
     }
-    notes.push("Premiere import of this XML has not been verified by Skywrite. Please record the result with skywrite nit, including any import errors or timing differences.".into());
+    notes.push("Premiere import of this XML was checked in Premiere Pro 26.5.2 on macOS 26.3.1 (a contributor's test of Skywrite 9dd2c3b, posted on PR #2 on 2026-11-24): stereo and mono audio on their own tracks, Audio Levels keyframes and fades, whole-second cuts at 23.976 fps without gaps or overlaps, --media-root paths linking without a relink, and Time Remap speed. Not covered by that check: captions, Opacity keyframes, the Basic Motion fit-to-sequence Scale (a rotated iPhone reel imported fitted in Premiere Pro 2026, outside that check), other effects and other Premiere versions. Record differences with skywrite nit.".into());
     let markers: String = edit
         .chapters
         .iter()

@@ -314,8 +314,19 @@ rotated phone footage fits upright); without it Premiere shows media at its own
 size. Premiere applies a source's pixel aspect ratio, which the render ignores, so
 anamorphic or DV media is framed differently in the two. The format counts whole frames at integer or NTSC rates,
 so subframe source in points are rounded (with a warning). Skywrite checks the
-XML's structure and timing with an independent reader, but import into Premiere
-itself has not yet been verified: please report results with `skywrite nit`.
+XML's structure and timing with an independent reader. Import into Premiere Pro
+26.5.2 on macOS 26.3.1 was checked by a contributor on Skywrite 9dd2c3b (results
+posted on PR #2 on 2026-11-24), with no import dialog: stereo and mono audio on
+their own tracks, Audio Levels keyframes and fades, whole-second cuts at 23.976
+fps without gaps or overlaps (burned-in frame numbers matched the playhead), a
+recorder clip's one-frame rounding overrun trimmed so no media went missing,
+plain exports linking on the editing machine, `--media-root` paths linking
+without a relink, and Time Remap speed (1.5x, landing on the expected source
+frames). Not covered
+by that check: captions (imported separately as SRT), Opacity keyframes, the
+Basic Motion Scale (a rotated iPhone reel imported fitted in Premiere Pro 2026,
+outside that check), other effects and other Premiere versions; report results
+with `skywrite nit`.
 
 **Media paths for exports made elsewhere.** FCPXML and Premiere XML reference
 media by absolute URL, by default this machine's paths. When the export is made

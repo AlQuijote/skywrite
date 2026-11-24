@@ -321,7 +321,15 @@ fn premiere_xml_keeps_layers_links_speed_and_levels() {
     let result = export::export(&validated, "premiere", &output, false).unwrap();
     let warnings = result["warnings"].to_string();
     assert!(warnings.contains("master limiter"), "{warnings}");
-    assert!(warnings.contains("not been verified"), "{warnings}");
+    assert!(
+        warnings.contains("checked in Premiere Pro 26.5.2 on macOS 26.3.1"),
+        "{warnings}"
+    );
+    assert!(
+        warnings
+            .contains("Not covered by that check: captions, Opacity keyframes, the Basic Motion"),
+        "{warnings}"
+    );
     let check = r#"import sys,xml.etree.ElementTree as E
 r=E.parse(sys.argv[1]).getroot()
 assert r.tag=='xmeml' and r.attrib['version']=='5'
