@@ -689,12 +689,15 @@ fn lint(args: &LintArgs) -> Result<Value> {
         .filter(|c| {
             c.opacity >= 1.0
                 && c.kind == MediaKind::Video
-                && c.media.video().is_some_and(|v| {
-                    let (w, h) = (v.width.unwrap_or(0) as f64, v.height.unwrap_or(0) as f64);
-                    h > 0.0
-                        && ((w / h) - edit.width as f64 / edit.height as f64).abs()
-                            < 0.01 * edit.width as f64 / edit.height as f64
-                })
+                && c.media
+                    .video()
+                    .and_then(|v| v.display_size())
+                    .is_some_and(|(w, h)| {
+                        let (w, h) = (w as f64, h as f64);
+                        h > 0.0
+                            && ((w / h) - edit.width as f64 / edit.height as f64).abs()
+                                < 0.01 * edit.width as f64 / edit.height as f64
+                    })
         })
         .map(|c| {
             (
