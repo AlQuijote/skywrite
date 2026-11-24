@@ -537,6 +537,43 @@ fn list_custom(options: &ListOptions<'_>, provider: &crate::providers::Provider)
 }
 
 /// Find a task-compatible model from its real dedicated catalog, never a paid call.
+/// Whether a provider's model catalog lists `structured_outputs` (strict
+/// `json_schema` responses) for this model. `Ok(None)` when the catalog cannot
+/// be loaded or does not list the model's parameters; an unreachable provider
+/// is an error, so the caller stops instead of asking the same server again.
+pub fn supports_structured_outputs(
+    provider: &crate::providers::Provider,
+    model: &str,
+    cache_dir: Option<&Path>,
+) -> Result<Option<bool>> {
+    let options = ListOptions {
+        cache_dir,
+        ..Default::default()
+    };
+    let catalog = match load_provider_catalog(&options, provider, "models") {
+        Ok((catalog, _)) => catalog,
+        Err(error)
+            if error
+                .downcast_ref::<crate::openrouter::Unreachable>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
+        Err(_) => return Ok(None),
+    };
+    let Some(entry) = catalog["data"]
+        .as_array()
+        .and_then(|data| data.iter().find(|v| v["id"].as_str() == Some(model)))
+    else {
+        return Ok(None);
+    };
+    Ok(entry["supported_parameters"].as_array().map(|parameters| {
+        parameters
+            .iter()
+            .any(|p| p.as_str() == Some("structured_outputs"))
+    }))
+}
+
 pub fn find_model(task: &str, id: &str, cache_dir: Option<&Path>, offline: bool) -> Result<Value> {
     let catalog = list(&ListOptions {
         task: Some(task),

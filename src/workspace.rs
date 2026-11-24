@@ -87,6 +87,7 @@ const BUILTINS: &[(&str, &str)] = &[
         "character-reference",
         include_str!("../assets/skills/character-reference.md"),
     ),
+    ("describing", include_str!("../assets/skills/describing.md")),
     (
         "technical-explainer",
         include_str!("../assets/skills/technical-explainer.md"),

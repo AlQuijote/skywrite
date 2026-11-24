@@ -27,6 +27,33 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     }
     serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
 }
+/// Reads one regular file through a single non-blocking descriptor (a FIFO
+/// cannot hang the open), at most `limit` bytes: a file that grows or is
+/// replaced after any earlier check cannot exceed it. With `no_follow`, a
+/// symlink at `path` is refused instead of followed.
+pub fn read_regular_bounded(path: &Path, limit: u64, no_follow: bool) -> Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | if no_follow { libc::O_NOFOLLOW } else { 0 });
+    }
+    #[cfg(not(unix))]
+    let _ = no_follow;
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("{} exceeds {limit} bytes", path.display());
+    }
+    Ok(bytes)
+}
 /// Admit a whole set by bytes actually read, before any caller parses it.
 /// Each read is limited to the remaining allowance plus one sentinel byte.
 pub fn read_files_bounded(paths: &[std::path::PathBuf], limit: usize) -> Result<Vec<Vec<u8>>> {

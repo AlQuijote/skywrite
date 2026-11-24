@@ -174,6 +174,7 @@ fn store_child() {
                 vec![
                     "character-reference",
                     "composing-tools",
+                    "describing",
                     "fcpxml",
                     "ffmpeg",
                     "hyperframes",

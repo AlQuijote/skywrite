@@ -28,6 +28,7 @@ def multipart(content_type, body):
 class Handler(BaseHTTPRequestHandler):
     half_bad = 0
     half_bad_lock = threading.Lock()
+    focus_calls = {}
 
     def log_message(self, *args):
         pass
@@ -54,6 +55,8 @@ class Handler(BaseHTTPRequestHandler):
                 {'id': 'vision-small', 'object': 'model', 'owned_by': 'llamacpp'},
                 {'id': 'vlm', 'architecture': {'input_modalities': ['text', 'image'], 'output_modalities': ['text']}},
                 {'id': 'text-only', 'architecture': {'input_modalities': ['text'], 'output_modalities': ['text']}},
+                {'id': 'vlm-structured', 'supported_parameters': ['response_format', 'structured_outputs'],
+                 'architecture': {'input_modalities': ['text', 'image', 'video'], 'output_modalities': ['text']}},
             ]})
         else:
             self.reply(404, {'error': {'message': 'not found'}})
@@ -85,6 +88,39 @@ class Handler(BaseHTTPRequestHandler):
                                        'message': 'image input is not supported - hint: if this is unexpected, you may need to provide the mmproj'}})
             return
         content = '<think>\nchecking the frame\n</think>\n{"summary": "a test frame", "people_count": 0}'
+        if model == 'plain-500' and 'FOCUS TASK' not in json.dumps(request.get('messages', [])):
+            self.reply(500, {'error': {'code': 500, 'message': 'description backend failed'}})
+            return
+        messages = request.get('messages', [])
+        first = messages[0].get('content') if messages else ''
+        prompt = first[0].get('text', '') if isinstance(first, list) else str(first)
+        if 'FOCUS TASK' in prompt:
+            # Focus answers: good boxes, or (by model name) wrong ones first.
+            good = {'faces': [{'box': [0.1, 0.2, 0.4, 0.8], 'position': 'left'}]}
+            bad = {'faces': [{'box': [0.6, 0.2, 0.3, 0.8], 'position': 'left'}]}
+            retry = len(messages) > 1
+            calls = Handler.focus_calls[model] = Handler.focus_calls.get(model, 0) + 1
+            answer = good
+            if model == 'focus-bad' and not retry:
+                answer = {'faces': [{'box': [-0.01, 0.2, 0.4, 1.01], 'position': 'left', 'extra': 1}]}
+            if model == 'focus-never':
+                answer = bad
+            if model == 'focus-half' and calls <= 2:
+                answer = bad
+            two_parts = 'This request has two parts' in prompt and not retry
+            if model == 'combined-500' and two_parts and calls == 1:
+                self.reply(500, {'error': {'code': 500, 'message': 'combined backend failed'}})
+                return
+            if model == 'focus-500' and not two_parts and calls == 1:
+                self.reply(500, {'error': {'code': 500, 'message': 'focus backend failed'}})
+                return
+            if two_parts:
+                value = {'description': {'summary': 'a test frame', 'people_count': 0}, 'focus': answer}
+            else:
+                value = {'focus': answer}
+            content = json.dumps(value)
+            if model == 'combined-garbage' and two_parts:
+                content = 'not json at all'
         usage = {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
         if model == 'last-answer':
             usage['cost'] = 0.25
