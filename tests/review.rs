@@ -381,9 +381,10 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     let gap = json!({"clips":[talk(0.0, 0.0, 2.0), talk(2.0667, 3.0, 1.9333)]});
     let logo = json!([gap, {"clips":[{"start":0,"source":"title.png","duration":4.0}]}]);
     assert_eq!(brief_shots(d, "logo.json", logo), [(2, 2.0)]);
-    // Black between pictures is found when black also shows around them: a
-    // gap between letterboxed shots, between partial-opacity shots, and under
-    // a picture-in-picture or a 0.3 wash. A 2-frame letterboxed shot is one
+    // Black is checked only between full-frame pictures: a gap between
+    // letterboxed shots, between partial-opacity shots, under a
+    // picture-in-picture, an opaque logo or a 0.3 wash is listed as not
+    // checked and never warned about. A 2-frame letterboxed shot is one
     // warning, for the shot.
     ffmpeg(&[
         "-v",
@@ -401,21 +402,57 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     ]);
     let wide = |start: f64, source_in: f64, duration: f64| json!({"start":start,"source":"wide.mp4","source_in":source_in,"duration":duration});
     let letterboxed = json!([{"clips":[wide(0.0, 0.0, 2.0), wide(2.0667, 3.0, 1.9333)]}]);
-    assert_eq!(brief_shots(d, "letterboxed.json", letterboxed), [(2, 2.0)]);
+    assert_eq!(
+        lint_shots(d, "letterboxed.json", letterboxed),
+        (vec![], vec![(60, 62)])
+    );
     let mut faint_a = talk(0.0, 0.0, 2.0);
     faint_a["opacity"] = json!(0.3);
     let mut faint_b = talk(2.0667, 3.0, 1.9333);
     faint_b["opacity"] = json!(0.3);
     let faint_gap = json!([{"clips":[faint_a, faint_b]}]);
-    assert_eq!(brief_shots(d, "faint-gap.json", faint_gap), [(2, 2.0)]);
+    assert_eq!(
+        lint_shots(d, "faint-gap.json", faint_gap),
+        (vec![], vec![(60, 62)])
+    );
     let pip = json!([gap, {"clips":[wide(0.0, 0.0, 4.0)]}]);
-    assert_eq!(brief_shots(d, "pip.json", pip), [(2, 2.0)]);
+    assert_eq!(lint_shots(d, "pip.json", pip), (vec![], vec![(60, 62)]));
     let mut veil = broll(0.0, 0.0, 4.0);
     veil["opacity"] = json!(0.3);
     let veiled = json!([gap, {"clips":[veil]}]);
-    assert_eq!(brief_shots(d, "veiled.json", veiled), [(2, 2.0)]);
+    assert_eq!(
+        lint_shots(d, "veiled.json", veiled),
+        (vec![], vec![(60, 62)])
+    );
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=red:s=16x16",
+        "-frames:v",
+        "1",
+        d.join("bug.png").to_str().unwrap(),
+    ]);
+    let bug = json!({"clips":[{"start":0,"source":"bug.png","duration":4.0}]});
+    let boxed_gap = json!({"clips":[wide(0.0, 0.0, 2.0), wide(2.0667, 3.0, 1.9333)]});
+    for (name, base) in [("bug.json", &gap), ("boxed-bug.json", &boxed_gap)] {
+        let logo = json!([base, bug]);
+        assert_eq!(
+            lint_shots(d, name, logo),
+            (vec![], vec![(60, 62)]),
+            "{name}"
+        );
+    }
+    // A picture-in-picture entering 2 frames into a black card ends the
+    // black between full-frame pictures: not checked, and not called black.
+    let card = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(3.0, 3.0, 1.0)]},
+        {"clips":[wide(2.0667, 0.0, 0.9333)]}]);
+    assert_eq!(lint_shots(d, "card.json", card), (vec![], vec![(60, 62)]));
     let boxed = json!([{"clips":[talk(0.0, 0.0, 2.0), wide(2.0, 0.0, 0.0667), talk(2.0667, 2.0667, 1.9333)]}]);
-    assert_eq!(brief_shots(d, "boxed.json", boxed), [(2, 2.0)]);
+    assert_eq!(lint_shots(d, "boxed.json", boxed), (vec![(2, 2.0)], vec![]));
     // The same take continued on another track counts as a cut (documented).
     let across = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(2.3, 2.3, 1.7)]},
         {"clips":[talk(2.0, 2.0, 0.3)]}]);
@@ -637,6 +674,8 @@ fn lint_help_explains_brief_shots_for_agents() {
         "brief_shots_not_checked",
         "a title or overlay edge near a cut is not a shot",
         "or a black gap",
+        "black gaps are checked only between full-frame pictures",
+        "above 0.75 opacity",
         "opacity 0",
         "clips continuing it across straight splits",
         "uncertain_cover_sources",
