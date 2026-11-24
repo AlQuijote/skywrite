@@ -435,12 +435,24 @@ fn audio_segment(
     ))
 }
 
+/// Restamp a picture stream on the output frame grid: time base one frame,
+/// frame N at pts N. Every segment emits exactly its frame count, so after a
+/// concat this places frame N of a track on output frame N. Microsecond
+/// timestamps (concat's own time base) cannot hold 1001/30000 frame steps, and
+/// concat estimates where a segment ends from its last frame (a one-frame
+/// segment advanced time by nothing); either made overlay show the previous
+/// frame past a cut, drop a one-frame clip, or end a track early.
+fn frame_clock(edit: &ValidatedEdit) -> String {
+    format!("settb={}/{},setpts=N", edit.fps.den, edit.fps.num)
+}
+
 fn transparent(edit: &ValidatedEdit, frames: u64, label: &str) -> String {
     format!(
-        "color=c=black@0:s={}x{}:r={},format=yuva420p,trim=end_frame={frames},setpts=PTS-STARTPTS,settb=AVTB[{label}]",
+        "color=c=black@0:s={}x{}:r={},format=yuva420p,trim=end_frame={frames},{}[{label}]",
         edit.width,
         edit.height,
-        edit.fps.ffmpeg()
+        edit.fps.ffmpeg(),
+        frame_clock(edit)
     )
 }
 
@@ -553,7 +565,7 @@ fn video_clip(
             number(clip.fade_out)
         )?;
     }
-    write!(chain, ",setpts=PTS-STARTPTS,settb=AVTB[{label}]")?;
+    write!(chain, ",{}[{label}]", frame_clock(edit))?;
     Ok((chain, prefix))
 }
 
@@ -608,10 +620,11 @@ fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan
     let total = edit.duration_frames;
     let total_samples = edit.fps.samples_48k(total);
     filters.push(format!(
-        "color=c=black:s={}x{}:r={},format=yuv420p,trim=end_frame={total},setpts=PTS-STARTPTS,settb=AVTB[base]",
+        "color=c=black:s={}x{}:r={},format=yuv420p,trim=end_frame={total},{}[base]",
         edit.width,
         edit.height,
-        edit.fps.ffmpeg()
+        edit.fps.ffmpeg(),
+        frame_clock(edit)
     ));
     let mut current = "base".to_owned();
     let mut lanes = Vec::<String>::new();
@@ -665,7 +678,8 @@ fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan
             cursor = clip.end_frames();
             input += 1;
         }
-        filters.push(concat(&pictures, true, &format!("track{t}")));
+        filters.push(concat(&pictures, true, &format!("cat{t}")));
+        filters.push(format!("[cat{t}]{}[track{t}]", frame_clock(edit)));
         let next = format!("comp{t}");
         filters.push(format!(
             "[{current}][track{t}]overlay=x=0:y=0:eof_action=pass:repeatlast=0:format=yuv420[{next}]"
