@@ -382,6 +382,19 @@ pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<String> 
         }
         writeln!(out, "</spine>")?;
     }
+    for pause in &edit.pauses {
+        writeln!(
+            out,
+            "<marker start=\"{}\" duration=\"{}\" value=\"Pause\"{}/>",
+            seconds(pause.start),
+            seconds(pause.end - pause.start),
+            if pause.note.is_empty() {
+                String::new()
+            } else {
+                format!(" note=\"{}\"", xml(&pause.note))
+            }
+        )?;
+    }
     for chapter in &edit.chapters {
         writeln!(
             out,

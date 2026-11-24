@@ -246,7 +246,8 @@ Unlinked sound becomes audio tracks. Stereo partners merge only when source,
 start, end, in point, speed and enabled state match and their source channels differ
 (or they link to each other with no conflicting channel identity); same-channel layers
 stay separate. Time Remap speed, Opacity and Audio Levels values and keyframes,
-fades, markers (as chapters) and the sequence rate and size carry over.
+fades, markers (ranged markers named `Pause` as `pauses`, other markers as
+chapters) and the sequence rate and size carry over.
 Generators, transitions and other effects are reported rather than silently
 dropped. Media paths are kept absolute; if they live on another machine the
 result reports validation errors so you can relink. Imported files are trusted
@@ -282,6 +283,7 @@ What each target carries:
 | Master limiter | yes | warning | warning | warning | warning |
 | Subframe `source_in` | yes | rounded to frames (warned) | yes | rounded to frames | yes |
 | Captions / chapters | yes | markers only | note + markers | sidecars | sidecars |
+| Pauses | ignored | sequence markers | markers | ignored | ignored |
 
 The Python script uses only the standard library and FFmpeg; it invokes FFmpeg
 with an argument list, never a shell. Both direct rendering and the script
@@ -457,6 +459,31 @@ XML as SRT, to import together with it. Hyperframes and Remotion preserve SRT/VT
 and JSON sidecars; their generated compositions do not apply them automatically.
 The FFmetadata sidecar contains chapter boundaries; JSON preserves exact titles,
 including trailing backslashes that FFmetadata cannot round-trip reliably.
+
+## Pauses
+
+`pauses` marks deliberate silences (a beat, a laugh, a reveal) on the **output
+timeline**, in seconds, so `skywrite review lint` does not report them as
+`dead_air`:
+
+```json
+"pauses": [{"start": 41.2, "end": 43, "note": "laugh"}]
+```
+
+Each pause needs `0 <= start < end <=` the timeline duration; pauses are ordered
+by `start` and must not overlap (one may start where the previous ends). `note` is
+optional, at most 512 bytes, without control characters or U+FFFE/U+FFFF; at
+most 1000 pauses.
+Lint passes a gap between heard words when the pauses cover all of it except at
+most `--dead-air-seconds`, and lists it in `checked.dead_air.excluded_by_pause`
+with the pauses' notes. Renderers (MP4, Python, Remotion, Hyperframes) ignore
+pauses. FCPXML writes each as a `<marker value="Pause">` with its duration and
+`note`; Premiere XML as a sequence marker named `Pause` with in and out points
+rounded to whole frames, kept inside the sequence and apart (a pause that rounds to
+no frame is left out, with a warning), and the note as its comment. Premiere XML
+import reads ranged `Pause` markers back as pauses, leaving out (with a note) any
+that overlap another or run past the sequence; comment line breaks and other
+control characters become spaces and comments are cut to 512 bytes (noted).
 After rendering either optional backend, run:
 
 ```sh

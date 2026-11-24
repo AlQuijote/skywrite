@@ -123,6 +123,86 @@ pub struct Edit {
     pub captions: Vec<CaptionTrack>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chapters: Vec<Chapter>,
+    /// Deliberate pauses on the output timeline, for review and NLE markers;
+    /// renderers ignore them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pauses: Vec<Pause>,
+}
+
+/// A deliberate pause (a beat, a laugh, a reveal) on the output timeline, in
+/// seconds. `review lint` does not report it as dead air; FCPXML and Premiere
+/// XML exports carry it as a marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Pause {
+    pub start: f64,
+    pub end: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// Name of the NLE marker that carries a pause (Premiere XML import reads
+/// ranged markers with this name back as pauses).
+pub const PAUSE_MARKER: &str = "Pause";
+
+/// At most this many pauses per edit.
+pub const MAX_PAUSES: usize = 1000;
+
+fn pause_note_char(c: char) -> bool {
+    !c.is_control() && c != '\u{fffe}' && c != '\u{ffff}'
+}
+
+fn pause_note_ok(note: &str) -> bool {
+    note.len() <= MAX_PAUSE_NOTE_BYTES && note.chars().all(pause_note_char)
+}
+
+/// A note that `pauses` accepts: control characters (such as line breaks)
+/// become spaces, U+FFFE/U+FFFF are dropped and the text is cut to 512 bytes
+/// at a character boundary. Used when importing NLE marker comments.
+pub fn pause_note(text: &str) -> String {
+    let mut note = String::new();
+    for c in text.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if !pause_note_char(c) {
+            continue;
+        }
+        if note.len() + c.len_utf8() > MAX_PAUSE_NOTE_BYTES {
+            break;
+        }
+        note.push(c);
+    }
+    note.trim().to_owned()
+}
+
+/// Longest pause note, in UTF-8 bytes.
+pub const MAX_PAUSE_NOTE_BYTES: usize = 512;
+
+fn validate_pauses(pauses: &[Pause], duration: f64) -> Result<()> {
+    ensure!(
+        pauses.len() <= MAX_PAUSES,
+        "at most {MAX_PAUSES} pauses are supported"
+    );
+    let mut previous_end = 0.0;
+    for (i, p) in pauses.iter().enumerate() {
+        ensure!(
+            p.start.is_finite()
+                && p.end.is_finite()
+                && p.start >= 0.0
+                && p.end > p.start
+                && p.end <= duration + 1e-9,
+            "pauses[{i}]: start and end must be finite seconds with 0 <= start < end <= the timeline duration ({duration} s)"
+        );
+        ensure!(
+            i == 0 || p.start >= previous_end,
+            "pauses[{i}]: pauses must be ordered by start and must not overlap"
+        );
+        ensure!(
+            pause_note_ok(&p.note),
+            "pauses[{i}]: note must be at most 512 bytes without control characters or U+FFFE/U+FFFF"
+        );
+        previous_end = p.end;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -475,6 +555,7 @@ pub struct ValidatedEdit {
     pub(crate) warnings: Vec<String>,
     pub(crate) captions: Vec<ValidatedTrack>,
     pub(crate) chapters: Vec<Chapter>,
+    pub(crate) pauses: Vec<Pause>,
     pub(crate) inputs: Vec<PathBuf>,
     /// Canonical directory relative sources resolve against (the edit file's
     /// directory). Not serialized: exports must not embed local layout.
@@ -510,10 +591,13 @@ impl ValidatedEdit {
           "audio_tracks":self.audio.iter().map(|t|json!({"name":t.name,"role":t.role,"clip_count":t.clips.len()})).collect::<Vec<_>>(),
           "video_clip_count":self.video_clips().count(),"audio_clip_count":self.audio_clips().count(),
           "luts":self.luts.iter().map(|l|&l.path).collect::<Vec<_>>(),"master":self.master,
-          "caption_track_count":self.captions.len(),"chapter_count":self.chapters.len(),"warnings":self.warnings})
+          "caption_track_count":self.captions.len(),"chapter_count":self.chapters.len(),"pause_count":self.pauses.len(),"warnings":self.warnings})
     }
+    /// Every file the edit reads, which no output may replace: clip media,
+    /// declared sources (used or not), the edit itself, LUTs and captions.
     pub fn protected_paths(&self) -> impl Iterator<Item = &Path> {
         self.source_paths()
+            .chain(self.sources.iter().map(|s| s.path.as_path()))
             .chain(self.inputs.iter().map(PathBuf::as_path))
             .chain(self.luts.iter().map(|l| l.path.as_path()))
             .chain(self.captions.iter().map(|c| c.source.as_path()))
@@ -970,6 +1054,7 @@ pub fn validate(edit: &Edit, base_dir: &Path) -> Result<ValidatedEdit> {
     let derive = |paths: &[PathBuf]| transcript_cues(paths, &video, &audio, edit.fps);
     let captions = captions::load_tracks(&edit.captions, base_dir, total, &derive)?;
     captions::validate_chapters(&edit.chapters, total)?;
+    validate_pauses(&edit.pauses, total)?;
     Ok(ValidatedEdit {
         name: edit.name.clone(),
         width: edit.width,
@@ -984,6 +1069,7 @@ pub fn validate(edit: &Edit, base_dir: &Path) -> Result<ValidatedEdit> {
         warnings,
         captions,
         chapters: edit.chapters.clone(),
+        pauses: edit.pauses.clone(),
         inputs: Vec::new(),
         base_dir: canonical_base,
     })

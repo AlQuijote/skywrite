@@ -612,8 +612,62 @@ fn xmeml(root: &Node) -> Result<(Value, Vec<String>)> {
             "{skipped} items (generators, transitions, or clips without media) were not imported"
         ));
     }
+    // Ranged markers named like the ones Skywrite writes for pauses are
+    // pauses; every other marker is a chapter.
+    let is_pause = |m: &&Node| {
+        m.text_of(&["name"]) == Some(crate::timeline::PAUSE_MARKER)
+            && m.number(&["out"])
+                .zip(m.number(&["in"]))
+                .is_some_and(|(out, start)| out > start)
+    };
+    // Kept only inside the sequence, in order and apart, as the edit format
+    // requires; others are reported.
+    let length = sequence.number(&["duration"]).filter(|d| *d > 0.0);
+    let mut ranges: Vec<(f64, f64, &str)> = sequence
+        .children("marker")
+        .filter(is_pause)
+        .filter_map(|m| {
+            Some((
+                m.number(&["in"])?,
+                m.number(&["out"])?,
+                m.text_of(&["comment"]).unwrap_or(""),
+            ))
+        })
+        .collect();
+    ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut pauses: Vec<Value> = Vec::new();
+    let mut previous_out = 0.0;
+    let mut unusable = 0usize;
+    let mut changed_notes = 0usize;
+    for (start, end, note) in ranges {
+        if start < previous_out || start < 0.0 || length.is_some_and(|l| end > l) {
+            unusable += 1;
+            continue;
+        }
+        previous_out = end;
+        let mut pause = json!({"start": seconds(start), "end": seconds(end)});
+        let cleaned = crate::timeline::pause_note(note);
+        if cleaned != note {
+            changed_notes += 1;
+        }
+        if !cleaned.is_empty() {
+            pause["note"] = json!(cleaned);
+        }
+        pauses.push(pause);
+    }
+    if unusable > 0 {
+        notes.push(format!(
+            "{unusable} Pause markers overlapping another or outside the sequence were not imported as pauses"
+        ));
+    }
+    if changed_notes > 0 {
+        notes.push(format!(
+            "{changed_notes} Pause marker comments had line breaks or other control characters replaced by spaces, or were cut to 512 bytes, to fit a pause note"
+        ));
+    }
     let chapters: Vec<Value> = sequence
         .children("marker")
+        .filter(|m| !is_pause(m))
         .filter_map(|m| {
             Some(json!({"start": seconds(m.number(&["in"])?), "title": m.text_of(&["name"]).filter(|n| !n.is_empty()).unwrap_or("Marker")}))
         })
@@ -632,6 +686,9 @@ fn xmeml(root: &Node) -> Result<(Value, Vec<String>)> {
     }
     if !chapters.is_empty() {
         edit["chapters"] = json!(chapters);
+    }
+    if !pauses.is_empty() {
+        edit["pauses"] = json!(pauses);
     }
     Ok((edit, notes))
 }

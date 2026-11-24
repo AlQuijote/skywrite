@@ -679,6 +679,7 @@ fn verify(
             master: Default::default(),
             captions: Vec::new(),
             chapters: Vec::new(),
+            pauses: Vec::new(),
         };
         // Reference time shown at render time u: expected_offset + speed * u.
         let expected_offset = r.source_in + r.speed * (p.start - r.start);
