@@ -4,6 +4,7 @@ pub use crate::timing::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -187,6 +188,8 @@ pub struct MediaStream {
     /// Display-matrix rotation in degrees (phone footage is often stored
     /// landscape with -90 or 90); players and FFmpeg show the picture turned.
     pub rotation: Option<i32>,
+    /// FFmpeg pixel format of a video stream, such as `yuv420p` or `argb`.
+    pub pix_fmt: Option<String>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u32>,
     pub avg_frame_rate: Option<String>,
@@ -224,7 +227,124 @@ impl MediaStream {
             (self.width, self.height)
         }
     }
+    /// Whether the pixel format is certainly opaque: FFmpeg's descriptor for it
+    /// has no alpha flag. Alpha-capable formats (`argb`, `yuva444p`, ProRes 4444
+    /// as `yuva444p12le`) and unknown or missing formats are not, even when every
+    /// pixel happens to be opaque, because only decoding the pixels would show it.
+    pub fn is_opaque_format(&self) -> bool {
+        self.pix_fmt
+            .as_deref()
+            .and_then(pixel_format_has_alpha)
+            .is_some_and(|alpha| !alpha)
+    }
 }
+
+/// Whether FFmpeg's pixel format descriptor `name` carries the alpha flag;
+/// `None` for a name ffprobe does not list or when the list cannot be read.
+/// The list is read once per process (`ffprobe -show_pixel_formats`).
+pub fn pixel_format_has_alpha(name: &str) -> Option<bool> {
+    static FORMATS: std::sync::OnceLock<HashMap<String, bool>> = std::sync::OnceLock::new();
+    FORMATS
+        .get_or_init(|| {
+            crate::process::run(
+                "ffprobe",
+                &crate::process::args(&["-v", "error", "-show_pixel_formats", "-of", "json"]),
+                Duration::from_secs(30),
+                4 * 1024 * 1024,
+            )
+            .ok()
+            .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
+            .map(|raw| pixel_format_alpha_flags(&raw))
+            .unwrap_or_default()
+        })
+        .get(name)
+        .copied()
+}
+
+fn pixel_format_alpha_flags(raw: &Value) -> HashMap<String, bool> {
+    raw["pixel_formats"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| {
+            Some((
+                f["name"].as_str()?.to_owned(),
+                f["flags"]["alpha"].as_i64()? != 0,
+            ))
+        })
+        .collect()
+}
+/// A still image as FFmpeg decodes it for a render: its size after any
+/// orientation FFmpeg applies (the EXIF rotation of phone photos, on FFmpeg
+/// versions that read it), and whether every pixel is fully opaque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StillPixels {
+    pub width: u32,
+    pub height: u32,
+    pub opaque: bool,
+}
+
+/// Decode a still once, bounded, to its alpha as a PGM image (opaque formats
+/// give 255 everywhere); `None` when it cannot be decoded.
+pub fn decode_still(path: &Path) -> Option<StillPixels> {
+    let formats = format_whitelist().ok()?;
+    let out = crate::process::run(
+        "ffmpeg",
+        &[
+            "-v".into(),
+            "error".into(),
+            "-protocol_whitelist".into(),
+            "file,pipe".into(),
+            "-format_whitelist".into(),
+            formats.into(),
+            "-i".into(),
+            path.as_os_str().to_owned(),
+            "-frames:v".into(),
+            "1".into(),
+            "-vf".into(),
+            "format=rgba,alphaextract".into(),
+            "-c:v".into(),
+            "pgm".into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-".into(),
+        ],
+        Duration::from_secs(30),
+        256 * 1024 * 1024,
+    )
+    .ok()?;
+    parse_pgm_alpha(&out.stdout)
+}
+
+/// Size and opacity from a binary 8-bit PGM (`P5`) of alpha values.
+fn parse_pgm_alpha(pgm: &[u8]) -> Option<StillPixels> {
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while fields.len() < 4 {
+        while pgm.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while !pgm.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(std::str::from_utf8(&pgm[start..at]).ok()?);
+    }
+    let [magic, width, height, max] = fields[..] else {
+        return None;
+    };
+    let (width, height): (u32, u32) = (width.parse().ok()?, height.parse().ok()?);
+    if magic != "P5" || max != "255" || width == 0 || height == 0 {
+        return None;
+    }
+    let pixels = pgm.get(at + 1..)?;
+    (pixels.len() as u64 == u64::from(width) * u64::from(height)).then(|| StillPixels {
+        width,
+        height,
+        opaque: pixels.iter().all(|&alpha| alpha == 255),
+    })
+}
+
 /// Accept regular local files; canonical absolute paths cannot become flags or URLs.
 pub fn canonical_file(path: &Path) -> Result<PathBuf> {
     let meta =
@@ -292,6 +412,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
                     .find_map(|d| d["rotation"].as_f64())
                     .map(|r| r.round() as i32)
             }),
+            pix_fmt: string(s, "pix_fmt"),
             sample_rate: s["sample_rate"].as_str().and_then(|v| v.parse().ok()),
             channels: s["channels"].as_u64().map(|v| v as u32),
             avg_frame_rate: string(s, "avg_frame_rate"),
@@ -902,6 +1023,7 @@ mod display_tests {
             width,
             height,
             rotation,
+            pix_fmt: None,
             sample_rate: None,
             channels: None,
             avg_frame_rate: None,
@@ -950,6 +1072,7 @@ mod duration_tests {
             width: None,
             height: None,
             rotation: None,
+            pix_fmt: None,
             sample_rate: None,
             channels: None,
             avg_frame_rate: None,
@@ -1009,5 +1132,70 @@ mod duration_tests {
             (presentation_duration("wav", None, 1.0, &[stream(Some(1.5), Some(2.0))]) - 2.5).abs()
                 < 1e-12
         );
+    }
+}
+#[cfg(test)]
+mod pgm_tests {
+    use super::*;
+    #[test]
+    fn still_size_and_opacity_come_from_the_decoded_alpha() {
+        let pgm = |header: &str, pixels: &[u8]| [header.as_bytes(), pixels].concat();
+        assert_eq!(
+            parse_pgm_alpha(&pgm("P5\n3 2\n255\n", &[255; 6])),
+            Some(StillPixels {
+                width: 3,
+                height: 2,
+                opaque: true
+            })
+        );
+        let some_clear = parse_pgm_alpha(&pgm("P5 2 1 255\n", &[255, 0])).unwrap();
+        assert!(!some_clear.opaque);
+        // Truncated, 16-bit or plain (P2) images are not read.
+        assert_eq!(parse_pgm_alpha(&pgm("P5\n3 2\n255\n", &[255; 5])), None);
+        assert_eq!(parse_pgm_alpha(&pgm("P5\n1 1\n65535\n", &[255; 2])), None);
+        assert_eq!(parse_pgm_alpha(b"P2\n1 1\n255\n255\n"), None);
+        assert_eq!(parse_pgm_alpha(b""), None);
+    }
+}
+#[cfg(test)]
+mod pixel_format_tests {
+    use super::*;
+    #[test]
+    fn alpha_comes_from_ffmpeg_descriptors_not_names() {
+        let flags = pixel_format_alpha_flags(&serde_json::json!({"pixel_formats":[
+            {"name":"gray","flags":{"alpha":0}},
+            {"name":"argb","flags":{"alpha":1}},
+            {"name":"broken"}]}));
+        assert_eq!(flags.get("gray"), Some(&false));
+        assert_eq!(flags.get("argb"), Some(&true));
+        assert!(!flags.contains_key("broken"));
+        // The installed FFmpeg's own descriptors: names containing "a" are not
+        // a guide (gray, Bayer), and unknown formats are never called opaque.
+        assert_eq!(pixel_format_has_alpha("yuv420p"), Some(false));
+        assert_eq!(pixel_format_has_alpha("gray"), Some(false));
+        assert_eq!(pixel_format_has_alpha("bayer_rggb8"), Some(false));
+        assert_eq!(pixel_format_has_alpha("argb"), Some(true));
+        assert_eq!(pixel_format_has_alpha("yuva444p12le"), Some(true));
+        assert_eq!(pixel_format_has_alpha("no-such-format"), None);
+        let stream = |pix_fmt: Option<&str>| MediaStream {
+            index: 0,
+            codec_type: "video".into(),
+            codec_name: None,
+            duration: None,
+            start_time: None,
+            width: Some(16),
+            height: Some(9),
+            rotation: None,
+            pix_fmt: pix_fmt.map(str::to_owned),
+            sample_rate: None,
+            channels: None,
+            avg_frame_rate: None,
+            r_frame_rate: None,
+            time_base: None,
+        };
+        assert!(stream(Some("yuv420p")).is_opaque_format());
+        assert!(!stream(Some("argb")).is_opaque_format());
+        assert!(!stream(Some("no-such-format")).is_opaque_format());
+        assert!(!stream(None).is_opaque_format());
     }
 }

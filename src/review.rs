@@ -26,7 +26,7 @@ pub enum ReviewCommand {
     Sheet(SheetArgs),
     /// Short audition clips around every cut in an edit, for listening and watching.
     Cuts(CutsArgs),
-    /// Objective checks of an edit before rendering; pass --transcript WORDS.json for each dialogue source, or the word checks (unfinished endings, dead air, repeated or clipped words, silent visible speakers) do not run.
+    /// Objective checks of an edit before rendering, including brief shots between hard cuts; pass --transcript WORDS.json for each dialogue source, or the word checks (unfinished endings, dead air, repeated or clipped words, silent visible speakers) do not run.
     #[command(long_about = LINT_ABOUT, after_long_help = LINT_EXAMPLES)]
     Lint(LintArgs),
 }
@@ -85,11 +85,21 @@ pub struct LintArgs {
     /// Longest silence between heard dialogue words, in timeline seconds, before a dead_air warning (0.1 to 10).
     #[arg(long, default_value_t = 0.6, value_name = "SECONDS")]
     pub dead_air_seconds: f64,
+    /// Report shots on screen for less than this many seconds (flash frames).
+    ///
+    /// Seconds of output time, 0 to 10 (default 0.5); 0 turns the brief-shot
+    /// check off. Only shots between two hard cuts are checked (fades and
+    /// dissolves are not checked yet, black gaps only between full-frame
+    /// pictures); a brief_shot warning reports its frames,
+    /// timeline_start and timeline_end. Raise it to match the edit's pacing
+    /// (for example 1). Values outside 0..10 are refused.
+    #[arg(long, default_value_t = 0.5, value_name = "SECONDS")]
+    pub min_shot_seconds: f64,
 }
 
 const LINT_ABOUT: &str = "Objective checks of an edit before you render it, from the edit JSON and word-timed transcripts. It never changes the edit and never judges taste.
 
-Run it on every draft, before skywrite edit render; after rendering, check the file with skywrite verify. Supply one --transcript per dialogue source (from skywrite transcribe; usage.source_sha256 must match the media). Without transcripts only the level checks run: the report's not_checked list (also printed to stderr) says which checks were skipped and which dialogue sources had no transcript.
+Run it on every draft, before skywrite edit render; after rendering, check the file with skywrite verify. Supply one --transcript per dialogue source (from skywrite transcribe; usage.source_sha256 must match the media). Without transcripts only the level and brief-shot checks run. The report's not_checked list (also printed to stderr) says which checks were skipped, which dialogue sources had no transcript and which short shots brief_shot did not check because of a fade, dissolve or opacity change, or black not between full-frame pictures.
 
 Warnings (kind):
   visible_speaker_without_dialogue  a speaker's picture is visible while their words are inaudible
@@ -100,12 +110,19 @@ Warnings (kind):
   dead_air                          silences between heard dialogue words longer than --dead-air-seconds (default 0.6 s), measured on the output timeline after cuts, speed changes, J/L cuts and muted B-roll sound. Each item has timeline_start, timeline_end, seconds, the words either side, across_cut and other_sound (music or effects audible in the gap, which does not hide a pause). Silence before the first and after the last word is not counted. A deliberate pause is marked in the edit itself: a top-level \"pauses\": [{\"start\": 41.2, \"end\": 43, \"note\": \"laugh\"}] (timeline seconds) passes any gap it covers except for at most --dead-air-seconds; those gaps are listed in checked.dead_air.excluded_by_pause.
   sound_cut_mid_flow                a clip ends while its source keeps sounding (applause, music tails)
   bed_close_to_dialogue             music or ambience within 10 dB of the dialogue
+  brief_shot                        a picture on screen for less than --min-shot-seconds (default 0.5 s) between two hard cuts: a flash frame, a short cutaway or a black gap between full-frame pictures. Fades and dissolves are not checked yet.
 
-Transcript checks are only as good as the transcript: missing words (laughter, crosstalk) read as silence, and word times are alignment estimates (Parakeet, for example, uses 80 ms steps). The JSON's checked object says what was and was not measured. Cost: no network; only the level checks decode audio (at most 256 short windows; --no-levels skips them). Exit status is 0 with warnings; it fails only on unreadable inputs or mismatched transcripts.";
+Brief shots (brief_shot) are checked only between hard cuts; fades and dissolves are not checked yet, and black gaps are checked only between full-frame pictures. They are judged from clip placement and opacity, not pixels (except that stills are decoded once to see whether they cover). A take is one clip, or clips continuing it across straight splits on one track (same source, contiguous within one frame of the slower clip's source step; pieces of one still always continue; the same take continued on another track counts as a cut). A take is on screen while its opacity times what full-frame opaque cover above it lets through is at least 0.25; black is on screen while at least 0.25 of the light reaches the bottom through cover. Black is checked only between full-frame pictures: the picture goes from fully covered (by pictures that fill the frame to the pixel as the renderer fits them) to black with nothing on it but titles that are not opaque, and back; every other black change (letterbox bars, black around a picture-in-picture or an opaque logo, black under a partial-opacity picture) is not checked yet. A brief shot is a take, or black between full-frame pictures, on screen for less than --min-shot-seconds, and its length is exact on the edit's frame grid. It is reported only when both its edges are hard cuts (the timeline's start and end count as hard cuts): no visible clip fades anywhere in it or in the frame on either side of it, and no take continues at another opacity at its edges or inside it. That catches a flash frame, a short cutaway, a short overlay or title (also at partial opacity), or a black gap between full-frame pictures cut in and out, while a title or overlay edge near a cut is not a shot (a full-frame opaque overlay above 0.75 opacity hides what is beneath it, so its edges are cuts). A stretch with a fade, dissolve or opacity change, and black that is not between full-frame pictures, is never reported; when it is under the threshold it is listed in checked.brief_shots_not_checked (timeline_start, timeline_end, source) and counted in not_checked, to watch with skywrite review cuts. Clips at opacity 0 show nothing, and cuts under full-frame opaque cover on a higher track are hidden. Cover is a full-frame picture (its shape within 1% of the frame's; stills are measured as FFmpeg decodes them, after any EXIF rotation) at full opacity that is certainly opaque: video whose pixel format has no alpha channel, or a still whose decoded pixels are all opaque. Pictures whose shape is more than 1% off the frame's (letterboxed or pillarboxed), alpha-capable video (QTRLE argb, ProRes 4444 with alpha) and stills with transparent pixels never hide or dim what is beneath them; a picture within 1% hides what is beneath it even though the render leaves thin bars (up to about 1% of the frame, such as 8 pixels a side for 1904x1080 on 1920x1080), but black next to it is checked only when it fills the frame to the pixel; video whose pixel format FFmpeg does not describe, and stills that cannot be decoded, are listed in checked.uncertain_cover_sources and never cover. Each brief_shot warning has frames, timeline_start, timeline_end and source (null for black); checked.min_shot_seconds is the threshold used.
+
+Transcript checks are only as good as the transcript: missing words (laughter, crosstalk) read as silence, and word times are alignment estimates (Parakeet, for example, uses 80 ms steps). The JSON's checked object says what was and was not measured. Cost: no network; only the level checks decode audio (at most 256 short windows; --no-levels skips them), and, when the brief-shot or speaker checks run, each still used by a clip is decoded once, one after another, to see whether it covers (measured with FFmpeg 8.0.1: 0.3 to 0.7 s for a 12 MP photo). Exit status is 0 with warnings; it fails only on unreadable inputs or mismatched transcripts.";
 
 const LINT_EXAMPLES: &str = "Examples:
   skywrite review lint edit.json --transcript talk.transcript.json
-  skywrite review lint edit.json --transcript host.json --transcript guest.json --no-levels --dead-air-seconds 0.8";
+  skywrite review lint edit.json --transcript host.json --transcript guest.json --no-levels --dead-air-seconds 0.8
+  skywrite review lint edit.json --no-levels --min-shot-seconds 1
+      Shots under 1 s between hard cuts are reported as brief (default 0.5 s).
+  skywrite review lint edit.json --min-shot-seconds 0
+      Turns the brief-shot check off.";
 
 pub fn execute(command: ReviewCommand) -> Result<Value> {
     match command {
@@ -645,6 +662,10 @@ fn level(path: &Path, start: f64, duration: f64) -> Result<Option<f64>> {
 
 fn lint(args: &LintArgs) -> Result<Value> {
     ensure!(
+        args.min_shot_seconds.is_finite() && (0.0..=10.0).contains(&args.min_shot_seconds),
+        "--min-shot-seconds must be 0..10 seconds"
+    );
+    ensure!(
         args.dead_air_seconds.is_finite() && (0.1..=10.0).contains(&args.dead_air_seconds),
         "--dead-air-seconds must be 0.1..10"
     );
@@ -711,23 +732,49 @@ fn lint(args: &LintArgs) -> Result<Value> {
     let words = merged;
 
     // 1. A visible picture of someone speaking with no dialogue audible.
+    // Only a full-frame picture covers what lies beneath: video whose pixel
+    // format has no alpha channel, or a still whose pixels are all opaque.
+    // Stills are decoded once, as the renderer decodes them, for their alpha
+    // and their size after any EXIF rotation. Pictures more than 1% off the
+    // frame's shape (letterboxed), alpha-capable video (lower thirds in ProRes
+    // 4444 or QTRLE) and stills with transparent pixels leave it visible.
+    let mut stills = HashMap::<&Path, Option<media::StillPixels>>::new();
+    let cover_needed = args.min_shot_seconds > 0.0 || !transcripts.is_empty();
+    for clip in edit.video_clips().filter(|_| cover_needed) {
+        if clip.kind == MediaKind::Image {
+            stills
+                .entry(clip.source.as_path())
+                .or_insert_with(|| media::decode_still(&clip.source));
+        }
+    }
+    let still =
+        |c: &timeline::ValidatedVideoClip| stills.get(c.source.as_path()).copied().flatten();
+    let opaque_picture = |c: &timeline::ValidatedVideoClip| {
+        if c.kind == MediaKind::Image {
+            still(c).is_some_and(|s| s.opaque)
+        } else {
+            c.media.video().is_some_and(|v| v.is_opaque_format())
+        }
+    };
+    let size = |c: &timeline::ValidatedVideoClip| {
+        if c.kind == MediaKind::Image {
+            still(c).map(|s| (s.width, s.height))
+        } else {
+            c.media.video().and_then(|v| v.display_size())
+        }
+    };
+    let frame_size = (edit.width, edit.height);
+    // Cover hides what is beneath when its shape is within 1% of the frame's;
+    // black is checked only between pictures that fill the frame exactly.
+    let covers_frame = |c: &timeline::ValidatedVideoClip| {
+        opaque_picture(c) && size(c).is_some_and(|s| near_frame_shape(s, frame_size))
+    };
+    let fills = |c: &timeline::ValidatedVideoClip| {
+        opaque_picture(c) && size(c).is_some_and(|s| fills_frame(s, frame_size))
+    };
     let opaque: Vec<(usize, Interval)> = edit
         .video_clips()
-        // Only full-frame opaque video hides the speaker; letterboxed pictures
-        // and stills (often transparent titles) leave them visible.
-        .filter(|c| {
-            c.opacity >= 1.0
-                && c.kind == MediaKind::Video
-                && c.media
-                    .video()
-                    .and_then(|v| v.display_size())
-                    .is_some_and(|(w, h)| {
-                        let (w, h) = (w as f64, h as f64);
-                        h > 0.0
-                            && ((w / h) - edit.width as f64 / edit.height as f64).abs()
-                                < 0.01 * edit.width as f64 / edit.height as f64
-                    })
-        })
+        .filter(|c| c.opacity >= 1.0 && covers_frame(c))
         .map(|c| {
             (
                 c.track,
@@ -788,6 +835,91 @@ fn lint(args: &LintArgs) -> Result<Value> {
             }));
         }
     }
+
+    // 1b. Brief shots: a take, or black between full-frame pictures, on
+    // screen for less than --min-shot-seconds, checked only between hard cuts. A take (one
+    // clip, or clips continuing it across straight splits) is on screen while
+    // its opacity times what full-frame opaque cover above it lets through is
+    // at least a quarter; black is on screen while at least a quarter of the
+    // light reaches the bottom through cover. A stretch is checked only when
+    // no visible clip fades in it or the frame beside it and no take changes
+    // opacity across a split at its edges or inside it, and black only between
+    // full-frame pictures (see `shots`), so its length is exact from the edit;
+    // short ones that are not checked are listed in
+    // checked.brief_shots_not_checked.
+    let mut brief = Vec::new();
+    let mut brief_not_checked = Vec::new();
+    if args.min_shot_seconds > 0.0 {
+        // Frames strictly under the threshold: ceil(threshold * fps) frames
+        // or more are long enough.
+        let max_frames = (args.min_shot_seconds * fps.value() - 1e-6).ceil().max(1.0) as u64;
+        let shots = shots(&edit, &covers_frame, &fills, &opaque_picture);
+        // A stretch of black around a picture that is itself a brief take is
+        // reported once, as the take.
+        let takes: Vec<(u64, u64)> = shots
+            .iter()
+            .filter(|s| s.source.is_some())
+            .map(|s| (s.start, s.end))
+            .collect();
+        for shot in shots {
+            if shot.source.is_none() && takes.contains(&(shot.start, shot.end)) {
+                continue;
+            }
+            if shot.end - shot.start >= max_frames {
+                continue;
+            }
+            let span = json!({
+                "timeline_start": fps.seconds(shot.start),
+                "timeline_end": fps.seconds(shot.end),
+                "source": shot.source,
+            });
+            if shot.hard {
+                if !brief.contains(&(shot.start, shot.end, span.clone())) {
+                    brief.push((shot.start, shot.end, span));
+                }
+            } else if !brief_not_checked.contains(&span) {
+                brief_not_checked.push(span);
+            }
+        }
+    }
+    for (start, end, span) in brief {
+        let frames = end - start;
+        let (start, end) = (fps.seconds(start), fps.seconds(end));
+        let what = span["source"]
+            .as_str()
+            .map_or_else(|| "Black".to_owned(), |path| file_name(Path::new(path)));
+        warnings.push(json!({
+            "kind": "brief_shot",
+            "timeline_start": start,
+            "timeline_end": end,
+            "frames": frames,
+            "source": span["source"],
+            "message": format!(
+                "{what} is on screen for only {frames} frames ({:.2}s) between hard cuts, from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
+                end - start, args.min_shot_seconds
+            ),
+        }));
+    }
+    // Video whose pixel format FFmpeg does not describe, and stills that cannot
+    // be decoded, never count as cover; say so, because they can add warnings
+    // beneath them.
+    let mut uncertain_cover: Vec<&Path> = edit
+        .video_clips()
+        .filter(|c| {
+            if c.kind == MediaKind::Image {
+                return stills.get(c.source.as_path()) == Some(&None);
+            }
+            c.media.video().is_some_and(|v| {
+                v.pix_fmt
+                    .as_deref()
+                    .and_then(media::pixel_format_has_alpha)
+                    .is_none()
+            })
+        })
+        .map(|c| c.source.as_path())
+        .collect();
+    uncertain_cover.sort();
+    uncertain_cover.dedup();
 
     // 2. Repeated words, across or inside cuts, and filler words in selects.
     for pair in words.windows(2) {
@@ -1003,7 +1135,19 @@ fn lint(args: &LintArgs) -> Result<Value> {
             }
         }
     }
-    let not_checked = transcript_gaps(&spans, &transcripts);
+    let mut not_checked = transcript_gaps(&spans, &transcripts);
+    if !brief_not_checked.is_empty() {
+        let count = brief_not_checked.len();
+        not_checked.push(format!(
+            "{count} shot{} under --min-shot-seconds {} a fade, dissolve or opacity change in or beside {}, or {} black not between full-frame pictures, so brief_shot did not check {} (fades and dissolves are not checked yet; black gaps are checked only between full-frame pictures); watch {} with skywrite review cuts (spans in checked.brief_shots_not_checked)",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "has" } else { "have" },
+            if count == 1 { "it" } else { "them" },
+            if count == 1 { "is" } else { "are" },
+            if count == 1 { "it" } else { "them" },
+            if count == 1 { "it" } else { "them" },
+        ));
+    }
     for line in &not_checked {
         eprintln!("review lint: {line}");
     }
@@ -1021,6 +1165,9 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "dialogue_sources": transcripts.keys().collect::<Vec<_>>(),
             "dialogue_words_heard": words.len(),
             "levels": levels_checked,
+            "min_shot_seconds": args.min_shot_seconds,
+            "uncertain_cover_sources": uncertain_cover,
+            "brief_shots_not_checked": brief_not_checked,
             "level_measurements": measurements,
             "ending": ending.checked,
             "dead_air": dead.checked,
@@ -1029,7 +1176,9 @@ fn lint(args: &LintArgs) -> Result<Value> {
         "limitations": [
             "Checks are objective signals, not editorial judgement: they cannot assess delivery, emotional fit, B-roll relevance or music choice.",
             "Speaker and repetition checks only cover sources whose transcripts were supplied, and only as well as those transcripts capture what was said.",
-            "Level checks measure short windows of the source audio with the edit's gains applied; they do not replace listening to the mix (skywrite review cuts)."
+            "Level checks measure short windows of the source audio with the edit's gains applied; they do not replace listening to the mix (skywrite review cuts).",
+            "Brief shots are checked only between hard cuts; fades and dissolves are not checked yet, and black gaps are checked only between full-frame pictures: a stretch with a fade, dissolve or opacity change, and black that is not between full-frame pictures (letterbox bars, around a picture-in-picture or opaque logo, under a partial-opacity picture), is never reported as brief, and when it is under the threshold it is listed in checked.brief_shots_not_checked instead, to watch with skywrite review cuts. Lengths are counted on the edit's frame grid, which renders follow exactly (each clip is on screen for exactly its grid frames); a video whose picture starts after its source_in shows black for that lead.",
+            "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement and opacity, not pixels (stills are decoded once to see whether they cover): only a full-frame picture that is certainly opaque (video whose pixel format has no alpha channel, or a still whose decoded pixels are all opaque) covers what is beneath it, so cuts under pictures whose shape is more than 1% off the frame's (letterboxed or pillarboxed), alpha-capable video (even fully opaque ProRes 4444 with alpha) and stills with transparent pixels count as visible and can add warnings; video whose pixel format FFmpeg does not describe and stills that cannot be decoded are listed in checked.uncertain_cover_sources and never cover; black gaps are checked only between pictures that fill the frame to the pixel as the renderer fits them; and changes inside a clip's own picture (a cut baked into the source) are not seen."
         ],
     }))
 }
@@ -1516,9 +1665,268 @@ mod ending_tests {
     }
 }
 
+/// Whether a picture of `size` (displayed width, height) fills a `frame` of
+/// that size with no bars, as the renderer fits it: FFmpeg's `scale` with
+/// `force_original_aspect_ratio=decrease` scales each side to the other's
+/// target, rounded to the nearest pixel, and keeps the smaller.
+fn fills_frame(size: (u32, u32), frame: (u32, u32)) -> bool {
+    let ((w, h), (fw, fh)) = (
+        (u64::from(size.0), u64::from(size.1)),
+        (u64::from(frame.0), u64::from(frame.1)),
+    );
+    w > 0 && h > 0 && (fh * w + h / 2) / h >= fw && (fw * h + w / 2) / w >= fh
+}
+
+/// Whether a picture of `size` (displayed width, height) has the shape of a
+/// `frame` within 1%, enough to hide what lies beneath it.
+fn near_frame_shape(size: (u32, u32), frame: (u32, u32)) -> bool {
+    let ((w, h), (fw, fh)) = (
+        (f64::from(size.0), f64::from(size.1)),
+        (f64::from(frame.0), f64::from(frame.1)),
+    );
+    h > 0.0 && fh > 0.0 && ((w / h) - fw / fh).abs() < 0.01 * fw / fh
+}
+
+/// Least share of the picture a take must have to be on screen: its opacity
+/// times what full-frame opaque cover above it lets through.
+const ON_SCREEN: f64 = 0.25;
+
+/// A take (or black) on screen for a stretch of frames. `hard` when no visible
+/// clip fades in it or in the frame on either side, no visible take continues
+/// at another opacity at its edges or inside it, and (for black) it lies
+/// between full-frame pictures, so it starts and ends with hard cuts and its
+/// length is exact.
+struct Shot {
+    start: u64,
+    end: u64,
+    hard: bool,
+    /// The take's source; `None` for black.
+    source: Option<PathBuf>,
+}
+
+/// Every stretch a take, or black, is on screen, in order.
+/// See `lint` (1b) for the model.
+fn shots(
+    edit: &timeline::ValidatedEdit,
+    covers_frame: &dyn Fn(&timeline::ValidatedVideoClip) -> bool,
+    fills: &dyn Fn(&timeline::ValidatedVideoClip) -> bool,
+    opaque_picture: &dyn Fn(&timeline::ValidatedVideoClip) -> bool,
+) -> Vec<Shot> {
+    let fps = edit.fps();
+    let frame = fps.seconds(1);
+    let total = edit.duration_frames();
+    // Tracks are sorted by start (no overlaps). Clips at opacity 0 show
+    // nothing but still continue a take across a split.
+    let mut tracks: Vec<Vec<&timeline::ValidatedVideoClip>> = Vec::new();
+    for clip in edit.video_clips() {
+        if tracks.len() <= clip.track {
+            tracks.resize_with(clip.track + 1, Vec::new);
+        }
+        tracks[clip.track].push(clip);
+    }
+    for track in &mut tracks {
+        track.sort_by_key(|c| c.start_frames);
+    }
+    // A straight split continues the take: same track and source, abutting,
+    // and (for video) source-contiguous within one frame of the slower clip's
+    // step. Pieces of one still are always one take.
+    let continues = |a: &timeline::ValidatedVideoClip, b: &timeline::ValidatedVideoClip| {
+        a.source == b.source
+            && a.end_frames() == b.start_frames
+            && (a.kind == MediaKind::Image
+                || (a.source_in + fps.seconds(a.duration_frames) * a.speed - b.source_in).abs()
+                    <= frame * a.speed.min(b.speed) * 1.01)
+    };
+    let mut takes: Vec<Vec<usize>> = Vec::with_capacity(tracks.len());
+    let mut sources: Vec<&Path> = Vec::new();
+    for track in &tracks {
+        let mut ids = Vec::with_capacity(track.len());
+        for (i, clip) in track.iter().enumerate() {
+            if i > 0 && continues(track[i - 1], clip) {
+                ids.push(ids[i - 1]);
+            } else {
+                ids.push(sources.len());
+                sources.push(&clip.source);
+            }
+        }
+        takes.push(ids);
+    }
+    // Frames a clip's fades can change, with a frame to spare for FFmpeg
+    // rounding fades to whole frames.
+    let fading = |clip: &timeline::ValidatedVideoClip| {
+        let frames = |seconds: f64| (seconds / frame).ceil() as u64 + 1;
+        let (start, end) = (clip.start_frames, clip.end_frames());
+        let fade_in = if clip.fade_in > 0.0 {
+            start..(start + frames(clip.fade_in)).min(end)
+        } else {
+            start..start
+        };
+        let fade_out = if clip.fade_out > 0.0 {
+            end.saturating_sub(frames(clip.fade_out)).max(start)..end
+        } else {
+            end..end
+        };
+        [fade_in, fade_out]
+    };
+    // At frame n, from the top track down: the takes on screen; how much
+    // light reaches the bottom through cover, and through pictures that fill
+    // the frame exactly; the opaque pictures on screen with it (black shows
+    // where at least ON_SCREEN of the light does);
+    // whether a visible clip is fading; and whether a visible take continues
+    // at another opacity.
+    struct Picture {
+        on: Vec<usize>,
+        through: f64,
+        unfilled: f64,
+        pictured: Vec<usize>,
+        fades: bool,
+        steps: bool,
+    }
+    let picture = |n: u64| {
+        let (mut through, mut unfilled) = (1.0, 1.0);
+        let (mut fades, mut steps) = (false, false);
+        let (mut on, mut pictured) = (Vec::new(), Vec::new());
+        for (track, ids) in tracks.iter().zip(&takes).rev() {
+            if through <= 1e-9 {
+                break;
+            }
+            let at = track.partition_point(|c| c.start_frames <= n);
+            let Some(i) = at.checked_sub(1) else {
+                continue;
+            };
+            let clip = track[i];
+            if n >= clip.end_frames() {
+                continue;
+            }
+            fades |= clip.opacity > 0.0 && fading(clip).iter().any(|r| r.contains(&n));
+            steps |= clip.start_frames == n
+                && i > 0
+                && ids[i - 1] == ids[i]
+                && track[i - 1].opacity != clip.opacity;
+            if clip.opacity * through >= ON_SCREEN - 1e-9 {
+                on.push(ids[i]);
+                if opaque_picture(clip) {
+                    pictured.push(ids[i]);
+                }
+            }
+            if covers_frame(clip) {
+                through *= 1.0 - clip.opacity;
+            }
+            if fills(clip) {
+                unfilled *= 1.0 - clip.opacity;
+            }
+        }
+        on.sort_unstable();
+        on.dedup();
+        pictured.sort_unstable();
+        pictured.dedup();
+        Picture {
+            on,
+            through,
+            unfilled,
+            pictured,
+            fades,
+            steps,
+        }
+    };
+    // The picture only changes at clip edges and fade ends.
+    let mut breaks = std::collections::BTreeSet::from([0]);
+    for clip in tracks.iter().flatten() {
+        breaks.insert(clip.start_frames);
+        breaks.insert(clip.end_frames());
+        for range in fading(clip) {
+            breaks.insert(range.start);
+            breaks.insert(range.end);
+        }
+    }
+    let starts: Vec<u64> = breaks.into_iter().filter(|&n| n < total).collect();
+    let pictures: Vec<Picture> = starts.iter().map(|&n| picture(n)).collect();
+    let frame_at = |i: usize| starts.get(i).copied().unwrap_or(total);
+    // No fade in segments first..last or the segment on either side, and no
+    // opacity step at their edges or inside them.
+    let hard = |first: usize, last: usize| {
+        !pictures[first.saturating_sub(1)..(last + 1).min(pictures.len())]
+            .iter()
+            .any(|p| p.fades)
+            && !pictures[first..(last + 1).min(pictures.len())]
+                .iter()
+                .any(|p| p.steps)
+    };
+    let mut shots = Vec::new();
+    // Each take's stretches on screen, as segment index ranges.
+    let mut open = std::collections::BTreeMap::<usize, usize>::new();
+    for i in 0..=pictures.len() {
+        let on: &[usize] = pictures.get(i).map_or(&[], |p| p.on.as_slice());
+        open.retain(|&id, &mut first| {
+            let stays = on.contains(&id);
+            if !stays {
+                shots.push((first, i, Some(id), hard(first, i)));
+            }
+            stays
+        });
+        for &id in on {
+            open.entry(id).or_insert(i);
+        }
+    }
+    // Black: each stretch where black shows with the same light through cover
+    // and the same opaque pictures on screen. It is checked only between
+    // full-frame pictures: nothing on screen but black (and titles that are
+    // not opaque), with the picture fully covered in the segment on either
+    // side. Black at the timeline's ends continues the black beyond them.
+    let black = |i: usize| {
+        let p = &pictures[i];
+        (p.through >= ON_SCREEN - 1e-9).then(|| ((p.through * 1e6).round() as i64, &p.pictured))
+    };
+    let covered = |i: usize| pictures[i].unfilled <= 1e-9;
+    let mut first = 0;
+    for i in 1..=pictures.len() {
+        if i < pictures.len() && black(i) == black(first) {
+            continue;
+        }
+        if let Some((through, pictured)) = black(first)
+            && first > 0
+            && i < pictures.len()
+        {
+            let alone = through == 1_000_000 && pictured.is_empty();
+            let checked = alone && covered(first - 1) && covered(i) && hard(first, i);
+            shots.push((first, i, None, checked));
+        }
+        first = i;
+    }
+    shots.sort_unstable_by_key(|&(first, last, id, _)| (first, last, id.is_none()));
+    shots
+        .into_iter()
+        .map(|(first, last, id, hard)| Shot {
+            start: frame_at(first),
+            end: frame_at(last),
+            hard,
+            source: id.map(|id| sources[id].to_path_buf()),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_picture_fills_the_frame_only_when_the_renderer_leaves_no_bars() {
+        assert!(fills_frame((1920, 1080), (160, 90)));
+        assert!(fills_frame((160, 90), (1920, 1080)));
+        // 480x272 on 480x270 scales to 476x270: 2-pixel pillarboxes.
+        assert!(!fills_frame((480, 272), (480, 270)));
+        assert!(!fills_frame((160, 44), (160, 90)));
+        // Measured with FFmpeg 8.0.1: 1366x768 on 1920x1080 scales to
+        // 1920x1079, and 1280x721 on 1280x720 to 1278x720.
+        assert!(!fills_frame((1366, 768), (1920, 1080)));
+        assert!(!fills_frame((1280, 721), (1280, 720)));
+        assert!(!fills_frame((0, 90), (160, 90)));
+        // Within 1% of the frame's shape is enough to hide what is beneath.
+        assert!(near_frame_shape((1366, 768), (1920, 1080)));
+        assert!(near_frame_shape((480, 272), (480, 270)));
+        assert!(!near_frame_shape((160, 44), (160, 90)));
+        assert!(!near_frame_shape((160, 0), (160, 90)));
+    }
+
     #[test]
     fn interval_subtraction_and_word_normalization() {
         let pieces = subtract(
