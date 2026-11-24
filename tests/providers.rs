@@ -820,7 +820,7 @@ fn video_ranges_of_rotated_phone_footage_keep_their_displayed_height() {
         .unwrap();
     assert!(status.success());
     // The fixture answers with a frame description, so only the request matters.
-    env.run(&[
+    let out = env.run(&[
         "describe",
         "video",
         phone.to_str().unwrap(),
@@ -831,6 +831,19 @@ fn video_ranges_of_rotated_phone_footage_keep_their_displayed_height() {
         "--model",
         "local:video-small",
     ]);
+    // The reported encoding (and the cache key) name the height actually sent.
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+        serde_json::from_slice(&out.stderr).expect("describe video prints JSON")
+    });
+    let encoding = report["encoding"]
+        .as_str()
+        .or(report["error"]["details"]["encoding"].as_str());
+    assert_eq!(
+        encoding,
+        Some("h264-crf28-h160-noaudio"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let requests = server.requests();
     let url = requests[0]["body"]["messages"][0]["content"][1]["video_url"]["url"]
         .as_str()

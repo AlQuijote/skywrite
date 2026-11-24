@@ -87,7 +87,10 @@ skywrite describe video interview.mp4 --start 56 --duration 8 -o laugh.json
 ```
 
 The range is re-encoded to H.264 at 480p without audio (`--height` 240–1080) and
-sent inline. The model reports shots, timed events (gestures, head turns,
+sent inline. It is never upscaled: a source shown smaller than `--height` (by its
+displayed size, so rotated phone footage counts upright) keeps its own height,
+rounded down to an even number, and `encoding` in the result names the height
+sent. The model reports shots, timed events (gestures, head turns,
 expression changes, visible speech onsets) and people, with clip-relative times plus
 `source_*` times. Ranges are limited to 600 seconds and 17 MiB encoded; shorter
 ranges give finer timing. A custom provider must accept `video_url` input; one

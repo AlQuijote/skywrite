@@ -640,7 +640,15 @@ fn video(args: &VideoArgs) -> Result<Value> {
     let model = target.reference();
     let root = crate::cache::cache_root(args.cache_dir.as_deref())?;
     let source_sha256 = media::file_sha256(&info.path)?;
-    let encode = format!("h264-crf28-h{}-noaudio", args.height);
+    // Never upscale: the clip is encoded at --height or the displayed height,
+    // whichever is smaller, rounded down to an even number for H.264 4:2:0.
+    // The encoded height is part of the cache key and the reported encoding.
+    let video_height = info
+        .video()
+        .and_then(|v| v.display_size())
+        .map_or(args.height, |(_, h)| h);
+    let height = (args.height.min(video_height) & !1).max(2);
+    let encode = format!("h264-crf28-h{height}-noaudio");
     let key = openrouter::cache_key(&[
         VIDEO_PROMPT_VERSION.as_bytes(),
         source_sha256.as_bytes(),
@@ -687,10 +695,6 @@ fn video(args: &VideoArgs) -> Result<Value> {
         .prefix("skywrite-video-")
         .tempdir()?;
     let clip = temp.path().join("clip.mp4");
-    let video_height = info
-        .video()
-        .and_then(|v| v.display_size())
-        .map_or(args.height, |(_, h)| h);
     let mut command = crate::process::args(&[
         "-hide_banner",
         "-nostdin",
@@ -710,7 +714,7 @@ fn video(args: &VideoArgs) -> Result<Value> {
         "0:v:0",
         "-an",
         "-vf",
-        &format!("scale=-2:{}", args.height.min(video_height)),
+        &format!("scale=-2:{height}"),
         "-c:v",
         "libx264",
         "-preset",
