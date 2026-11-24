@@ -169,7 +169,9 @@ media. Longer overruns are rejected. Use rational rates such as
 ## Pictures
 
 Video and stills scale to fit the canvas, preserving aspect ratio; phone footage
-with a display rotation fits by its upright, displayed size. Letterboxing is
+with a display rotation fits by its upright, displayed size. Fitting treats
+stored pixels as square: a source's sample aspect ratio is ignored, so anamorphic
+or DV media keeps its stored shape. Letterboxing is
 transparent, so lower tracks show through; at the bottom that means black. Stills
 keep their alpha channel (for example Takumi title cards with transparency) and
 require `source_in: 0` and `speed: 1`.
@@ -307,8 +309,10 @@ of their own (a track mixing mono and stereo sources is split, with a warning),
 and sources with more than two channels use their first two. Speed
 uses the Time Remap effect, opacity and fades use Opacity keyframes, and gain uses
 Audio Levels keyframes. Each video clip gets a Basic Motion Scale that fits it in
-the sequence as the render does (by displayed size, so rotated phone footage fits
-upright); without it Premiere shows media at its own size. The format counts whole frames at integer or NTSC rates,
+the sequence as the render does for square-pixel sources (by displayed size, so
+rotated phone footage fits upright); without it Premiere shows media at its own
+size. Premiere applies a source's pixel aspect ratio, which the render ignores, so
+anamorphic or DV media is framed differently in the two. The format counts whole frames at integer or NTSC rates,
 so subframe source in points are rounded (with a warning). Skywrite checks the
 XML's structure and timing with an independent reader, but import into Premiere
 itself has not yet been verified: please report results with `skywrite nit`.
