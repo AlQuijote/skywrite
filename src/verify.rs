@@ -104,10 +104,12 @@ fn execute_with_limit(args: VerifyArgs, hash_limit: u64) -> Result<Value> {
     if let Some(expected) = args.expected_duration {
         checks.push(json!({"property":"duration","expected":expected,"actual":duration,"tolerance":args.duration_tolerance,"basis":if measured_duration.is_some(){"decoded_presentation"}else{"metadata_estimate"},"passed":(duration-expected).abs() <= args.duration_tolerance}));
     }
-    let display = info.video().and_then(|v| v.display_size());
+    let (width, height) = info
+        .video()
+        .map_or((None, None), |v| v.display_dimensions());
     for (name, expected, actual) in [
-        ("width", args.expected_width, display.map(|(w, _)| w)),
-        ("height", args.expected_height, display.map(|(_, h)| h)),
+        ("width", args.expected_width, width),
+        ("height", args.expected_height, height),
     ] {
         if let Some(expected) = expected {
             checks.push(json!({"property":name,"expected":expected,"actual":actual,"basis":"stream_metadata","passed":actual==Some(expected)}));
