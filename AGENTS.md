@@ -43,7 +43,7 @@ Tests must not use the network, paid accounts or the real `~/.config`/`~/.cache`
 | Edit format: parse, validate, frame grid | `src/timeline.rs` (`ValidatedEdit` is the only input to backends) |
 | Render and exports | `src/export.rs` (FFmpeg MP4 + Python script), `src/export/{fcpxml,xmeml,project,media_url}.rs` |
 | NLE import | `src/import.rs` |
-| Audio finishing | `src/audio.rs` |
+| Audio finishing, room tone | `src/audio.rs`; device listing and `record-bed` capture in `src/capture.rs` |
 | Clip/tempo speed filters and the `--stretcher` choice (rubberband detection, latency calibration) | `src/stretch.rs` (`SpeedFilters`, resolved once per command; used by the renderer, FFmpeg script and `audio tempo`) |
 | On-device transcription (`ondevice:` provider: pinned model download/remove, transcribe.cpp engine) | `src/ondevice.rs`, `build.rs` (static musl C++ runtime) |
 | Analysis, transcripts, captions, review, describe | `src/analysis.rs`, `src/transcript.rs`, `src/captions.rs`, `src/review.rs`, `src/describe.rs`, `src/verify.rs` |

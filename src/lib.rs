@@ -36,6 +36,7 @@ pub mod verify;
 pub mod project;
 
 pub mod audio;
+pub mod capture;
 
 pub mod captions;
 

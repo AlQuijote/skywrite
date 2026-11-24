@@ -274,6 +274,26 @@ pub fn run(
     timeout: Duration,
     max_output: usize,
 ) -> Result<Output> {
+    run_child(program, args, timeout, max_output, true)
+}
+/// Like `run`, but a nonzero exit is returned with its complete (still
+/// bounded) output instead of an error: for modes such as FFmpeg's device
+/// listings that always exit nonzero.
+pub fn run_any_status(
+    program: &str,
+    args: &[OsString],
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Output> {
+    run_child(program, args, timeout, max_output, false)
+}
+fn run_child(
+    program: &str,
+    args: &[OsString],
+    timeout: Duration,
+    max_output: usize,
+    require_success: bool,
+) -> Result<Output> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -395,7 +415,7 @@ pub fn run(
                 stdout: captured[0].take().unwrap(),
                 stderr: captured[1].take().unwrap(),
             };
-            if !output.status.success() {
+            if require_success && !output.status.success() {
                 let diagnostic: String = String::from_utf8_lossy(&output.stderr)
                     .chars()
                     .take(4096)

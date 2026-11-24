@@ -27,12 +27,18 @@ pub enum AudioCommand {
     /// bed looped or trimmed to it at a target level, summed without a later
     /// loudness pass; output length equals the speech.
     Roomtone(RoomtoneArgs),
+    /// List capture devices this FFmpeg sees (PulseAudio/PipeWire and ALSA,
+    /// macOS avfoundation, Windows dshow). Records nothing.
+    Inputs,
+    /// Record room tone from a capture device, only with --confirm (ask the user
+    /// first): mono 48 kHz PCM16, measured and checked; never uploaded.
+    RecordBed(crate::capture::RecordBedArgs),
 }
 #[derive(Debug, Args)]
 pub struct RoomtoneArgs {
     /// Dry speech, for example a generated narration take.
     pub input: PathBuf,
-    /// Room tone: a recording of the room with nobody talking.
+    /// Room tone: a recording of the room with nobody talking (see `audio record-bed`).
     #[arg(long)]
     pub bed: PathBuf,
     #[arg(short, long)]
@@ -411,6 +417,8 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
         }
         AudioCommand::Finish(args) => (args, "finish"),
         AudioCommand::Roomtone(args) => return roomtone(args),
+        AudioCommand::Inputs => return crate::capture::inputs(),
+        AudioCommand::RecordBed(args) => return crate::capture::record_bed(args),
     };
     bounded("start", options.start, 0.0, MAX_SECONDS)?;
     for (name, value) in [("length", options.length), ("duration", options.duration)] {
@@ -655,7 +663,7 @@ fn roomtone(options: RoomtoneArgs) -> Result<Value> {
         .with_context(|| format!("speech input {}", options.input.display()))?;
     let bed = crate::media::canonical_file(&options.bed).with_context(|| {
         format!(
-            "room-tone bed {} not found or unreadable; pass a recording of the room with nobody talking",
+            "room-tone bed {} not found or unreadable; pass a recording of the room with nobody talking (`skywrite audio record-bed`, after asking the user)",
             options.bed.display()
         )
     })?;
