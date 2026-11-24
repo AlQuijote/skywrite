@@ -45,7 +45,7 @@ Put the binary on your `PATH` to run it as `skywrite`, as the examples below do.
 
 ## Installation
 
-Skywrite needs FFmpeg 5.1 or newer and ffprobe on your `PATH`; for security fixes, use the latest point release of a maintained FFmpeg branch. FFmpeg must include H.264 (`libx264`) and AAC encoding for the built-in MP4 renderer. Linux and macOS are supported. Burned-in captions also need the `subtitles` filter (libass). On macOS, Homebrew's `ffmpeg` formula lacks libass and rubberband; install the keg-only `ffmpeg-full` and put `$(brew --prefix ffmpeg-full)/bin` first on your `PATH`.
+Skywrite needs FFmpeg 5.1 or newer and ffprobe on your `PATH` (renders and audio loops were checked on 5.1.2 through 9.1, including the 7.x releases; see [validation](docs/validation.md#ffmpeg-version-compatibility)); for security fixes, use the latest point release of a maintained FFmpeg branch. FFmpeg must include H.264 (`libx264`) and AAC encoding for the built-in MP4 renderer. Linux and macOS are supported. Burned-in captions also need the `subtitles` filter (libass). On macOS, Homebrew's `ffmpeg` formula lacks libass and rubberband; install the keg-only `ffmpeg-full` and put `$(brew --prefix ffmpeg-full)/bin` first on your `PATH`.
 
 ### Prebuilt binaries
 

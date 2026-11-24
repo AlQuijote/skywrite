@@ -207,12 +207,20 @@ enum Seam {
     /// Quarter-sine gain: constant power for uncorrelated noise such as room tone.
     EqualPower,
 }
-/// `repetitions` copies of `source`, joined with `seam` crossfades of
-/// `crossfade_samples` (plain concatenation at zero), cut at `duration`.
+/// `repetitions` copies of `source` (`content_samples` long), joined with
+/// `seam` crossfades of `crossfade_samples` (plain concatenation at zero), cut
+/// at `duration`.
+///
+/// Each copy is faded and delayed to its own position, then the copies are
+/// summed by `amix`. Chained `acrossfade` is not used: before FFmpeg 8.0 it
+/// ends its output as soon as its second input reaches end of stream, even if
+/// the first is still being read, so a short source looped through
+/// FFmpeg 7.x's threaded CLI was cut short at random points.
 fn loop_file(
     source: &Path,
     output: &Path,
     repetitions: usize,
+    content_samples: u64,
     (crossfade_samples, seam): (u64, Seam),
     duration: f64,
     deadline: Instant,
@@ -232,15 +240,31 @@ fn loop_file(
         }
         graph.push_str(&format!("concat=n={repetitions}:v=0:a=1[out]"));
     } else {
-        let mut last = "0:a:0".to_owned();
-        for i in 1..repetitions {
-            let next = format!("l{i}");
-            graph.push_str(&format!(
-                "[{last}][{i}:a:0]acrossfade=ns={crossfade_samples}:c1={curve}:c2={curve}[{next}];"
-            ));
-            last = next;
+        // Copy `i` starts at `i * stride`; its last `crossfade_samples` fade out.
+        let stride = content_samples - crossfade_samples;
+        for i in 0..repetitions {
+            graph.push_str(&format!("[{i}:a:0]asetpts=N/SR/TB"));
+            if i > 0 {
+                graph.push_str(&format!(
+                    ",afade=t=in:ss=0:ns={crossfade_samples}:curve={curve}"
+                ));
+            }
+            if i + 1 < repetitions {
+                graph.push_str(&format!(
+                    ",afade=t=out:ss={stride}:ns={crossfade_samples}:curve={curve}"
+                ));
+            }
+            if i > 0 {
+                graph.push_str(&format!(",adelay={}S:all=1", i as u64 * stride));
+            }
+            graph.push_str(&format!("[c{i}];"));
         }
-        graph.push_str(&format!("[{last}]anull[out]"));
+        for i in 0..repetitions {
+            graph.push_str(&format!("[c{i}]"));
+        }
+        graph.push_str(&format!(
+            "amix=inputs={repetitions}:duration=longest:dropout_transition=0:normalize=0[out]"
+        ));
     }
     args.extend(crate::process::args(&[
         "-filter_complex_threads",
@@ -583,6 +607,7 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
             &current,
             &looped,
             repetitions,
+            content_timing.samples,
             (crossfade_samples, Seam::Linear),
             final_duration,
             deadline,
@@ -787,6 +812,7 @@ fn roomtone(options: RoomtoneArgs) -> Result<Value> {
             &bed_source,
             &work("bed-looped.wav"),
             repetitions,
+            bed_prepared.samples,
             (crossfade_samples, Seam::EqualPower),
             duration,
             deadline,

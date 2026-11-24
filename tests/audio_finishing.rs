@@ -232,6 +232,88 @@ fn loops_crossfade_ducking_recovers_and_short_control_does_not_truncate() {
     );
 }
 #[test]
+fn crossfaded_loop_of_a_short_source_matches_the_exact_sum_of_faded_copies() {
+    // FFmpeg 7.x's acrossfade cut short loops of a 1 s source at random
+    // points; every output sample must be the linear-crossfaded copies' sum.
+    // 437 Hz is 0.6 cycle out of phase after the 0.8 s stride, so overlapping
+    // copies differ and a loop without crossfades fails too.
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path();
+    let src = p.join("music.wav");
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=437:sample_rate=48000:duration=1",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+        ],
+        &src,
+    );
+    let looped = p.join("looped.wav");
+    let r = success(
+        p,
+        &[
+            "audio",
+            "loop",
+            src.to_str().unwrap(),
+            "-o",
+            looped.to_str().unwrap(),
+            "--duration",
+            "6",
+            "--crossfade",
+            "0.2",
+        ],
+    );
+    assert_eq!(r["loop_repetitions"], 8);
+    assert_eq!(timing(&looped).samples, 288_000);
+    let source = pcm(&src, 0.0, 1.0);
+    assert_eq!(source.len(), 48_000);
+    let (content, fade) = (48_000usize, 9_600usize);
+    let stride = content - fade;
+    let mut expected = vec![0.0; 288_000];
+    for copy in 0..8 {
+        for (k, value) in source.iter().enumerate() {
+            let Some(slot) = expected.get_mut(copy * stride + k) else {
+                break;
+            };
+            let mut gain = 1.0;
+            if copy > 0 && k < fade {
+                gain *= k as f64 / fade as f64;
+            }
+            if copy < 7 && k >= content - fade {
+                gain *= (content - k) as f64 / fade as f64;
+            }
+            *slot += value * gain;
+        }
+    }
+    let actual = pcm(&looped, 0.0, 6.0);
+    assert_eq!(actual.len(), expected.len());
+    let (worst, at) = actual
+        .iter()
+        .zip(&expected)
+        .map(|(a, e)| (a - e).abs())
+        .enumerate()
+        .fold(
+            (0.0, 0),
+            |best, (i, diff)| {
+                if diff > best.0 { (diff, i) } else { best }
+            },
+        );
+    assert!(
+        worst <= 3.0 / 32768.0,
+        "loop differs from the crossfaded copies by {:.1} LSB at sample {at}",
+        worst * 32768.0
+    );
+}
+#[test]
 fn final_pad_trim_fades_and_selection_use_decoded_sample_grid() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path();
