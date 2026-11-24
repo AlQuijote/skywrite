@@ -79,3 +79,10 @@ or point the transcript/edit at the media it was made from. Hashes use the share
 Level checks decode short windows of the sources (at most 256 measurements);
 `--no-levels` skips them. They measure source audio with the edit's gains, not the
 final mix, and do not replace listening.
+
+Cover is decided from metadata, not pixels. Only full-frame video (by displayed
+size, so rotated phone footage counts) at full opacity whose pixel format has no
+alpha channel, per FFmpeg's pixel format list, hides what lies beneath it.
+Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE `argb`)
+never count as cover, even when every pixel is opaque, so a speaker or a cut under
+them stays visible and can add warnings.

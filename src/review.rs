@@ -689,23 +689,24 @@ fn lint(args: &LintArgs) -> Result<Value> {
     let words = merged;
 
     // 1. A visible picture of someone speaking with no dialogue audible.
-    let opaque: Vec<(usize, Interval)> = edit
-        .video_clips()
-        // Only full-frame opaque video hides the speaker; letterboxed pictures
-        // and stills (often transparent titles) leave them visible.
-        .filter(|c| {
-            c.opacity >= 1.0
-                && c.kind == MediaKind::Video
-                && c.media
-                    .video()
-                    .and_then(|v| v.display_size())
-                    .is_some_and(|(w, h)| {
+    // Only full-frame video whose pixel format has no alpha channel covers what
+    // lies beneath; letterboxed pictures, stills (often transparent titles) and
+    // alpha-capable video (lower thirds in ProRes 4444 or QTRLE) leave it visible.
+    let covers_frame = |c: &timeline::ValidatedVideoClip| {
+        c.kind == MediaKind::Video
+            && c.media.video().is_some_and(|v| {
+                v.is_opaque_format()
+                    && v.display_size().is_some_and(|(w, h)| {
                         let (w, h) = (w as f64, h as f64);
                         h > 0.0
                             && ((w / h) - edit.width as f64 / edit.height as f64).abs()
                                 < 0.01 * edit.width as f64 / edit.height as f64
                     })
-        })
+            })
+    };
+    let opaque: Vec<(usize, Interval)> = edit
+        .video_clips()
+        .filter(|c| c.opacity >= 1.0 && covers_frame(c))
         .map(|c| {
             (
                 c.track,

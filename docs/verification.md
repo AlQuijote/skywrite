@@ -27,6 +27,7 @@ ffprobe's whole-degree value, and only quarter turns (90 and 270, either sign)
 swap the displayed width and height. That matches the exact quarter-turn
 matrices phones write; for other angles FFmpeg's own autorotation, which rounds
 the matrix angle, may disagree.
+`pix_fmt` is its FFmpeg pixel format (`yuv420p`, or `argb` for alpha video).
 
 `skywrite verify FILE --expected-duration 10 --duration-tolerance 0.05
 --expected-width 1280 --expected-height 720 --expected-fps 30` performs a fresh

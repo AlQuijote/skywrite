@@ -4,6 +4,7 @@ pub use crate::timing::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -187,6 +188,8 @@ pub struct MediaStream {
     /// Display-matrix rotation in degrees (phone footage is often stored
     /// landscape with -90 or 90); players and FFmpeg show the picture turned.
     pub rotation: Option<i32>,
+    /// FFmpeg pixel format of a video stream, such as `yuv420p` or `argb`.
+    pub pix_fmt: Option<String>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u32>,
     pub avg_frame_rate: Option<String>,
@@ -218,6 +221,52 @@ impl MediaStream {
             (w, h)
         })
     }
+    /// Whether the pixel format is certainly opaque: FFmpeg's descriptor for it
+    /// has no alpha flag. Alpha-capable formats (`argb`, `yuva444p`, ProRes 4444
+    /// as `yuva444p12le`) and unknown or missing formats are not, even when every
+    /// pixel happens to be opaque, because only decoding the pixels would show it.
+    pub fn is_opaque_format(&self) -> bool {
+        self.pix_fmt
+            .as_deref()
+            .and_then(pixel_format_has_alpha)
+            .is_some_and(|alpha| !alpha)
+    }
+}
+
+/// Whether FFmpeg's pixel format descriptor `name` carries the alpha flag;
+/// `None` for a name ffprobe does not list or when the list cannot be read.
+/// The list is read once per process (`ffprobe -show_pixel_formats`).
+pub fn pixel_format_has_alpha(name: &str) -> Option<bool> {
+    static FORMATS: std::sync::OnceLock<HashMap<String, bool>> = std::sync::OnceLock::new();
+    FORMATS
+        .get_or_init(|| {
+            crate::process::run(
+                "ffprobe",
+                &crate::process::args(&["-v", "error", "-show_pixel_formats", "-of", "json"]),
+                Duration::from_secs(10),
+                4 * 1024 * 1024,
+            )
+            .ok()
+            .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
+            .map(|raw| pixel_format_alpha_flags(&raw))
+            .unwrap_or_default()
+        })
+        .get(name)
+        .copied()
+}
+
+fn pixel_format_alpha_flags(raw: &Value) -> HashMap<String, bool> {
+    raw["pixel_formats"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| {
+            Some((
+                f["name"].as_str()?.to_owned(),
+                f["flags"]["alpha"].as_i64()? != 0,
+            ))
+        })
+        .collect()
 }
 /// Accept regular local files; canonical absolute paths cannot become flags or URLs.
 pub fn canonical_file(path: &Path) -> Result<PathBuf> {
@@ -286,6 +335,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
                     .find_map(|d| d["rotation"].as_f64())
                     .map(|r| r.round() as i32)
             }),
+            pix_fmt: string(s, "pix_fmt"),
             sample_rate: s["sample_rate"].as_str().and_then(|v| v.parse().ok()),
             channels: s["channels"].as_u64().map(|v| v as u32),
             avg_frame_rate: string(s, "avg_frame_rate"),
@@ -842,5 +892,48 @@ mod filter_tests {
             " .. atempo  A->A  Adjust audio tempo (not rubberband).\n",
             "rubberband"
         ));
+    }
+}
+
+#[cfg(test)]
+mod pixel_format_tests {
+    use super::*;
+    #[test]
+    fn alpha_comes_from_ffmpeg_descriptors_not_names() {
+        let flags = pixel_format_alpha_flags(&serde_json::json!({"pixel_formats":[
+            {"name":"gray","flags":{"alpha":0}},
+            {"name":"argb","flags":{"alpha":1}},
+            {"name":"broken"}]}));
+        assert_eq!(flags.get("gray"), Some(&false));
+        assert_eq!(flags.get("argb"), Some(&true));
+        assert!(!flags.contains_key("broken"));
+        // The installed FFmpeg's own descriptors: names containing "a" are not
+        // a guide (gray, Bayer), and unknown formats are never called opaque.
+        assert_eq!(pixel_format_has_alpha("yuv420p"), Some(false));
+        assert_eq!(pixel_format_has_alpha("gray"), Some(false));
+        assert_eq!(pixel_format_has_alpha("bayer_rggb8"), Some(false));
+        assert_eq!(pixel_format_has_alpha("argb"), Some(true));
+        assert_eq!(pixel_format_has_alpha("yuva444p12le"), Some(true));
+        assert_eq!(pixel_format_has_alpha("no-such-format"), None);
+        let stream = |pix_fmt: Option<&str>| MediaStream {
+            index: 0,
+            codec_type: "video".into(),
+            codec_name: None,
+            duration: None,
+            start_time: None,
+            width: Some(16),
+            height: Some(9),
+            rotation: None,
+            pix_fmt: pix_fmt.map(str::to_owned),
+            sample_rate: None,
+            channels: None,
+            avg_frame_rate: None,
+            r_frame_rate: None,
+            time_base: None,
+        };
+        assert!(stream(Some("yuv420p")).is_opaque_format());
+        assert!(!stream(Some("argb")).is_opaque_format());
+        assert!(!stream(Some("no-such-format")).is_opaque_format());
+        assert!(!stream(None).is_opaque_format());
     }
 }
