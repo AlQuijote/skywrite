@@ -13,9 +13,16 @@ pub struct VerifyArgs {
     pub expected_duration: Option<f64>,
     #[arg(long, default_value_t = 0.05)]
     pub duration_tolerance: f64,
-    #[arg(long)]
+    /// Expected displayed width in pixels, from stream metadata (basis
+    /// stream_metadata), with the display rotation applied: a phone clip stored
+    /// 1920x1080 with rotation 90 or -90 is 1080 wide. A mismatch fails the check
+    /// (nonzero exit, report still printed). Example: --expected-width 1080
+    /// --expected-height 1920 for an upright vertical phone clip.
+    #[arg(long, value_name = "PIXELS")]
     pub expected_width: Option<u32>,
-    #[arg(long)]
+    /// Expected displayed height in pixels (rotation applied, like
+    /// --expected-width): a phone clip stored 1920x1080 with rotation 90 is 1920 high.
+    #[arg(long, value_name = "PIXELS")]
     pub expected_height: Option<u32>,
     #[arg(long)]
     pub expected_fps: Option<f64>,

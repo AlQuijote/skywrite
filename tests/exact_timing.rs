@@ -395,3 +395,24 @@ fn verify_checks_the_displayed_size_of_rotated_phone_footage() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+fn verify_help_says_sizes_are_displayed_sizes() {
+    let out = Command::new(env!("CARGO_BIN_EXE_skywrite"))
+        .args(["verify", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for fact in [
+        "--expected-width <PIXELS>",
+        "--expected-height <PIXELS>",
+        "displayed width in pixels",
+        "display rotation applied",
+        "stored 1920x1080 with rotation 90 or -90 is 1080 wide",
+        "stream_metadata",
+        "nonzero exit",
+    ] {
+        assert!(help.contains(fact), "missing {fact:?} in:\n{help}");
+    }
+}
