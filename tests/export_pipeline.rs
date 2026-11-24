@@ -308,6 +308,14 @@ assert all('file://' in x.attrib['src'] for x in r.findall('.//media-rep'))
         );
         assert!(export::export(&validated, target, &project, true).is_err());
     }
+    // Remotion packages move in lockstep on a release that already pins the
+    // fixed Zod (checked with npm install / npm ls zod; docs/validation.md).
+    let package: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("remotion/package.json")).unwrap())
+            .unwrap();
+    assert_eq!(package["dependencies"]["remotion"], "4.0.546");
+    assert_eq!(package["dependencies"]["@remotion/cli"], "4.0.546");
+    assert!(package.get("overrides").is_none(), "{package}");
 }
 
 #[test]
