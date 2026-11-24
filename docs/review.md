@@ -126,11 +126,9 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   `source`), and a line in `not_checked` gives their count, so you can watch
   them with `skywrite review cuts`. Clips at `opacity: 0` show nothing, and cuts
   under full-frame opaque cover on a higher track are hidden. Lengths are
-  counted on the edit's frame grid, and a render can be a frame off it
-  (measured with FFmpeg 8.0.1: at 29.97 fps a clip after a cut starts one frame
-  late; at 30 fps a clip after a gap or a short clip can start one frame late or
-  end one frame early; a video whose picture starts after its `source_in` shows black for that
-  lead). Raise the threshold to match your pacing (for example `1`).
+  counted on the edit's frame grid, which renders follow exactly (each clip is
+  on screen for exactly its grid frames); a video whose picture starts after its
+  `source_in` shows black for that lead. Raise the threshold to match your pacing (for example `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
   `role` are classified by it; otherwise a source without a transcript is a bed.
