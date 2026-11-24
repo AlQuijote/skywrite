@@ -316,13 +316,13 @@ enum EditCommand {
         file: PathBuf,
         /// premiere writes Final Cut Pro 7 XML (xmeml v5), which Premiere Pro imports.
         ///
-        /// In Premiere XML every video clip whose displayed size differs from the
-        /// edit's width and height gets a Basic Motion Scale (percent) that fits it
-        /// inside the sequence like the render: min(width / clip width, height /
-        /// clip height) * 100. Rotated phone footage fits by its displayed (upright)
-        /// size, so a clip stored 3840x2160 with rotation -90 shows as 2160x3840 and
-        /// gets Scale 50 in a 1080x1920 sequence; clips that already match get no
-        /// Scale. Non-square-pixel (anamorphic, DV) sources frame differently in
+        /// In Premiere XML each video clip is fitted inside the sequence like the
+        /// render, with a Basic Motion Scale (percent) of min(width / clip width,
+        /// height / clip height) * 100 from its displayed size. Rotated phone
+        /// footage fits by its displayed (upright) size, so a clip stored 3840x2160
+        /// with rotation -90 shows as 2160x3840 and gets Scale 50 in a 1080x1920
+        /// sequence; a clip whose fit is exactly 100% (for example one that matches
+        /// the sequence) gets no Scale. Non-square-pixel (anamorphic, DV) sources frame differently in
         /// Premiere, which applies their pixel aspect ratio. Example:
         /// skywrite edit export reel.json --to premiere -o reel.xml
         #[arg(long,value_parser=["fcpxml","premiere","ffmpeg","hyperframes","remotion"])]

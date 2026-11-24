@@ -308,8 +308,8 @@ video clip; Premiere shows it as one stereo clip. Mono sources get a mono track
 of their own (a track mixing mono and stereo sources is split, with a warning),
 and sources with more than two channels use their first two. Speed
 uses the Time Remap effect, opacity and fades use Opacity keyframes, and gain uses
-Audio Levels keyframes. Each video clip gets a Basic Motion Scale that fits it in
-the sequence as the render does for square-pixel sources (by displayed size, so
+Audio Levels keyframes. Each video clip is fitted in the sequence with a Basic
+Motion Scale (omitted when the fit is exactly 100%), as the render does for square-pixel sources (by displayed size, so
 rotated phone footage fits upright); without it Premiere shows media at its own
 size. Premiere applies a source's pixel aspect ratio, which the render ignores, so
 anamorphic or DV media is framed differently in the two. The format counts whole frames at integer or NTSC rates,
