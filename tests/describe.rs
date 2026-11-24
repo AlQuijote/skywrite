@@ -519,3 +519,31 @@ fn frames_of_rotated_phone_footage_fit_their_displayed_shape() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&size.stdout).trim(), "432,768");
 }
+
+#[test]
+fn help_says_sizes_follow_the_displayed_picture() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = |args: &[&str]| {
+        let out = run(args, dir.path(), dir.path());
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let video = help(&["describe", "video", "--help"]);
+    for fact in [
+        "--height <PIXELS>",
+        "never upscaled",
+        "displayed height",
+        "rounded down to an even number",
+        "encoding field names the height sent",
+    ] {
+        assert!(video.contains(fact), "missing {fact:?} in:\n{video}");
+    }
+    let sheet = help(&["review", "sheet", "--help"]);
+    for fact in [
+        "--tile-width <PIXELS>",
+        "displayed aspect ratio",
+        "upright portrait tiles",
+    ] {
+        assert!(sheet.contains(fact), "missing {fact:?} in:\n{sheet}");
+    }
+}

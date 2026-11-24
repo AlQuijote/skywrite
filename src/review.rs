@@ -47,7 +47,10 @@ pub struct SheetArgs {
     #[arg(long, default_value_t = 4)]
     pub columns: u32,
     /// Width of each tile in pixels.
-    #[arg(long, default_value_t = 320)]
+    ///
+    /// Default 320. Tile height follows the source's displayed aspect ratio
+    /// (rotation applied), so rotated phone footage gets upright portrait tiles.
+    #[arg(long, default_value_t = 320, value_name = "PIXELS")]
     pub tile_width: u32,
     #[arg(short, long)]
     pub output: PathBuf,

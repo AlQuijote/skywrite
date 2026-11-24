@@ -98,7 +98,13 @@ pub struct VideoArgs {
     #[arg(long)]
     pub duration: f64,
     /// Encoded height for the request (smaller is cheaper; 240..1080).
-    #[arg(long, default_value_t = 480)]
+    ///
+    /// Pixels, default 480. The clip is never upscaled: a source whose displayed
+    /// height (rotation applied, so a phone clip stored 1920x1080 with rotation 90
+    /// is 1920 high) is smaller keeps that height, rounded down to an even number.
+    /// The result's encoding field names the height sent, and results are cached
+    /// per encoding.
+    #[arg(long, default_value_t = 480, value_name = "PIXELS")]
     pub height: u32,
     #[arg(long)]
     pub cast: Option<PathBuf>,
