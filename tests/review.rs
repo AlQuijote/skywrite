@@ -451,6 +451,27 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     let card = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(3.0, 3.0, 1.0)]},
         {"clips":[wide(2.0667, 0.0, 0.9333)]}]);
     assert_eq!(lint_shots(d, "card.json", card), (vec![], vec![(60, 62)]));
+    // A picture a pixel off the frame's shape (161x90, within 1% of 16:9)
+    // renders with a thin bar, so a gap between such shots is not between
+    // full-frame pictures.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=green:s=161x90",
+        "-frames:v",
+        "1",
+        d.join("near.png").to_str().unwrap(),
+    ]);
+    let near_gap = json!([{"clips":[{"start":0,"source":"near.png","duration":2.0},
+        {"start":2.0667,"source":"near.png","duration":1.9333}]}]);
+    assert_eq!(
+        lint_shots(d, "near-gap.json", near_gap),
+        (vec![], vec![(60, 62)])
+    );
     let boxed = json!([{"clips":[talk(0.0, 0.0, 2.0), wide(2.0, 0.0, 0.0667), talk(2.0667, 2.0667, 1.9333)]}]);
     assert_eq!(lint_shots(d, "boxed.json", boxed), (vec![(2, 2.0)], vec![]));
     // The same take continued on another track counts as a cut (documented).

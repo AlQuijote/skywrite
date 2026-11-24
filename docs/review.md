@@ -143,8 +143,9 @@ Level checks decode short windows of the sources (at most 256 measurements);
 final mix, and do not replace listening.
 
 Cover is decided from metadata, and for stills from their pixels. Only a
-full-frame picture (by displayed size, so rotated phone footage counts) at full
-opacity that is certainly opaque hides what lies beneath it: video whose pixel
+full-frame picture (by displayed size, so rotated phone footage counts; it must
+fill the frame to the pixel as the renderer fits it, so 1366x768 on a 1920x1080
+edit, fitted to 1920x1079, is letterboxed) at full opacity that is certainly opaque hides what lies beneath it: video whose pixel
 format has no alpha channel, per FFmpeg's pixel format list, or a still whose
 pixels all decode as opaque (palette and RGBA PNGs are decoded once to check).
 Letterboxed pictures, alpha-capable video (QTRLE `argb`, ProRes 4444 with alpha)
