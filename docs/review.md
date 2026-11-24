@@ -99,26 +99,30 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   warning gives `timeline_start`, `timeline_end` (seconds), `frames` and
   `source` (`null` for black). **Fades and dissolves are not checked yet.** The
   check works from clip placement and opacity, not pixels. A take is one clip, or
-  clips that continue it across straight splits (same source and track,
+  clips that continue it across straight splits on one track (same source,
   contiguous within one frame of the slower clip's source step after frame
-  rounding; pieces of one still always continue). A take is on screen while its
-  opacity times what full-frame opaque cover above it lets through is at least
-  0.25; black is on screen while no take is. A shot's length is exact from the
-  edit. It is reported only when both its edges are hard cuts: no visible clip
-  fades in it or in the frame on either side of it, and no take continues at
-  another opacity at its edges or inside it. That reports a flash frame, a short
-  cutaway, a short overlay or title (also at partial opacity), or a black gap cut
-  in and out; a title or overlay starting or ending near a cut is not a shot. A
-  stretch with a fade, a dissolve or an opacity change at either edge is never
+  rounding; pieces of one still always continue; the same take continued on
+  another track counts as a cut). A take is on screen while its opacity times
+  what full-frame opaque cover above it lets through is at least 0.25; black is
+  on screen while at least 0.25 of the light reaches the bottom through cover,
+  also around titles and letterboxed pictures. A shot's length is exact on the
+  edit's frame grid. It is reported only when both its edges are hard cuts (the
+  timeline's start and end count as hard cuts): no visible clip fades anywhere
+  in it or in the frame on either side of it, and no take continues at another
+  opacity at its edges or inside it. That reports a flash frame, a short cutaway,
+  a short overlay or title (also at partial opacity), or a black gap cut in and
+  out, also under a logo; a title or overlay starting or ending near a cut is
+  not a shot. A stretch with a fade, a dissolve or an opacity change is never
   reported as brief; when it is under the threshold it is listed in
   `checked.brief_shots_not_checked` (`timeline_start`, `timeline_end`,
   `source`), and a line in `not_checked` gives their count, so you can watch
   them with `skywrite review cuts`. Clips at `opacity: 0` show nothing, and cuts
-  under full-frame opaque video or stills on a higher track are hidden. Lengths
-  are counted on the edit's frame grid; a render can differ: at 29.97 fps a clip
-  after a cut was measured to start one frame late (FFmpeg 8.0.1), and a video
-  whose picture starts after its `source_in` shows black for that lead. Raise the
-  threshold to match your pacing (for example `1`).
+  under full-frame opaque cover on a higher track are hidden. Lengths are
+  counted on the edit's frame grid, and a render can be a frame off it
+  (measured with FFmpeg 8.0.1: at 29.97 fps a clip after a cut starts one frame
+  late; at 30 fps a clip after a gap can start one frame late or end one frame
+  early; a video whose picture starts after its `source_in` shows black for that
+  lead). Raise the threshold to match your pacing (for example `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
   `role` are classified by it; otherwise a source without a transcript is a bed.
@@ -131,14 +135,17 @@ Level checks decode short windows of the sources (at most 256 measurements);
 `--no-levels` skips them. They measure source audio with the edit's gains, not the
 final mix, and do not replace listening.
 
-Cover is decided from metadata, not pixels. Only a full-frame picture (video or
-still, by displayed size, so rotated phone footage counts) at full opacity whose
-pixel format has no alpha channel, per FFmpeg's pixel format list, hides what
-lies beneath it. Letterboxed pictures, alpha-capable video (ProRes 4444, QTRLE
-`argb`) and stills with alpha (RGBA PNG titles) never count as cover, even when
-every pixel is opaque, so a speaker or a cut under them stays visible and can add
-warnings. A picture whose pixel format FFmpeg does not describe is never cover
-either and is listed in `checked.uncertain_cover_sources`.
+Cover is decided from metadata, and for stills from their pixels. Only a
+full-frame picture (by displayed size, so rotated phone footage counts) at full
+opacity that is certainly opaque hides what lies beneath it: video whose pixel
+format has no alpha channel, per FFmpeg's pixel format list, or a still whose
+pixels all decode as opaque (palette and RGBA PNGs are decoded once to check).
+Letterboxed pictures, alpha-capable video (QTRLE `argb`, ProRes 4444 with alpha)
+and stills with transparent pixels (PNG titles) never count as cover, even when
+every pixel of the video is opaque, so a speaker or a cut under them stays
+visible and can add warnings. Video whose pixel format FFmpeg does not describe,
+and a still that cannot be decoded, are never cover either and are listed in
+`checked.uncertain_cover_sources`.
 
 The 0.6-s dead-air default is measured: in three 60-s windows of unedited AMI
 meeting speech (ES2002a) transcribed on device with Parakeet TDT 0.6B v3 (80-ms
