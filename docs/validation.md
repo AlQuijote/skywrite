@@ -60,6 +60,58 @@ reclamation or CDN invalidation. Input cleanup protects local job receipts only;
 use separate project prefixes when independent computers may still need a source.
 Shared outputs are outside the temporary-input purge namespace.
 
+## Remotion export dependencies
+
+Checked 2026-11-24 on Linux (Node 26.13.1, npm 11.20.0, FFmpeg 8.0.1) with a
+synthetic edit (3-s `testsrc2` H.264 clip with a 440-Hz tone, a 660-Hz WAV on an
+audio track; 640×360, 30 fps, 2 s) exported by `skywrite edit export --to
+remotion`. The exported `package.json` pins `remotion` and `@remotion/cli`
+4.0.546 with no `overrides`. `npm install` succeeded; `npm ls zod --all`
+resolved a single version, zod 4.6.7 (the GHSA-mrhx-c7xc-m3w5 fix), deduplicated
+across six dependents; `npm audit` found 0 vulnerabilities. `npm run render`
+wrote `edit.mp4`, which ffprobe reads as H.264 640×360 at 30 fps with 60 frames
+plus AAC 48 kHz stereo, 2.005 s. Remotion printed no version-mismatch warning;
+the previous pins (4.0.539 with a zod 4.6.7 override) printed "Version mismatch …
+For zod, install exact version 4.5.4". On a Mac mini (macOS 27.0.1, FFmpeg 9.0.2),
+install, `npm ls zod` and audit gave the same results, but headless rendering
+timed out at "Waiting for root component to load" for both the old and new pins
+alike, so that environment does not establish a macOS render.
+
+## FFmpeg version compatibility
+
+Checked 2026-11-24 on Linux (AMD Ryzen AI Max+ 395) with static FFmpeg builds
+5.1.2, 6.1.1, 7.0.2, 7.1, 7.1.1, 8.0.1, 8.1.2 and 9.1 (`mwader/static-ffmpeg`,
+digest-verified) and Ubuntu's 8.0.1, each first on `PATH`, running
+`tests/export_pipeline.rs` `delayed_video_prefix_is_counted_once_in_both_renderers`
+and the `tests/audio_finishing.rs` crossfaded-loop tests alone, three to five
+times per version. Two FFmpeg behaviours that skywrite used to depend on differ
+by version:
+
+- FFmpeg 7.0 and 7.1 `setpts` clears the frame rate on its output, and `tpad`
+  converts `start_duration` to frames with that rate, so a black lead-in placed
+  after `setpts` added no frames: a clip whose video starts 1 s after its audio
+  showed its first picture at 0 s (in both the renderer and exported scripts).
+  5.1, 6.1 and 8.0 or newer keep the rate. The lead is now added after `fps`,
+  in output seconds.
+- Before FFmpeg 8.0, `acrossfade` ends its output as soon as its second input
+  ends, even while it is still reading the first. With the threaded CLI of 7.0
+  and 7.1, a crossfaded loop of a 1-s cue was cut short at random points and
+  padded with silence (5.1 and 6.1 happened to pass). Loops now fade and delay
+  each copy and sum them with `amix normalize=0`. On every version above, the
+  looped output matches the exact sum of linearly faded copies to within 3 LSB
+  (16-bit).
+
+Before the change, both tests failed every run on 7.0.2, 7.1 and 7.1.1; after
+it, both pass on all nine builds.
+
+On this CPU the static 5.1.2 to 8.1.2 builds (not 9.1 or Ubuntu's 8.0.1) have a
+separate fault in their bundled librubberband: after about 0.1 s or more of
+leading digital silence on float input, `rubberband` output stays about 15 dB
+low (RMS 0.0154 instead of 0.088 for FFmpeg's default `sine` source). The same
+builds are correct on an Intel Core i7-8550U. Skywrite's rubberband pad is
+leading silence, so speed-0.5 clip audio renders quiet there; the delayed-video
+test's prefix-level check was skipped for those builds in the runs above.
+
 ## Dual-system sound: camera scratch track and separate recorder
 
 Measured 2026-11-15 with FFmpeg 8.0.1 on Linux. What is real and what is

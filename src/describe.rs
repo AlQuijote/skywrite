@@ -472,7 +472,8 @@ fn frames_with_api(
     let results: Mutex<Vec<Option<Value>>> = Mutex::new(vec![None; work.len()]);
     let spent = Mutex::new(0.0f64);
     let uncosted = AtomicUsize::new(0);
-    let done = AtomicUsize::new(0);
+    // Finished frames by outcome: (described, cached, failed).
+    let tally = Mutex::new((0usize, 0usize, 0usize));
     // An unreachable provider fails every request the same way: stop at once.
     let unreachable: Mutex<Option<String>> = Mutex::new(None);
     std::thread::scope(|scope| {
@@ -510,12 +511,19 @@ fn frames_with_api(
                         })?;
                         Ok(json!({"description":description,"cached":false,"cost_usd":usage.get("cost")}))
                     })();
+                    let mut tally = tally.lock().expect("lock");
                     let value = match result {
                         Ok(mut value) => {
+                            if value["cached"] == true {
+                                tally.1 += 1;
+                            } else {
+                                tally.0 += 1;
+                            }
                             value["source_time"] = json!(time);
                             value
                         }
                         Err(error) => {
+                            tally.2 += 1;
                             if let Some(down) = error.downcast_ref::<openrouter::Unreachable>() {
                                 unreachable.lock().expect("lock").get_or_insert(down.to_string());
                             }
@@ -523,10 +531,15 @@ fn frames_with_api(
                         }
                     };
                     results.lock().expect("lock")[index] = Some(value);
-                    let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
+                    let (described, cached, failed) = *tally;
+                    let finished = described + cached + failed;
                     if finished.is_multiple_of(25) || finished == work.len() {
-                        eprintln!("Described {finished}/{} frames", work.len());
+                        eprintln!(
+                            "Finished {finished}/{} frames ({described} described, {cached} cached, {failed} failed)",
+                            work.len()
+                        );
                     }
+                    drop(tally);
                 }
             });
         }

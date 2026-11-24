@@ -844,13 +844,66 @@ fn wide_sources_are_written_as_stereo_pairs_with_a_note() {
     );
 }
 
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
 #[test]
 fn video_is_scaled_to_fit_the_sequence_like_the_render() {
     let dir = tempfile::tempdir().unwrap();
     media(dir.path());
     let p = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+    let scales = |edit: Value| -> Vec<Option<String>> {
+        let (xml, _) = export_xml(edit, dir.path(), &ExportOptions::default());
+        let root = import::parse_xml(&xml).unwrap();
+        kids(tracks(&root, "video")[0], "clipitem")
+            .map(|item| {
+                let effect = child(item, "filter").and_then(|f| child(f, "effect"))?;
+                assert_eq!(text(effect, &["effectid"]), "basic");
+                assert_eq!(text(effect, &["parameter", "parameterid"]), "scale");
+                Some(text(effect, &["parameter", "value"]).to_owned())
+            })
+            .collect()
+    };
+    // A 90x40 clip already fits the 90x160 frame at 100%, so it gets no Scale
+    // although its size differs; the 160x90 camera clip is letterboxed at
+    // 90/160 = 56.25%.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=s=90x40:r=25:d=2",
+        "-c:v",
+        "libx264",
+        &p("strip.mp4"),
+    ]);
+    let edit = json!({"version":1,"name":"Vertical","width":90,"height":160,"fps":{"num":25,"den":1},
+        "video":[{"clips":[
+            {"start":0,"source":"strip.mp4","duration":1},
+            {"start":1,"source":"cam.mp4","duration":1}]}]});
+    assert_eq!(scales(edit), [None, Some("56.250000".to_owned())]);
+    // Media that already matches the sequence size carries no Basic Motion.
+    let (xml, _) = export_xml(tester_edit(), dir.path(), &ExportOptions::default());
+    assert!(!xml.contains("<effectid>basic</effectid>"), "{xml}");
+
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping the rotated phone case of video_is_scaled_to_fit_the_sequence_like_the_render: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
     // A phone clip: stored 320x180 with a quarter-turn display rotation, so it
-    // shows upright as 180x320.
+    // shows upright as 180x320 and fills the 90x160 frame at 50%.
     ffmpeg(&[
         "-v",
         "error",
@@ -881,23 +934,10 @@ fn video_is_scaled_to_fit_the_sequence_like_the_render() {
         "video":[{"clips":[
             {"start":0,"source":"phone.mp4","duration":1},
             {"start":1,"source":"cam.mp4","duration":1}]}]});
-    let (xml, _) = export_xml(edit, dir.path(), &ExportOptions::default());
-    let root = import::parse_xml(&xml).unwrap();
-    let scales: Vec<String> = kids(tracks(&root, "video")[0], "clipitem")
-        .map(|item| {
-            let effect = path(item, &["filter", "effect"]);
-            assert_eq!(text(effect, &["effectid"]), "basic");
-            assert_eq!(text(effect, &["parameter", "parameterid"]), "scale");
-            text(effect, &["parameter", "value"]).to_owned()
-        })
-        .collect();
-    // Phone 180x320 fills the 90x160 frame at 50%; the 160x90 camera clip is
-    // letterboxed at 90/160 = 56.25%.
-    assert_eq!(scales, ["50.000000", "56.250000"]);
-
-    // Media that already matches the sequence size carries no Basic Motion.
-    let (xml, _) = export_xml(tester_edit(), dir.path(), &ExportOptions::default());
-    assert!(!xml.contains("<effectid>basic</effectid>"), "{xml}");
+    assert_eq!(
+        scales(edit),
+        [Some("50.000000".to_owned()), Some("56.250000".to_owned())]
+    );
 }
 
 #[test]
@@ -926,4 +966,37 @@ fn media_root_warns_when_sources_leave_the_edit_tree() {
     );
     let warned = result["warnings"].to_string().contains("filesystem root");
     assert_eq!(warned, base.parent().is_none(), "{result}");
+}
+
+#[test]
+fn help_explains_premiere_fit_and_rotation_for_agents() {
+    let help = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_skywrite"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let export = help(&["edit", "export", "--help"]);
+    for fact in [
+        "Basic Motion Scale (percent)",
+        "min(width / clip width, height / clip height) * 100",
+        "displayed (upright)",
+        "gets Scale 50 in a 1080x1920 sequence",
+        "exactly 100%",
+        "pixel aspect ratio",
+        "skywrite edit export reel.json --to premiere -o reel.xml",
+    ] {
+        assert!(export.contains(fact), "missing {fact:?} in:\n{export}");
+    }
+    let inspect = help(&["inspect", "--help"]);
+    for fact in [
+        "rotation",
+        "whole degrees, or null",
+        "-90 or 90",
+        "width and height swapped",
+    ] {
+        assert!(inspect.contains(fact), "missing {fact:?} in:\n{inspect}");
+    }
 }

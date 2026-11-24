@@ -80,13 +80,13 @@ impl Env {
         self.command(args).output().unwrap()
     }
     fn ok(&self, args: &[&str]) -> Value {
+        self.ok_with_stderr(args).0
+    }
+    fn ok_with_stderr(&self, args: &[&str]) -> (Value, String) {
         let out = self.run(args);
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice(&out.stdout).unwrap()
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{args:?}: {stderr}");
+        (serde_json::from_slice(&out.stdout).unwrap(), stderr)
     }
     fn fails(&self, args: &[&str]) -> String {
         let out = self.run(args);
@@ -265,7 +265,7 @@ fn frames_through_a_local_provider_send_standard_fields_and_cache_per_provider()
         "X-Org=team",
     ]);
     let video = env.video();
-    let report = env.ok(&[
+    let (report, progress) = env.ok_with_stderr(&[
         "describe",
         "frames",
         &video,
@@ -274,6 +274,10 @@ fn frames_through_a_local_provider_send_standard_fields_and_cache_per_provider()
         "--model",
         "local:vision-small",
     ]);
+    assert!(
+        progress.contains("Finished 1/1 frames (1 described, 0 cached, 0 failed)"),
+        "{progress}"
+    );
     assert_eq!(report["provider"], "local");
     assert_eq!(report["model"], "local:vision-small");
     assert_eq!(report["data_policy"], Value::Null);
@@ -309,7 +313,7 @@ fn frames_through_a_local_provider_send_standard_fields_and_cache_per_provider()
         "{body:?}"
     );
     // Same pass again: served from the cache, no request.
-    let again = env.ok(&[
+    let (again, progress) = env.ok_with_stderr(&[
         "describe",
         "frames",
         &video,
@@ -318,6 +322,10 @@ fn frames_through_a_local_provider_send_standard_fields_and_cache_per_provider()
         "--model",
         "local:vision-small",
     ]);
+    assert!(
+        progress.contains("Finished 1/1 frames (0 described, 1 cached, 0 failed)"),
+        "{progress}"
+    );
     assert_eq!(again["counts"]["cached"], 1);
     assert_eq!(server.requests().len(), 1);
     // The bare ID is OpenRouter's: no shared entry, so it needs a key.
@@ -348,7 +356,7 @@ fn frames_through_a_local_provider_send_standard_fields_and_cache_per_provider()
     assert_eq!(server.requests().len(), 2);
 
     // A completed request whose answer is not JSON is still counted as spent.
-    let mixed = env.ok(&[
+    let (mixed, progress) = env.ok_with_stderr(&[
         "describe",
         "frames",
         &video,
@@ -359,6 +367,10 @@ fn frames_through_a_local_provider_send_standard_fields_and_cache_per_provider()
         "--model",
         "local:half-bad",
     ]);
+    assert!(
+        progress.contains("Finished 2/2 frames (1 described, 0 cached, 1 failed)"),
+        "{progress}"
+    );
     assert_eq!(mixed["counts"]["failed"], 1);
     assert_eq!(mixed["counts"]["described"], 1);
     assert_eq!(mixed["cost_usd"], 0.5);
@@ -398,7 +410,57 @@ fn a_run_where_every_answer_fails_still_reports_what_it_cost() {
     ]);
     assert!(error.contains("every frame description failed"), "{error}");
     assert!(error.contains("cost $0.25"), "{error}");
+    // The progress line never claims a frame was described.
+    assert!(
+        error.contains("Finished 1/1 frames (0 described, 0 cached, 1 failed)"),
+        "{error}"
+    );
+    assert!(!error.contains("Described"), "{error}");
     assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn concurrent_frame_progress_counts_each_outcome() {
+    let env = Env::new();
+    let server = Server::start(env.path());
+    env.ok(&["providers", "add", "local", "--base-url", &server.base()]);
+    let video = env.video();
+    // 30 frames over 4 workers; the server's first half-bad answer is not JSON.
+    let (report, progress) = env.ok_with_stderr(&[
+        "describe",
+        "frames",
+        &video,
+        "--every",
+        "1",
+        "--concurrency",
+        "4",
+        "--model",
+        "local:half-bad",
+    ]);
+    let lines: Vec<&str> = progress
+        .lines()
+        .filter(|l| l.starts_with("Finished "))
+        .collect();
+    assert_eq!(lines.len(), 2, "{progress}");
+    // Each snapshot's outcomes add up to the frames finished so far.
+    for (line, finished) in lines.iter().zip([25, 30]) {
+        let counts: Vec<usize> = line
+            .split(['(', ',', ' '])
+            .filter_map(|word| word.parse().ok())
+            .collect();
+        assert_eq!(counts.iter().sum::<usize>(), finished, "{line}");
+        assert!(
+            line.starts_with(&format!("Finished {finished}/30 frames (")),
+            "{line}"
+        );
+    }
+    assert_eq!(
+        lines[1],
+        "Finished 30/30 frames (29 described, 0 cached, 1 failed)"
+    );
+    assert_eq!(report["counts"]["described"], 29);
+    assert_eq!(report["counts"]["failed"], 1);
+    assert_eq!(server.requests().len(), 30);
 }
 
 #[test]

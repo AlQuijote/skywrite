@@ -36,7 +36,8 @@ dense pass reuses every frame an earlier survey already described. Results are
 cached per source content hash, exact presentation time, model, prompt version and
 cast. Re-running, widening or overlapping a pass never pays twice, and a run with
 only cached frames needs no API key. Failed frames are not cached; rerun the same
-command to retry them alone.
+command to retry them alone. Progress on stderr, every 25 frames and after the last,
+counts each outcome: `Finished 2/2 frames (1 described, 0 cached, 1 failed)`.
 
 Each result lists the source time, estimated frame number, the persistent JPEG that
 was described (under the cache's `assets/<sha>/exact-frames/`), and a JSON

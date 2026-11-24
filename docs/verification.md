@@ -22,7 +22,11 @@ presentation end includes source-relative delay and gaps. The decoder handles
 codec priming. The cache is regeneratable local evidence, not a signed attestation.
 Existing MediaInfo JSON remains readable; inspection adds explanatory fields.
 A video stream's `rotation` is its display-matrix rotation in degrees (phone
-footage stored landscape reports -90 or 90); FFmpeg decodes it upright.
+footage stored landscape reports -90 or 90); FFmpeg decodes it upright. It is
+ffprobe's whole-degree value, and only quarter turns (90 and 270, either sign)
+swap the displayed width and height. That matches the exact quarter-turn
+matrices phones write; for other angles FFmpeg's own autorotation, which rounds
+the matrix angle, may disagree.
 
 `skywrite verify FILE --expected-duration 10 --duration-tolerance 0.05
 --expected-width 1280 --expected-height 720 --expected-fps 30` performs a fresh
