@@ -98,21 +98,26 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   as a talking shot showing for a few frames between two B-roll clips. Each
   warning gives `timeline_start`, `timeline_end` (seconds), `frames` and
   `source` (`null` for black). **Fades and dissolves are not checked yet.** The
-  check works from clip placement and opacity, not pixels. A take is one clip, or
+  check works from clip placement and opacity, not pixels (stills are
+  decoded once to see whether they cover). A take is one clip, or
   clips that continue it across straight splits on one track (same source,
   contiguous within one frame of the slower clip's source step after frame
   rounding; pieces of one still always continue; the same take continued on
   another track counts as a cut). A take is on screen while its opacity times
   what full-frame opaque cover above it lets through is at least 0.25; black is
   on screen while at least 0.25 of the light reaches the bottom through cover,
-  also around titles and letterboxed pictures. A shot's length is exact on the
+  also around titles and letterboxed pictures; black with an opaque picture on
+  screen (letterbox bars, around a picture-in-picture, under a partial wash) is
+  told apart from black with none, so a gap between letterboxed shots is a
+  black shot. A shot's length is exact on the
   edit's frame grid. It is reported only when both its edges are hard cuts (the
   timeline's start and end count as hard cuts): no visible clip fades anywhere
   in it or in the frame on either side of it, and no take continues at another
   opacity at its edges or inside it. That reports a flash frame, a short cutaway,
   a short overlay or title (also at partial opacity), or a black gap cut in and
-  out, also under a logo; a title or overlay starting or ending near a cut is
-  not a shot. A stretch with a fade, a dissolve or an opacity change is never
+  out, also under a logo or between letterboxed shots; a title or overlay
+  starting or ending near a cut is not a shot (but a full-frame opaque overlay
+  at 0.75 opacity or more hides what is beneath it, so its edges are cuts). A stretch with a fade, a dissolve or an opacity change is never
   reported as brief; when it is under the threshold it is listed in
   `checked.brief_shots_not_checked` (`timeline_start`, `timeline_end`,
   `source`), and a line in `not_checked` gives their count, so you can watch
@@ -120,8 +125,8 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   under full-frame opaque cover on a higher track are hidden. Lengths are
   counted on the edit's frame grid, and a render can be a frame off it
   (measured with FFmpeg 8.0.1: at 29.97 fps a clip after a cut starts one frame
-  late; at 30 fps a clip after a gap can start one frame late or end one frame
-  early; a video whose picture starts after its `source_in` shows black for that
+  late; at 30 fps a clip after a gap or a short clip can start one frame late or
+  end one frame early; a video whose picture starts after its `source_in` shows black for that
   lead). Raise the threshold to match your pacing (for example `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
