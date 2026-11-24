@@ -154,7 +154,8 @@ turn upright; measured: FFmpeg 8.0.1 turns them). Black
 gaps are checked only between pictures that fill the frame to the pixel as the
 renderer fits them: 1366x768 on a 1920x1080 edit is fitted to 1920x1079, so it
 hides what is beneath it but a black gap next to it is not checked.
-Letterboxed pictures, alpha-capable video (QTRLE `argb`, ProRes 4444 with alpha)
+Pictures whose shape is more than 1% off the frame's (letterboxed or
+pillarboxed), alpha-capable video (QTRLE `argb`, ProRes 4444 with alpha)
 and stills with transparent pixels (PNG titles) never count as cover, even when
 every pixel of the video is opaque, so a speaker or a cut under them stays
 visible and can add warnings. Video whose pixel format FFmpeg does not describe,
