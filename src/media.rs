@@ -303,33 +303,12 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         bail!("media contains no streams");
     }
     let start_time = number(format, "start_time").unwrap_or(0.0);
-    // FFmpeg's Matroska/WebM demuxer exposes Segment Duration as an ending
-    // presentation timestamp (the muxer includes a nonzero timestamp origin).
-    // MOV/MP4 and MPEG-TS instead expose elapsed format duration. Never apply
-    // the Matroska correction to those demuxers. This uses header metadata only;
-    // inspection must not scan/decode the complete source.
-    let matroska = format_name
-        .split(',')
-        .any(|name| name == "matroska" || name == "webm");
-    let duration = number(format, "duration")
-        .map(|duration| {
-            if matroska {
-                duration - start_time
-            } else {
-                duration
-            }
-        })
-        .or_else(|| {
-            streams
-                .iter()
-                .filter_map(|stream| {
-                    stream.duration.map(|duration| {
-                        stream.start_time.unwrap_or(start_time) + duration - start_time
-                    })
-                })
-                .max_by(f64::total_cmp)
-        })
-        .unwrap_or(0.0);
+    let duration = presentation_duration(
+        format_name,
+        number(format, "duration"),
+        start_time,
+        &streams,
+    );
     if !duration.is_finite() || duration < 0.0 {
         bail!("media has an invalid duration");
     }
@@ -341,6 +320,64 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         format_name: format_name.to_owned(),
         streams,
     })
+}
+/// Elapsed presentation time from header metadata (inspection must not scan or
+/// decode the complete source).
+///
+/// The demuxers disagree on what the format duration means when the first
+/// timestamp is not zero. Matroska/WebM exposes Segment Duration, which counts
+/// from timestamp 0, so it is the ending timestamp. MPEG-TS exposes the elapsed
+/// span. MOV/MP4 exposes the elapsed span on FFmpeg 6.0 and newer, but FFmpeg
+/// 5.1 returns the movie header's duration, which also counts from 0 (a 3-s
+/// file starting at 5 s reads 8 s there). For MOV/MP4 the elapsed span is
+/// therefore taken from the audio and video streams' own start and duration,
+/// which every version reports the same way; the format duration is used when
+/// there are none or one lacks them. Subtitle and data tracks are left out, as
+/// FFmpeg's own span leaves out their outliers: a 3-s fragmented MP4 with a
+/// `mov_text` cue from 1 to 10 s reads 3.2 s, its subtitle stream 19.2 s.
+fn presentation_duration(
+    format_name: &str,
+    format_duration: Option<f64>,
+    start_time: f64,
+    streams: &[MediaStream],
+) -> f64 {
+    let is = |names: &[&str]| format_name.split(',').any(|name| names.contains(&name));
+    let stream_span = || {
+        streams
+            .iter()
+            .filter_map(|stream| {
+                stream
+                    .duration
+                    .map(|duration| stream.start_time.unwrap_or(start_time) + duration - start_time)
+            })
+            .max_by(f64::total_cmp)
+    };
+    let media_stream_span = || {
+        let media: Vec<&MediaStream> = streams
+            .iter()
+            .filter(|s| s.codec_type == "audio" || s.codec_type == "video")
+            .collect();
+        if media.is_empty()
+            || media
+                .iter()
+                .any(|s| s.duration.is_none() || s.start_time.is_none())
+        {
+            return None;
+        }
+        media
+            .iter()
+            .map(|s| s.start_time.unwrap_or(start_time) + s.duration.unwrap_or(0.0) - start_time)
+            .max_by(f64::total_cmp)
+    };
+    if is(&["matroska", "webm"]) {
+        format_duration.map(|duration| duration - start_time)
+    } else if is(&["mov", "mp4"]) {
+        media_stream_span().or(format_duration)
+    } else {
+        format_duration
+    }
+    .or_else(stream_span)
+    .unwrap_or(0.0)
 }
 fn string(value: &Value, key: &str) -> Option<String> {
     value[key].as_str().map(str::to_owned)
@@ -892,5 +929,85 @@ mod display_tests {
             (Some(16), None)
         );
         assert_eq!(stream(Some(16), None, None).display_size(), None);
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    fn stream(start_time: Option<f64>, duration: Option<f64>) -> MediaStream {
+        typed("audio", start_time, duration)
+    }
+
+    fn typed(codec_type: &str, start_time: Option<f64>, duration: Option<f64>) -> MediaStream {
+        MediaStream {
+            index: 0,
+            codec_type: codec_type.into(),
+            codec_name: None,
+            duration,
+            start_time,
+            width: None,
+            height: None,
+            rotation: None,
+            sample_rate: None,
+            channels: None,
+            avg_frame_rate: None,
+            r_frame_rate: None,
+            time_base: None,
+        }
+    }
+
+    #[test]
+    fn mp4_starting_late_reads_its_elapsed_span_on_every_ffmpeg() {
+        // ffprobe of one 3-s H.264/AAC MP4 whose video starts at 5 s (AAC
+        // priming puts audio at 4.978 s): FFmpeg 5.1.2 reports format duration
+        // 8.0, FFmpeg 6.1.1 through 9.1 report 3.022; the streams agree on all.
+        let streams = [
+            stream(Some(5.0), Some(3.0)),
+            stream(Some(4.978), Some(3.021333)),
+        ];
+        let mov = "mov,mp4,m4a,3gp,3g2,mj2";
+        for format_duration in [8.0, 3.022] {
+            let d = presentation_duration(mov, Some(format_duration), 4.978, &streams);
+            assert!((d - 3.022).abs() < 1e-6, "{format_duration}: {d}");
+        }
+        // Subtitle and data tracks do not extend it (FFmpeg 8.0.1, fragmented
+        // MP4 with a mov_text cue from 1 to 10 s: format 3.2 s, subtitle 19.2 s).
+        let with_text = [
+            typed("video", Some(0.0), Some(3.0)),
+            typed("subtitle", Some(0.0), Some(19.2)),
+            typed("data", Some(0.0), Some(60.0)),
+        ];
+        assert_eq!(presentation_duration(mov, Some(3.2), 0.0, &with_text), 3.0);
+        let text_only = [typed("subtitle", Some(0.0), Some(19.2))];
+        assert_eq!(presentation_duration(mov, Some(3.2), 0.0, &text_only), 3.2);
+        // Without complete audio/video timing the format duration is used.
+        let partial = [stream(Some(0.0), None)];
+        assert_eq!(presentation_duration(mov, Some(2.5), 0.0, &partial), 2.5);
+        assert_eq!(presentation_duration(mov, None, 0.0, &partial), 0.0);
+    }
+
+    #[test]
+    fn matroska_counts_from_zero_and_other_demuxers_use_the_format_duration() {
+        let none = [stream(None, None)];
+        assert_eq!(
+            presentation_duration("matroska,webm", Some(8.0), 5.0, &none),
+            3.0
+        );
+        // MPEG-TS already reports the elapsed span, whatever the stream fields say.
+        let ts = [
+            stream(Some(6.4), Some(3.0)),
+            stream(Some(6.378667), Some(2.88)),
+        ];
+        assert_eq!(
+            presentation_duration("mpegts", Some(3.021333), 6.378667, &ts),
+            3.021333
+        );
+        // No format duration: the longest stream span.
+        assert!(
+            (presentation_duration("wav", None, 1.0, &[stream(Some(1.5), Some(2.0))]) - 2.5).abs()
+                < 1e-12
+        );
     }
 }

@@ -431,7 +431,7 @@ fn audio_segment(
     Ok(format!(
         "[{input}:a:0]asetpts=PTS-STARTPTS,atrim=start={},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,atrim=end_sample={source_samples},{},aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={delay}S:all=1,apad=whole_len={output_samples},atrim=end_sample={output_samples},asetpts=N/SR/TB,{envelope}[{label}]",
         number(trim),
-        speeds.filter(speed, source_samples)?,
+        speeds.filter(speed, source_samples, label)?,
     ))
 }
 
@@ -1160,8 +1160,8 @@ fn display_rotation(path: &Path) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
-/// Stream-copy `path` with an identity display matrix (FFmpeg 7+), falling
-/// back to the legacy `rotate` tag for older builds.
+/// Stream-copy `path` with an identity display matrix (`-display_rotation`,
+/// FFmpeg 6.0+), falling back to the legacy `rotate` tag on 5.1.
 fn clear_display_rotation(
     path: &Path,
     parent: &Path,
@@ -1373,12 +1373,9 @@ mod tests {
         let plain = dir.path().join("plain.mp4");
         let rotated = dir.path().join("rotated.mp4");
         let run = |args: &[&str]| {
-            let status = std::process::Command::new("ffmpeg")
-                .args(["-v", "error", "-y"])
-                .args(args)
-                .status()
-                .unwrap();
-            assert!(status.success());
+            let mut all = process::args(&["-v", "error", "-y"]);
+            all.extend(process::args(args));
+            process::run("ffmpeg", &all, Duration::from_secs(60), 1024 * 1024).unwrap();
         };
         run(&[
             "-f",
@@ -1389,15 +1386,37 @@ mod tests {
             "libx264",
             plain.to_str().unwrap(),
         ]);
-        run(&[
-            "-display_rotation",
-            "-90",
-            "-i",
-            plain.to_str().unwrap(),
-            "-c",
-            "copy",
-            rotated.to_str().unwrap(),
-        ]);
+        // FFmpeg 6.0+ sets the display matrix with `-display_rotation`; 5.1 has
+        // no such option and writes it from the legacy `rotate` tag instead,
+        // which is also the path clear_display_rotation falls back to there.
+        let help = process::run(
+            "ffmpeg",
+            &process::args(&["-hide_banner", "-h", "full"]),
+            Duration::from_secs(60),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        if String::from_utf8_lossy(&help.stdout).contains("-display_rotation") {
+            run(&[
+                "-display_rotation",
+                "-90",
+                "-i",
+                plain.to_str().unwrap(),
+                "-c",
+                "copy",
+                rotated.to_str().unwrap(),
+            ]);
+        } else {
+            run(&[
+                "-i",
+                plain.to_str().unwrap(),
+                "-c",
+                "copy",
+                "-metadata:s:v:0",
+                "rotate=-90",
+                rotated.to_str().unwrap(),
+            ]);
+        }
         assert_eq!(display_rotation(&plain).unwrap(), None);
         assert!(display_rotation(&rotated).unwrap().is_some());
         let (cleared, _cleanup) = clear_display_rotation(&rotated, dir.path()).unwrap();

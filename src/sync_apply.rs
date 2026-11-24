@@ -203,11 +203,14 @@ fn edit_path(asset: &Path, base: &Path) -> PathBuf {
         .unwrap_or_else(|_| asset.to_path_buf())
 }
 
+/// Frames within this fraction of a frame of a boundary count as on it, so
+/// float noise in a mapping never moves a placement by a whole frame.
+const FRAME_SNAP: f64 = 1e-6;
 fn ceil_frame(fps: Rational, seconds: f64) -> u64 {
-    (seconds * fps.value() - 1e-6).ceil().max(0.0) as u64
+    (seconds * fps.value() - FRAME_SNAP).ceil().max(0.0) as u64
 }
 fn floor_frame(fps: Rational, seconds: f64) -> u64 {
-    (seconds * fps.value() + 1e-6).floor().max(0.0) as u64
+    (seconds * fps.value() + FRAME_SNAP).floor().max(0.0) as u64
 }
 
 /// Place one segment against one reference clip, or `None` without overlap.
@@ -236,14 +239,15 @@ fn place(
     let start = fps.seconds(first);
     let end = fps.seconds(last);
     let source_in = (reference.source_in + sv * (start - reference.start) - o) / k;
-    let source_in = if source_in < 0.0 && source_in > -1e-9 {
-        0.0
-    } else {
-        source_in
-    };
-    if source_in < 0.0 {
+    // `first` may sit up to FRAME_SNAP of a frame before timeline(lo), which
+    // puts source_in that far (in asset time) before the asset's start; that is
+    // the snap, not a missing overlap. A 9.1-decoded scratch track gave an
+    // offset of 18.000000004 s at 24 fps: start 18 s, source_in -4e-9 s.
+    let snap = FRAME_SNAP / fps.value() * sv / k + 1e-12;
+    if source_in < -snap {
         return None;
     }
+    let source_in = source_in.max(0.0);
     let speed = if sv == 1.0 {
         segment.playback_rate
     } else {

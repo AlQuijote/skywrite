@@ -7,8 +7,12 @@ fn inspect_reports_mxf_color_labels_alongside_ffmpeg_decoding() {
     let mxf = dir.path().join("tagged.mxf");
     let made = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
-        .arg("testsrc=d=0.2:r=25,format=yuv422p10le,setparams=color_trc=bt709:color_primaries=bt709:colorspace=bt709")
-        .args(["-c:v", "prores"])
+        .arg("testsrc=d=0.2:r=25,format=yuv422p,setparams=color_trc=bt709:color_primaries=bt709:colorspace=bt709")
+        // MPEG-2 carries the labels in its bitstream on every FFmpeg (5.1+).
+        // FFmpeg 5.1's ProRes encoder leaves them unset there, and 5.1's ffprobe
+        // then reports the stream as unlabelled although the MXF header has them.
+        .args(["-color_trc", "bt709", "-color_primaries", "bt709", "-colorspace", "bt709"])
+        .args(["-c:v", "mpeg2video"])
         .arg(&mxf)
         .output()
         .unwrap();

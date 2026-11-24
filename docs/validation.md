@@ -104,13 +104,84 @@ by version:
 Before the change, both tests failed every run on 7.0.2, 7.1 and 7.1.1; after
 it, both pass on all nine builds.
 
-On this CPU the static 5.1.2 to 8.1.2 builds (not 9.1 or Ubuntu's 8.0.1) have a
-separate fault in their bundled librubberband: after about 0.1 s or more of
-leading digital silence on float input, `rubberband` output stays about 15 dB
-low (RMS 0.0154 instead of 0.088 for FFmpeg's default `sine` source). The same
-builds are correct on an Intel Core i7-8550U. Skywrite's rubberband pad is
-leading silence, so speed-0.5 clip audio renders quiet there; the delayed-video
-test's prefix-level check was skipped for those builds in the runs above.
+Checked again 2026-11-24 with the full `cargo test --locked` once per build on
+an AMD EPYC 4585PX (Zen 5, Boat sandbox): the nine builds above, each first on
+`PATH`. Four more behaviours differed by version or exposed a skywrite bug; all
+nine builds now pass the whole suite:
+
+- Rubberband after silence. Skywrite used to pad the stretcher's input with
+  16384 samples of silence at the start, so every stretched clip began with an
+  artificial onset after silence, and rubberband's phase vocoder answers that
+  differently by library version. At 0.5x (`window=short:channels=together`,
+  plain `ffmpeg`, same on an Intel Core i7-8550U): pink noise came out 3.5 dB
+  quieter in its first 150 ms than with the pad described next (5.1.2, 8.1.2
+  and 9.1 alike); a steady 440 Hz `sine` tone came out 15 dB low for the first
+  150 ms with the librubberband in the static 5.1.2–7.1.1 builds and for the
+  whole clip with the one in static 8.0.1 and 8.1.2 (9.1: 4.5 dB low from 50 to
+  150 ms). The pad before the content is now the content's own first samples,
+  time-reversed, so the input is continuous where the clip starts; a clip
+  shorter than the pad is looped to fill it first. Then the tone is within
+  0.3 dB of its steady level from the first 50 ms on every build, and pink noise
+  keeps the same 1–1.4 dB offset from an unstretched reference in its first
+  150 ms as later in the clip. Short clips, stretched alone against the same
+  samples inside a long stretch (5.1.2 and 9.1, Zen 5): at 0.125x and 0.5x,
+  25-ms to 400-ms clips of pink noise or a 440 Hz tone are within 1.5 dB (the
+  silent pad: down to -9.2 dB for the 25-ms tone at 0.5x, -5.8 dB for 25 ms of
+  pink noise; a reversed pad left silent where the clip is shorter: -10.4 dB),
+  pink noise within 2.1 dB at 0.8x to 2x (cut at its largest sample, a 25-ms
+  clip at 0.8x came out +3.9 dB, the silent pad +3.1 dB). At 0.8x and faster, a
+  short pure tone depends on the phase at the cut with every pre-roll tried: cut
+  at a zero crossing the reversed pre-roll lost 2–9 dB (the silent pad
+  0.5–3 dB), cut at a peak it was within 1.6 dB; a sign-inverted reversal
+  behaves the other way round. At 8x a 25-ms clip yields 150 samples, too few to measure a level
+  (even real preceding audio varied by -14 to +8 dB). Reproduce the 8.0/8.1 case with
+  `ffmpeg -f lavfi -i sine=440:sample_rate=48000:d=4 -af
+  "adelay=4800S:all=1,rubberband=tempo=0.5:window=short,atrim=start=1:end=7,astats=measure_perchannel=none:measure_overall=RMS_level"
+  -f null -`: RMS -36.3 dB on static 8.0.1/8.1.2, -21.1 dB on the others and
+  with `adelay=0S`. This is not a fault of those builds alone: a pure tone
+  after digital silence *inside* a clip can still lose up to 15 dB, depending on
+  its frequency, the speed and the library (on 9.1 too: 2 kHz at 0.25x;
+  `transients=smooth` moves the failures to other pairs rather than removing
+  them). Broadband sound (speech, music, noise) is not affected that way. If a
+  stretched sustained tone matters, check its level or use `--stretcher atempo`.
+  An earlier note here put the quiet stretch down to Zen 5 CPUs; that was wrong,
+  it reproduces on Intel and depends on the signal, not the CPU.
+- MP4 duration on FFmpeg 5.1. For a MOV/MP4 file whose first timestamp is not
+  zero, FFmpeg 5.1 reports the movie header's duration, which counts from 0
+  (a 3-s file starting at 5 s reads 8 s); 6.0 and newer report the elapsed 3 s.
+  Skywrite now takes the elapsed span of a MOV/MP4 from its audio and video
+  streams' own start
+  and duration, which every version reports the same way, so source ranges past
+  the real end are refused on 5.1 too.
+- Test fixtures on FFmpeg 5.1 only: it has no `-display_rotation` (6.0+; the
+  rotation fixtures write the legacy `rotate` tag there, which is also the path
+  skywrite uses to clear a copied rotation on 5.1), and its ProRes encoder
+  leaves the colour labels out of the bitstream, after which 5.1's ffprobe
+  reports the stream unlabelled although the MXF header has the labels (the MXF
+  colour fixture is MPEG-2, labelled in both on every version).
+- `sync apply` on FFmpeg 9.1. Its decode of the test's camera scratch track gave
+  an offset of 18.000000004 s; the frame-grid snap put the clip on 18 s, which
+  made `source_in` -4e-9 s, and a 1e-9 s clamp then dropped the only placement
+  ("does not overlap"). The clamp now allows exactly the snap (1e-6 frame), on
+  every version.
+- `verify --black`/`--frozen` on FFmpeg 7.0 and 7.1. The detectors ran on a
+  `split` copy of the counting decode's frames, in a `-filter_complex` branch
+  ending in `nullsink`, with `tpad` appending one white frame so spans that run
+  to the end close there. FFmpeg 7.0.2, 7.1 and 7.1.1 then abort after the last
+  frame (`Assertion best_input >= 0 failed at fftools/ffmpeg_filter.c`, SIGABRT),
+  because that branch still produces a frame after the input ends; 5.1, 6.1 and
+  8.0 or newer finish. Plain repro:
+  `ffmpeg -i in.mp4 -filter_complex "[0:v:0]split=2[counted][detect];[detect]tpad=stop=1:stop_mode=add:color=white,blackdetect=d=0,nullsink" -map "[counted]" -f null -`
+  (rc 134 on 7.0.2/7.1.1, 0 on 5.1.2, 6.1.1, 8.0.1, 9.1; without `tpad`, rc 0
+  everywhere). The detectors now run in their own decode, as its only output,
+  which works on every version and reports the same spans (black to the end of a 4-s clip:
+  2.5–4 s; a freeze from 1.467 s: closed at 4 s, on 5.1.2, 7.0.2, 7.1, 7.1.1 and
+  9.1). Two verify test fixtures depended on the encoding FFmpeg: an MP4 whose
+  video is offset 1 s by `-itsoffset` starts at 0 on 5.1 and 6.1, because their
+  CLI fills the gap with copies of the first frame (now encoded with
+  `-fps_mode passthrough`), and FFmpeg 5.1's Matroska muxer delays VP9 video by
+  Opus's 7-ms pre-skip (the test measures the 3 s of video from the video's own
+  start).
 
 ## Dual-system sound: camera scratch track and separate recorder
 

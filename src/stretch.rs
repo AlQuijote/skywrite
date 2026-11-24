@@ -12,9 +12,10 @@
 //! latency, so its output lands off by an amount that depends on speed (10 ms
 //! clicks, short window, FFmpeg 8.0.1, librubberband 4.0: 14.7 ms early at 0.5x,
 //! 6.1 ms late at 2x). Skywrite pads the input
-//! with [`RUBBERBAND_PAD`] samples of silence at each end and drops the leading
-//! output samples that a click calibration measured for that exact speed and
-//! graph on this FFmpeg. `atempo` (WSOLA) cannot be corrected the same way: its
+//! with [`RUBBERBAND_PAD`] samples at each end (before: the clip's own first
+//! samples, time-reversed; after: silence) and drops the leading output samples
+//! that a click calibration measured for that exact speed and graph on this
+//! FFmpeg. `atempo` (WSOLA) cannot be corrected the same way: its
 //! offset moves by up to 16 ms between events (3-36 ms early at 0.5-2x, up to
 //! about 60 ms early at 0.125-0.25x).
 use anyhow::{Context, Result, bail, ensure};
@@ -35,10 +36,21 @@ const _: () = assert!(RESAMPLE_RATE * 1001 / 1000 <= i32::MAX as u64);
 /// keeps stereo channels phase-coherent (lower spectral distortion in mono).
 /// `pitchq` has no effect at pitch 1; transients stay at the default `crisp`.
 pub const RUBBERBAND_OPTIONS: &str = "window=short:channels=together";
-/// Silence (48 kHz samples) added before and after rubberband's input. It must
-/// exceed the latency at every speed so the leading drop is never negative and
-/// the stretcher flushes all real content: 16384 / 8 = 2048 output samples at
-/// the fastest speed, against a measured offset below 700.
+/// Samples (48 kHz) added before and after rubberband's input. It must exceed
+/// the latency at every speed so the leading drop is never negative and the
+/// stretcher flushes all real content: 16384 / 8 = 2048 output samples at the
+/// fastest speed, against a measured offset below 700.
+///
+/// The pad before the content is the content's own first samples in reverse
+/// (content shorter than the pad is repeated to fill it first), so the signal
+/// is continuous where the content starts. A silent pad gave every stretched clip an
+/// artificial onset there, and rubberband's phase vocoder answers an onset after
+/// silence differently by library version: at 0.5x, pink noise came out 3.5 dB
+/// quieter in its first 150 ms than with this pad on every FFmpeg checked
+/// (5.1.2 to 9.1), and a steady 440 Hz tone 15 dB low for 150 ms (the
+/// librubberband in static 5.1.2 to 7.1.1) or for the whole clip (static 8.0.1
+/// and 8.1.2). The pad after the content is silence, which only flushes the
+/// stretcher.
 pub const RUBBERBAND_PAD: u64 = 16_384;
 /// Calibration bursts: 50 ms Hann-windowed 2 kHz tone, one per second from 0.5 s
 /// (long enough to survive an 8x stretch; 10 ms bursts lose most of their energy).
@@ -170,8 +182,9 @@ impl SpeedFilters {
 
     /// FFmpeg filters that play 48 kHz audio of `input_samples` samples at
     /// `speed` source seconds per output second, keeping 48 kHz. The rubberband
-    /// graph outputs exactly `round(input_samples / speed)` samples.
-    pub fn filter(&self, speed: f64, input_samples: u64) -> Result<String> {
+    /// graph outputs exactly `round(input_samples / speed)` samples; it branches
+    /// internally, using link labels that start with `label` (unique per graph).
+    pub fn filter(&self, speed: f64, input_samples: u64, label: &str) -> Result<String> {
         if speed == 1.0 {
             return Ok("anull".into());
         }
@@ -193,7 +206,7 @@ impl SpeedFilters {
                 let end = start + (input_samples as f64 / speed).round() as u64;
                 Ok(format!(
                     "{},atrim=start_sample={start}:end_sample={end},asetpts=N/SR/TB",
-                    rubberband_core(speed)
+                    rubberband_core(speed, label, input_samples)
                 ))
             }
             None => bail!("speed {speed} needs a time-stretcher that was not resolved"),
@@ -251,8 +264,11 @@ fn atempo(speed: f64) -> String {
 
 /// Padded rubberband stretch; calibration measures exactly this graph. Above
 /// 2x it chains 2x stages: one stage at 4-8x drops most of a short event and
-/// moves it by up to 28 ms, a chain of 2x stages by under 5 ms.
-fn rubberband_core(speed: f64) -> String {
+/// moves it by up to 28 ms, a chain of 2x stages by under 5 ms. The leading pad
+/// is the first [`RUBBERBAND_PAD`] of the `input_samples` reversed (see there);
+/// shorter input is looped to that length first, so a 25-ms clip is not
+/// stretched after a mostly silent pad.
+fn rubberband_core(speed: f64, label: &str, input_samples: u64) -> String {
     let mut stages = Vec::new();
     let mut remaining = speed;
     while remaining > 2.0 {
@@ -262,8 +278,16 @@ fn rubberband_core(speed: f64) -> String {
     stages.push(format!(
         "rubberband=tempo={remaining:.12}:{RUBBERBAND_OPTIONS}"
     ));
+    // aloop=loop=k plays k + 1 copies (and loops what it has if the stream ends
+    // early); apad keeps the pad length exact in that case.
+    let fill = if input_samples >= RUBBERBAND_PAD {
+        String::new()
+    } else {
+        let n = input_samples.max(1);
+        format!("aloop=loop={}:size={n},", RUBBERBAND_PAD.div_ceil(n) - 1)
+    };
     format!(
-        "adelay={RUBBERBAND_PAD}S:all=1,apad=pad_len={RUBBERBAND_PAD},{}",
+        "asplit=2[{label}_rbin][{label}_rbhead];[{label}_rbhead]{fill}atrim=end_sample={RUBBERBAND_PAD},apad=whole_len={RUBBERBAND_PAD},areverse[{label}_rbpre];[{label}_rbpre][{label}_rbin]concat=n=2:v=0:a=1,apad=pad_len={RUBBERBAND_PAD},{}",
         stages.join(",")
     )
 }
@@ -322,7 +346,7 @@ fn calibrate(speed: f64) -> Result<Calibration> {
     args.push(input.into_os_string());
     let graph = format!(
         "aformat=sample_fmts=fltp:channel_layouts=stereo,{}",
-        rubberband_core(speed)
+        rubberband_core(speed, "calibration", source_len as u64)
     );
     args.extend(crate::process::args(&[
         "-filter_threads",
@@ -410,17 +434,19 @@ mod tests {
     fn unit_and_drift_speeds_ignore_the_stretcher() {
         for stretcher in [None, Some(Stretcher::Atempo), Some(Stretcher::Rubberband)] {
             let filters = fixed(stretcher, Vec::new());
-            assert_eq!(filters.filter(1.0, 48_000).unwrap(), "anull");
+            assert_eq!(filters.filter(1.0, 48_000, "a").unwrap(), "anull");
             assert_eq!(
-                filters.filter(1.0005003119303504, 48_000).unwrap(),
+                filters.filter(1.0005003119303504, 48_000, "a").unwrap(),
                 "asetrate=480240150,aresample=480000000,asetrate=48000"
             );
             assert_eq!(
-                filters.filter(0.999999, 48_000).unwrap(),
+                filters.filter(0.999999, 48_000, "a").unwrap(),
                 "asetrate=479999520,aresample=480000000,asetrate=48000"
             );
             assert_eq!(
-                filters.filter(1.0 + RESAMPLE_SPEED_LIMIT, 48_000).unwrap(),
+                filters
+                    .filter(1.0 + RESAMPLE_SPEED_LIMIT, 48_000, "a")
+                    .unwrap(),
                 "asetrate=480480000,aresample=480000000,asetrate=48000"
             );
         }
@@ -433,13 +459,16 @@ mod tests {
     #[test]
     fn atempo_chains_across_the_full_range() {
         let filters = fixed(Some(Stretcher::Atempo), Vec::new());
-        assert_eq!(filters.filter(1.01, 1).unwrap(), "atempo=1.010000000000");
         assert_eq!(
-            filters.filter(8.0, 1).unwrap(),
+            filters.filter(1.01, 1, "a").unwrap(),
+            "atempo=1.010000000000"
+        );
+        assert_eq!(
+            filters.filter(8.0, 1, "a").unwrap(),
             "atempo=2,atempo=2,atempo=2.000000000000"
         );
         assert_eq!(
-            filters.filter(0.125, 1).unwrap(),
+            filters.filter(0.125, 1, "a").unwrap(),
             "atempo=0.5,atempo=0.5,atempo=0.500000000000"
         );
     }
@@ -455,8 +484,8 @@ mod tests {
             }],
         );
         assert_eq!(
-            filters.filter(2.0, 48_001).unwrap(),
-            "adelay=16384S:all=1,apad=pad_len=16384,rubberband=tempo=2.000000000000:window=short:channels=together,atrim=start_sample=8500:end_sample=32501,asetpts=N/SR/TB"
+            filters.filter(2.0, 48_001, "a3_1").unwrap(),
+            "asplit=2[a3_1_rbin][a3_1_rbhead];[a3_1_rbhead]atrim=end_sample=16384,apad=whole_len=16384,areverse[a3_1_rbpre];[a3_1_rbpre][a3_1_rbin]concat=n=2:v=0:a=1,apad=pad_len=16384,rubberband=tempo=2.000000000000:window=short:channels=together,atrim=start_sample=8500:end_sample=32501,asetpts=N/SR/TB"
         );
         let chained = fixed(
             Some(Stretcher::Rubberband),
@@ -467,11 +496,11 @@ mod tests {
             }],
         );
         assert_eq!(
-            chained.filter(6.0, 6).unwrap(),
-            "adelay=16384S:all=1,apad=pad_len=16384,rubberband=tempo=2:window=short:channels=together,rubberband=tempo=2:window=short:channels=together,rubberband=tempo=1.500000000000:window=short:channels=together,atrim=start_sample=3000:end_sample=3001,asetpts=N/SR/TB"
+            chained.filter(6.0, 6, "t").unwrap(),
+            "asplit=2[t_rbin][t_rbhead];[t_rbhead]aloop=loop=2730:size=6,atrim=end_sample=16384,apad=whole_len=16384,areverse[t_rbpre];[t_rbpre][t_rbin]concat=n=2:v=0:a=1,apad=pad_len=16384,rubberband=tempo=2:window=short:channels=together,rubberband=tempo=2:window=short:channels=together,rubberband=tempo=1.500000000000:window=short:channels=together,atrim=start_sample=3000:end_sample=3001,asetpts=N/SR/TB"
         );
-        assert!(filters.filter(1.5, 1).is_err());
-        assert!(fixed(None, Vec::new()).filter(1.5, 1).is_err());
+        assert!(filters.filter(1.5, 1, "a").is_err());
+        assert!(fixed(None, Vec::new()).filter(1.5, 1, "a").is_err());
     }
 
     #[test]
@@ -514,6 +543,178 @@ mod tests {
                 "{speed}: {calibration:?}"
             );
             assert!(calibration.spread_samples <= MAX_CALIBRATION_SPREAD);
+        }
+    }
+
+    /// Stretch `input` (mono f32 at 48 kHz) through `graph`; mono f32 out.
+    fn stretch_raw(dir: &std::path::Path, input: &[f32], graph: &str) -> Vec<f32> {
+        let path = dir.join("in.f32");
+        std::fs::write(
+            &path,
+            input
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut args = crate::process::args(&[
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-threads",
+            "1",
+            "-f",
+            "f32le",
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-i",
+        ]);
+        args.push(path.into_os_string());
+        let graph = format!("aformat=sample_fmts=fltp:channel_layouts=stereo,{graph}");
+        args.extend(crate::process::args(&[
+            "-filter_threads",
+            "1",
+            "-af",
+            &graph,
+            "-ac",
+            "1",
+            "-f",
+            "f32le",
+            "-",
+        ]));
+        let out = crate::process::run("ffmpeg", &args, Duration::from_secs(120), 64 << 20).unwrap();
+        let samples = out.stdout.as_chunks::<4>().0.iter();
+        samples.map(|b| f32::from_le_bytes(*b)).collect()
+    }
+
+    fn rms(x: &[f32]) -> f64 {
+        (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64).sqrt()
+    }
+
+    fn rubberband_at(speed: f64) -> SpeedFilters {
+        SpeedFilters {
+            requested: StretcherChoice::Rubberband,
+            rubberband_available: Some(true),
+            stretcher: Some(Stretcher::Rubberband),
+            calibrations: vec![calibrate(speed).unwrap()],
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A clip stretched on its own keeps the level its samples have inside a
+    /// long stretch. Before the reversed pre-roll, the silent pad made a 25-ms
+    /// 440 Hz clip 9 dB quiet at 0.5x and 6 dB at 0.125x (25-ms pink noise 3 dB
+    /// at 0.5x); a reversed pad left silent where the clip is shorter than it
+    /// still lost 10 dB on the 25-ms tone. Slowed-down clips are checked: at 2x
+    /// and above, short pure tones vary by several dB with the phase at the cut
+    /// whatever the pre-roll (docs/validation.md), so only noise is checked at 2x.
+    #[test]
+    fn short_clips_keep_their_level_through_rubberband() {
+        if !rubberband_available().unwrap() {
+            eprintln!(
+                "skipping short_clips_keep_their_level_through_rubberband: this FFmpeg has no rubberband filter"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let noise_file = dir.path().join("noise.s16");
+        let mut args = crate::process::args(&[
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=color=pink:amplitude=0.25:sample_rate=48000:duration=2:seed=11",
+            "-ac",
+            "1",
+            "-f",
+            "s16le",
+        ]);
+        args.push(noise_file.clone().into_os_string());
+        crate::process::run("ffmpeg", &args, Duration::from_secs(60), 1 << 20).unwrap();
+        let noise: Vec<f32> = std::fs::read(&noise_file)
+            .unwrap()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
+            .collect();
+        let tone: Vec<f32> = (0..96_000)
+            .map(|i| {
+                let v = 0.25 * (std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin();
+                ((v * 32768.0).round() / 32768.0) as f32
+            })
+            .collect();
+        // (speed, signals, largest level difference in dB)
+        for (speed, signals, limit) in [
+            (0.125, vec![("noise", &noise), ("tone", &tone)], 2.0),
+            (0.5, vec![("noise", &noise), ("tone", &tone)], 2.0),
+            (2.0, vec![("noise", &noise)], 3.0),
+        ] {
+            let filters = rubberband_at(speed);
+            for (name, source) in signals {
+                let graph = filters.filter(speed, source.len() as u64, "t").unwrap();
+                let long = stretch_raw(dir.path(), source, &graph);
+                assert_eq!(
+                    long.len() as u64,
+                    (source.len() as f64 / speed).round() as u64
+                );
+                let at = 48_000;
+                for n in [1_200usize, 4_800, 19_200] {
+                    let out_range = |a: usize| (a as f64 / speed).round() as usize;
+                    let reference = &long[out_range(at)..out_range(at + n)];
+                    let graph = filters.filter(speed, n as u64, "t").unwrap();
+                    let out = stretch_raw(dir.path(), &source[at..at + n], &graph);
+                    assert_eq!(out.len(), reference.len(), "{name} {speed}x {n}");
+                    let db = 20.0 * (rms(&out) / rms(reference)).log10();
+                    let head = out.len().min(7_200);
+                    let head_db = 20.0 * (rms(&out[..head]) / rms(&reference[..head])).log10();
+                    assert!(
+                        db.abs() <= limit && head_db.abs() <= limit,
+                        "{name} at {speed}x, {n} samples: {db:+.2} dB overall, {head_db:+.2} dB in the first 150 ms"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A burst inside a clip shorter than the pad lands where the calibration
+    /// says, at every speed (the pre-roll is the clip itself, looped).
+    #[test]
+    fn short_clip_bursts_land_on_time_through_rubberband() {
+        if !rubberband_available().unwrap() {
+            eprintln!(
+                "skipping short_clip_bursts_land_on_time_through_rubberband: this FFmpeg has no rubberband filter"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let template = burst();
+        let mut clip = vec![0f32; 9_600];
+        let at = 4_800;
+        for (i, v) in template.iter().enumerate() {
+            clip[at + i] = (0.5 * v) as f32;
+        }
+        let half = (BURST_SAMPLES - 1) as f64 / 2.0;
+        for speed in [0.125, 0.5, 2.0, 8.0] {
+            let filters = rubberband_at(speed);
+            let graph = filters.filter(speed, clip.len() as u64, "t").unwrap();
+            let out = stretch_raw(dir.path(), &clip, &graph);
+            assert_eq!(out.len() as u64, (clip.len() as f64 / speed).round() as u64);
+            let (energy, moment) = out.iter().enumerate().fold((0.0, 0.0), |(e, m), (i, v)| {
+                let p = (*v as f64).powi(2);
+                (e + p, m + i as f64 * p)
+            });
+            let error = moment / energy - (at as f64 + half) / speed;
+            assert!(
+                error.abs() <= 192.0,
+                "{speed}x: burst {error:+.0} samples off"
+            );
         }
     }
 }

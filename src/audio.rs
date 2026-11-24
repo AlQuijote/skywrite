@@ -541,7 +541,7 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
     let speed_filters = crate::stretch::SpeedFilters::resolve(options.stretcher, options.tempo)?;
     if let Some(speed) = options.tempo {
         filter.push(',');
-        filter.push_str(&speed_filters.filter(speed, selection_samples)?);
+        filter.push_str(&speed_filters.filter(speed, selection_samples, "tempo")?);
     }
     filter_file(&source, &prepared, &filter, deadline)?;
     let prepared_timing = checked_timing(&prepared)?;
