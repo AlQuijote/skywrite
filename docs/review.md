@@ -92,34 +92,33 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   `checked.dead_air.excluded_by_pause` instead of warned about.
 - `sound_cut_mid_flow`: a clip ends without a fade while its source keeps sounding
   at a similar level, as when applause or a music tail is cut off.
-- `brief_shot`: a picture on screen for less than `--min-shot-seconds` between
-  two hard cuts (default 0.5, allowed 0 to 10; `0` turns the check off;
-  `checked.min_shot_seconds` reports the value used), such as a talking shot
-  showing for a few frames between two B-roll clips. Each warning gives
-  `timeline_start`, `timeline_end` (seconds) and `frames`. **Fades and dissolves
-  are not checked yet.** The check works from clip placement and opacity, not
-  pixels. Each frame's picture is the visible weight of each clip: its opacity,
-  reduced by full-frame opaque video above it, with black taking the rest. Two
-  pictures differ by half the sum of their weight differences: 1 for a cut
-  between full-frame shots, 0.25 when a 25%-opacity full-frame overlay appears.
-  A cut is a frame where the picture differs by at least 0.25 from the frame
-  before (black lies beyond the timeline's ends), and a shot runs from one cut to
-  the next, so its length is exact from the edit. A shot is checked only when
-  both its cuts are hard: no visible clip fades in the shot or in the frame on
-  either side of it, and no take continues at another opacity at its cuts or
-  inside it. That reports a flash frame, a short cutaway, a short overlay at
-  partial opacity, or a black gap cut in and out. A shot with a fade, a dissolve
-  or an opacity change at either cut is never reported as brief; when its clip
-  edges are under the threshold it is listed in `checked.brief_shots_not_checked`
-  (`timeline_start`, `timeline_end`), and a line in `not_checked` gives their
-  count, so you can watch them with `skywrite review cuts`. Not cuts: clips at
-  `opacity: 0`, a straight split that continues the
-  same take on the same track (same source, contiguous within one frame of the
-  slower clip's source step after frame rounding), and cuts hidden under
-  full-frame opaque video on a higher track. Stills, letterboxed pictures and
-  alpha-capable video never dim what is beneath them, so a partial-opacity one
-  must be about twice as opaque to count (a 2-frame PNG at 0.6 is reported, at
-  0.3 it is not). Raise the threshold to match your pacing (for example `1`).
+- `brief_shot`: a take, or black between pictures, on screen for less than
+  `--min-shot-seconds` between two hard cuts (default 0.5, allowed 0 to 10; `0`
+  turns the check off; `checked.min_shot_seconds` reports the value used), such
+  as a talking shot showing for a few frames between two B-roll clips. Each
+  warning gives `timeline_start`, `timeline_end` (seconds), `frames` and
+  `source` (`null` for black). **Fades and dissolves are not checked yet.** The
+  check works from clip placement and opacity, not pixels. A take is one clip, or
+  clips that continue it across straight splits (same source and track,
+  contiguous within one frame of the slower clip's source step after frame
+  rounding; pieces of one still always continue). A take is on screen while its
+  opacity times what full-frame opaque cover above it lets through is at least
+  0.25; black is on screen while no take is. A shot's length is exact from the
+  edit. It is reported only when both its edges are hard cuts: no visible clip
+  fades in it or in the frame on either side of it, and no take continues at
+  another opacity at its edges or inside it. That reports a flash frame, a short
+  cutaway, a short overlay or title (also at partial opacity), or a black gap cut
+  in and out; a title or overlay starting or ending near a cut is not a shot. A
+  stretch with a fade, a dissolve or an opacity change at either edge is never
+  reported as brief; when it is under the threshold it is listed in
+  `checked.brief_shots_not_checked` (`timeline_start`, `timeline_end`,
+  `source`), and a line in `not_checked` gives their count, so you can watch
+  them with `skywrite review cuts`. Clips at `opacity: 0` show nothing, and cuts
+  under full-frame opaque video or stills on a higher track are hidden. Lengths
+  are counted on the edit's frame grid; a render can differ: at 29.97 fps a clip
+  after a cut was measured to start one frame late (FFmpeg 8.0.1), and a video
+  whose picture starts after its `source_in` shows black for that lead. Raise the
+  threshold to match your pacing (for example `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
   `role` are classified by it; otherwise a source without a transcript is a bed.
@@ -132,13 +131,14 @@ Level checks decode short windows of the sources (at most 256 measurements);
 `--no-levels` skips them. They measure source audio with the edit's gains, not the
 final mix, and do not replace listening.
 
-Cover is decided from metadata, not pixels. Only full-frame video (by displayed
-size, so rotated phone footage counts) at full opacity whose pixel format has no
-alpha channel, per FFmpeg's pixel format list, hides what lies beneath it.
-Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE `argb`)
-never count as cover, even when every pixel is opaque, so a speaker or a cut under
-them stays visible and can add warnings. Video whose pixel format FFmpeg does not
-describe is never cover either and is listed in `checked.uncertain_cover_sources`.
+Cover is decided from metadata, not pixels. Only a full-frame picture (video or
+still, by displayed size, so rotated phone footage counts) at full opacity whose
+pixel format has no alpha channel, per FFmpeg's pixel format list, hides what
+lies beneath it. Letterboxed pictures, alpha-capable video (ProRes 4444, QTRLE
+`argb`) and stills with alpha (RGBA PNG titles) never count as cover, even when
+every pixel is opaque, so a speaker or a cut under them stays visible and can add
+warnings. A picture whose pixel format FFmpeg does not describe is never cover
+either and is listed in `checked.uncertain_cover_sources`.
 
 The 0.6-s dead-air default is measured: in three 60-s windows of unedited AMI
 meeting speech (ES2002a) transcribed on device with Parakeet TDT 0.6B v3 (80-ms
