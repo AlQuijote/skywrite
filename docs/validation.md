@@ -60,6 +60,23 @@ reclamation or CDN invalidation. Input cleanup protects local job receipts only;
 use separate project prefixes when independent computers may still need a source.
 Shared outputs are outside the temporary-input purge namespace.
 
+## Remotion export dependencies
+
+Checked 2026-11-24 on Linux (Node 26.13.1, npm 11.20.0, FFmpeg 8.0.1) with a
+synthetic edit (3-s `testsrc2` H.264 clip with a 440-Hz tone, a 660-Hz WAV on an
+audio track; 640×360, 30 fps, 2 s) exported by `skywrite edit export --to
+remotion`. The exported `package.json` pins `remotion` and `@remotion/cli`
+4.0.546 with no `overrides`. `npm install` succeeded; `npm ls zod --all`
+resolved a single version, zod 4.6.7 (the GHSA-mrhx-c7xc-m3w5 fix), deduplicated
+across six dependents; `npm audit` found 0 vulnerabilities. `npm run render`
+wrote `edit.mp4`, which ffprobe reads as H.264 640×360 at 30 fps with 60 frames
+plus AAC 48 kHz stereo, 2.005 s. Remotion printed no version-mismatch warning;
+the previous pins (4.0.539 with a zod 4.6.7 override) printed "Version mismatch …
+For zod, install exact version 4.5.4". On a Mac mini (macOS 27.0.1, FFmpeg 9.0.2),
+install, `npm ls zod` and audit gave the same results, but headless rendering
+timed out at "Waiting for root component to load" for both the old and new pins
+alike, so that environment does not establish a macOS render.
+
 ## Dual-system sound: camera scratch track and separate recorder
 
 Measured 2026-11-15 with FFmpeg 8.0.1 on Linux. What is real and what is
