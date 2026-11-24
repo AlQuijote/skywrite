@@ -856,7 +856,7 @@ fn video_ranges_of_rotated_phone_footage_keep_their_displayed_height() {
         .or(report["error"]["details"]["encoding"].as_str());
     assert_eq!(
         encoding,
-        Some("h264-crf28-h160-noaudio"),
+        Some("h264-crf28-upright-h160-noaudio"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

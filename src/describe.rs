@@ -652,13 +652,15 @@ fn video(args: &VideoArgs) -> Result<Value> {
     let source_sha256 = media::file_sha256(&info.path)?;
     // Never upscale: the clip is encoded at --height or the displayed height,
     // whichever is smaller, rounded down to an even number for H.264 4:2:0.
-    // The encoded height is part of the cache key and the reported encoding.
+    // The encoded height is part of the cache key and the reported encoding;
+    // `upright` marks clips sized by their displayed shape, so descriptions of
+    // rotated footage encoded from its stored shape are not reused.
     let video_height = info
         .video()
         .and_then(|v| v.display_size())
         .map_or(args.height, |(_, h)| h);
     let height = (args.height.min(video_height) & !1).max(2);
-    let encode = format!("h264-crf28-h{height}-noaudio");
+    let encode = format!("h264-crf28-upright-h{height}-noaudio");
     let key = openrouter::cache_key(&[
         VIDEO_PROMPT_VERSION.as_bytes(),
         source_sha256.as_bytes(),
