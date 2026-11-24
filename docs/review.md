@@ -92,7 +92,7 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   `checked.dead_air.excluded_by_pause` instead of warned about.
 - `sound_cut_mid_flow`: a clip ends without a fade while its source keeps sounding
   at a similar level, as when applause or a music tail is cut off.
-- `brief_shot`: a take, or black between pictures, on screen for less than
+- `brief_shot`: a take, or black between full-frame pictures, on screen for less than
   `--min-shot-seconds` between two hard cuts (default 0.5, allowed 0 to 10; `0`
   turns the check off; `checked.min_shot_seconds` reports the value used), such
   as a talking shot showing for a few frames between two B-roll clips. Each
@@ -105,20 +105,22 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   rounding; pieces of one still always continue; the same take continued on
   another track counts as a cut). A take is on screen while its opacity times
   what full-frame opaque cover above it lets through is at least 0.25; black is
-  on screen while at least 0.25 of the light reaches the bottom through cover,
-  also around titles and letterboxed pictures; black with an opaque picture on
-  screen (letterbox bars, around a picture-in-picture, under a partial wash) is
-  told apart from black with none, so a gap between letterboxed shots is a
-  black shot. A shot's length is exact on the
+  on screen while at least 0.25 of the light reaches the bottom through cover.
+  **Black gaps are checked only between full-frame pictures:** the picture goes
+  from fully covered to black, with nothing on it but titles that are not
+  opaque, and back. Every other black change (letterbox bars, black around a
+  picture-in-picture or an opaque logo, black under a partial-opacity picture)
+  is not checked yet. A shot's length is exact on the
   edit's frame grid. It is reported only when both its edges are hard cuts (the
   timeline's start and end count as hard cuts): no visible clip fades anywhere
   in it or in the frame on either side of it, and no take continues at another
   opacity at its edges or inside it. That reports a flash frame, a short cutaway,
-  a short overlay or title (also at partial opacity), or a black gap cut in and
-  out, also under a logo or between letterboxed shots; a title or overlay
-  starting or ending near a cut is not a shot (but a full-frame opaque overlay
-  at 0.75 opacity or more hides what is beneath it, so its edges are cuts). A stretch with a fade, a dissolve or an opacity change is never
-  reported as brief; when it is under the threshold it is listed in
+  a short overlay or title (also at partial opacity), or a black gap between
+  full-frame pictures cut in and out, also under a transparent title; a title
+  or overlay starting or ending near a cut is not a shot (but a full-frame
+  opaque overlay above 0.75 opacity hides what is beneath it, so its edges are
+  cuts). A stretch with a fade, a dissolve or an opacity change, and black that
+  is not between full-frame pictures, is never reported as brief; when it is under the threshold it is listed in
   `checked.brief_shots_not_checked` (`timeline_start`, `timeline_end`,
   `source`), and a line in `not_checked` gives their count, so you can watch
   them with `skywrite review cuts`. Clips at `opacity: 0` show nothing, and cuts
