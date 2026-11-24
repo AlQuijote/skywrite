@@ -210,36 +210,142 @@ fn lint_accepts_matching_transcript_fingerprint_case_insensitively() {
     );
 }
 
-#[test]
-fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
-    let dir = tempfile::tempdir().unwrap();
-    fixtures(dir.path());
-    // A straight split of one take at 1s, a jump cut at 1.5s hidden under
-    // B-roll, and two B-roll shots 2 frames apart: the speaker flashes back.
+/// `(frames, timeline_start)` of every brief_shot warning for these tracks.
+fn brief_shots(dir: &Path, name: &str, video: Value) -> Vec<(u64, f64)> {
     let edit = write_edit(
-        dir.path(),
-        "flash.json",
-        json!({"version":1,"width":160,"height":90,"fps":{"num":30,"den":1},
-            "video":[
-                {"clips":[{"start":0,"source":"talk.mp4","duration":1},
-                          {"start":1,"source":"talk.mp4","source_in":1,"duration":0.5},
-                          {"start":1.5,"source":"talk.mp4","source_in":3,"duration":2.5}]},
-                {"clips":[{"start":1,"source":"broll.mp4","duration":1},
-                          {"start":2.0667,"source":"broll.mp4","source_in":2,"duration":0.9333}]}]}),
+        dir,
+        name,
+        json!({"version":1,"width":160,"height":90,"fps":{"num":30,"den":1},"video":video}),
     );
     let report = skywrite(&["review", "lint", &edit, "--no-levels"]);
-    let brief: Vec<&Value> = report["warnings"]
+    assert_eq!(report["checked"]["min_shot_seconds"], 0.5, "{report}");
+    report["warnings"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|w| w["kind"] == "brief_shot")
-        .collect();
-    assert_eq!(brief.len(), 1, "{report}");
-    assert_eq!(brief[0]["frames"], 2, "{report}");
-    assert_eq!(brief[0]["timeline_start"], 2.0, "{report}");
-    assert_eq!(report["checked"]["min_shot_seconds"], 0.5);
+        .map(|w| {
+            let start = w["timeline_start"].as_f64().unwrap();
+            let end = w["timeline_end"].as_f64().unwrap();
+            let frames = w["frames"].as_u64().unwrap();
+            assert!((end - start - frames as f64 / 30.0).abs() < 1e-9, "{w}");
+            (frames, (start * 30.0).round() / 30.0)
+        })
+        .collect()
+}
 
-    // A threshold of zero turns the check off; an invalid one is refused.
+#[test]
+fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
+    let dir = tempfile::tempdir().unwrap();
+    fixtures(dir.path());
+    let d = dir.path();
+    let talk = |start: f64, source_in: f64, duration: f64| json!({"start":start,"source":"talk.mp4","source_in":source_in,"duration":duration});
+    let broll = |start: f64, source_in: f64, duration: f64| json!({"start":start,"source":"broll.mp4","source_in":source_in,"duration":duration});
+    let at = |frame: f64| frame / 30.0;
+
+    // Two B-roll shots 2 frames apart over one talking take: the speaker flashes.
+    let flash = json!([{"clips":[talk(0.0, 0.0, 4.0)]},
+        {"clips":[broll(1.0, 0.0, 1.0), broll(2.0667, 2.0, 0.9333)]}]);
+    assert_eq!(brief_shots(d, "flash.json", flash.clone()), [(2, 2.0)]);
+
+    // A straight split 9 frames after a B-roll shot ends continues the take.
+    let split = json!([{"clips":[talk(0.0, 0.0, 1.2), talk(1.2, 1.2, 2.8)]},
+        {"clips":[broll(0.0, 0.0, 0.9)]}]);
+    assert_eq!(brief_shots(d, "split.json", split), []);
+    // A jump cut 6 frames into opaque full-frame B-roll is hidden.
+    let hidden = json!([{"clips":[talk(0.0, 0.0, 1.2), talk(1.2, 3.0, 2.8)]},
+        {"clips":[broll(1.0, 0.0, 1.0)]}]);
+    assert_eq!(brief_shots(d, "hidden.json", hidden), []);
+
+    // A 0.4 s cross-dissolve is one gradual transition, not two cuts; a hard
+    // 2-frame flash beside it is still a brief shot.
+    let mut out = talk(0.0, 0.0, 2.2);
+    out["fade_out"] = json!(0.4);
+    let mut into = broll(1.8, 0.0, 2.2);
+    into["fade_in"] = json!(0.4);
+    let dissolve = json!([{"clips":[out]},{"clips":[into]}]);
+    assert_eq!(brief_shots(d, "dissolve.json", dissolve.clone()), []);
+    let mut beside = dissolve;
+    beside
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"clips":[talk(3.0, 0.0, 0.0667)]}));
+    assert_eq!(brief_shots(d, "beside.json", beside), [(2, 3.0)]);
+
+    // An opening fade from black is not a shot; an invisible overlay is not a
+    // change; a 2-frame overlay with 1-frame fades still flashes.
+    let mut opening = talk(0.0, 0.0, 4.0);
+    opening["fade_in"] = json!(0.6);
+    let mut invisible = broll(1.0, 0.0, 0.0667);
+    invisible["opacity"] = json!(0);
+    let mut faded = broll(3.0, 0.0, 0.0667);
+    faded["fade_in"] = json!(0.0333);
+    faded["fade_out"] = json!(0.0333);
+    let fades = json!([{"clips":[opening]},{"clips":[invisible, faded]}]);
+    assert_eq!(brief_shots(d, "fades.json", fades), [(1, at(91.0))]);
+
+    // An opacity-0 piece inside a split upper take shows the base for 2 frames.
+    let mut gap = broll(1.0, 1.0, 0.0667);
+    gap["opacity"] = json!(0);
+    let seam = json!([{"clips":[talk(0.0, 0.0, 4.0)]},
+        {"clips":[broll(0.0, 0.0, 1.0), gap, broll(1.0667, 1.0667, 2.9333)]}]);
+    assert_eq!(brief_shots(d, "seam.json", seam), [(2, 1.0)]);
+
+    // Fast B-roll jumping back 0.25 s into a slow clip is a cut: the slower
+    // clip's source step bounds continuity, not the faster one's.
+    let mut fast = broll(1.0, 0.0, 0.5);
+    fast["speed"] = json!(8);
+    let mut slow = broll(1.5, 3.75, 0.0667);
+    slow["speed"] = json!(0.125);
+    let jump = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[fast, slow]}]);
+    assert_eq!(brief_shots(d, "jump.json", jump), [(2, 1.5)]);
+    // Frame rounding decides: authored contiguous for 0.51 s at 4x, the first
+    // clip rounds to 0.5 s and leaves a 0.04 s source gap, more than one frame
+    // of the slower 1x clip, so the seam is a cut.
+    let mut rounded = broll(1.0, 0.0, 0.51);
+    rounded["speed"] = json!(4);
+    let rounding = json!([{"clips":[talk(0.0, 0.0, 4.0)]},
+        {"clips":[rounded, broll(1.5, 2.04, 0.0667)]}]);
+    assert_eq!(brief_shots(d, "rounding.json", rounding), [(2, 1.5)]);
+
+    // Razor all tracks: cuts under a continuous opaque take are hidden, even at
+    // the take's own seams; a real upper cut at the same frames is a change.
+    let lower =
+        json!({"clips":[talk(0.0, 0.0, 1.0), talk(1.0, 3.0, 0.0667), talk(1.0667, 0.5, 2.9333)]});
+    let razor = json!([lower.clone(),
+        {"clips":[broll(0.0, 0.0, 1.0), broll(1.0, 1.0, 0.0667), broll(1.0667, 1.0667, 2.9333)]}]);
+    assert_eq!(brief_shots(d, "razor.json", razor), []);
+    let recut = json!([lower,
+        {"clips":[broll(0.0, 0.0, 1.0), broll(1.0, 3.0, 0.0667), broll(1.0667, 1.0667, 2.9333)]}]);
+    assert_eq!(brief_shots(d, "recut.json", recut), [(2, 1.0)]);
+
+    // Full-frame video with an alpha channel never hides a cut beneath it,
+    // whether its pixels are transparent or (undetectably) all opaque.
+    for (name, color) in [("clear.mov", "white@0.0"), ("solid.mov", "white@1.0")] {
+        ffmpeg(&[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color={color}:s=160x90:r=30:d=4,format=argb"),
+            "-c:v",
+            "qtrle",
+            d.join(name).to_str().unwrap(),
+        ]);
+        let under = json!([{"clips":[talk(0.0, 0.0, 1.0), broll(1.0, 0.0, 0.0667), talk(1.0667, 1.0667, 2.9333)]},
+            {"clips":[{"start":0,"source":name,"duration":4}]}]);
+        assert_eq!(brief_shots(d, &format!("{name}.json"), under), [(2, 1.0)]);
+    }
+
+    // A threshold of zero turns the check off; values outside 0..10 are refused
+    // by the validator (the `=` form reaches it for negative numbers).
+    let edit = write_edit(
+        d,
+        "flash-args.json",
+        json!({"version":1,"width":160,"height":90,"fps":{"num":30,"den":1},"video":flash}),
+    );
     let report = skywrite(&[
         "review",
         "lint",
@@ -252,8 +358,42 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         !kinds(&report).contains(&"brief_shot".to_owned()),
         "{report}"
     );
-    let out = run(&["review", "lint", &edit, "--min-shot-seconds", "-1"]);
-    assert!(!out.status.success());
+    assert_eq!(report["checked"]["min_shot_seconds"], 0.0);
+    for bad in ["=-1", "=11", "=NaN"] {
+        let out = run(&[
+            "review",
+            "lint",
+            &edit,
+            "--no-levels",
+            &format!("--min-shot-seconds{bad}"),
+        ]);
+        assert!(!out.status.success(), "{bad}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("must be 0..10"), "{bad}: {stderr}");
+    }
+}
+
+#[test]
+fn lint_help_explains_brief_shots_for_agents() {
+    let out = run(&["review", "lint", "--help"]);
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for fact in [
+        "brief_shot",
+        "--min-shot-seconds <SECONDS>",
+        "0 to 10 (default 0.5); 0 turns the brief-shot",
+        "not pixels",
+        "at least half the visible picture changes at once",
+        "dissolves and longer fades",
+        "opacity 0",
+        "straight split continuing the same take",
+        "alpha-capable video",
+        "timeline_start",
+        "never changes the edit",
+        "skywrite review lint edit.json --min-shot-seconds 0",
+    ] {
+        assert!(help.contains(fact), "missing {fact:?} in:\n{help}");
+    }
 }
 
 #[test]
