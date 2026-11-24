@@ -348,3 +348,50 @@ fn timing_cache_keys_on_the_whole_ffmpeg_build_but_stores_it_compactly() {
         assert!(std::fs::metadata(&entry).unwrap().len() < 1024);
     }
 }
+#[test]
+fn verify_checks_the_displayed_size_of_rotated_phone_footage() {
+    let d = scratch();
+    let stored = d.path().join("stored.mp4");
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=s=160x90:r=10:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+        &stored,
+    );
+    let phone = d.path().join("phone.mp4");
+    ffmpeg(
+        &[
+            "-display_rotation",
+            "90",
+            "-i",
+            stored.to_str().unwrap(),
+            "-c",
+            "copy",
+        ],
+        &phone,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_skywrite"))
+        .arg("verify")
+        .arg(&phone)
+        .args([
+            "--metadata-only",
+            "--expected-width",
+            "90",
+            "--expected-height",
+            "160",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

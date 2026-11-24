@@ -744,6 +744,51 @@ fn unreachable_and_slow_servers_fail_once_with_a_clear_error() {
 }
 
 #[test]
+fn video_ranges_of_rotated_phone_footage_keep_their_displayed_height() {
+    let env = Env::new();
+    let server = Server::start(env.path());
+    env.ok(&["providers", "add", "local", "--base-url", &server.base()]);
+    let stored = env.video();
+    let phone = env.path().join("phone.mp4");
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-display_rotation", "90", "-i", &stored])
+        .args(["-c", "copy"])
+        .arg(&phone)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // The fixture answers with a frame description, so only the request matters.
+    env.run(&[
+        "describe",
+        "video",
+        phone.to_str().unwrap(),
+        "--duration",
+        "1",
+        "--height",
+        "240",
+        "--model",
+        "local:video-small",
+    ]);
+    let requests = server.requests();
+    let url = requests[0]["body"]["messages"][0]["content"][1]["video_url"]["url"]
+        .as_str()
+        .unwrap();
+    let clip = env.path().join("sent.mp4");
+    std::fs::write(
+        &clip,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            url.strip_prefix("data:video/mp4;base64,").unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Shown 90x160: a 240-row cap keeps all 160 rows instead of shrinking to 90.
+    let video = skywrite::media::probe(&clip).unwrap();
+    assert_eq!(video.video().unwrap().height, Some(160));
+}
+
+#[test]
 fn provider_catalogs_label_unverified_capabilities() {
     let env = Env::new();
     let server = Server::start(env.path());

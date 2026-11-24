@@ -305,11 +305,11 @@ fn ask(
 }
 
 fn fit_width(info: &media::MediaInfo) -> u32 {
-    let video = info.video();
-    let (w, h) = (
-        video.and_then(|v| v.width).unwrap_or(16) as f64,
-        video.and_then(|v| v.height).unwrap_or(9) as f64,
-    );
+    let (w, h) = info
+        .video()
+        .and_then(|v| v.display_size())
+        .unwrap_or((16, 9));
+    let (w, h) = (w as f64, h as f64);
     let width = if w >= h {
         FRAME_FIT as f64
     } else {
@@ -674,7 +674,10 @@ fn video(args: &VideoArgs) -> Result<Value> {
         .prefix("skywrite-video-")
         .tempdir()?;
     let clip = temp.path().join("clip.mp4");
-    let video_height = info.video().and_then(|v| v.height).unwrap_or(args.height);
+    let video_height = info
+        .video()
+        .and_then(|v| v.display_size())
+        .map_or(args.height, |(_, h)| h);
     let mut command = crate::process::args(&[
         "-hide_banner",
         "-nostdin",

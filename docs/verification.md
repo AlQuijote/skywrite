@@ -34,7 +34,8 @@ writes JSON to stdout, and exits nonzero for failed expectations. Use
 An input cannot be its own report output, including with `--overwrite`.
 
 `--metadata-only` skips decoding and labels duration evidence as estimated.
-Width, height and average FPS checks use stream metadata; average FPS does not
+Width, height and average FPS checks use stream metadata, with width and height
+as displayed (rotation applied); average FPS does not
 establish constant frame rate. No audio levels, decoded counts or measured
 duration are claimed in this mode.
 

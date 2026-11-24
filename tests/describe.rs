@@ -488,3 +488,34 @@ fn seeded_frame_descriptions_are_reused_across_overlapping_passes() {
     );
     assert!(!invalid.status.success());
 }
+
+#[test]
+fn frames_of_rotated_phone_footage_fit_their_displayed_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let stored = dir.path().join("stored.mp4");
+    fixture_video(&stored);
+    let video = dir.path().join("phone.mp4");
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-display_rotation", "90", "-i"])
+        .arg(&stored)
+        .args(["-c", "copy"])
+        .arg(&video)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let cache = dir.path().join("cache");
+    let out = dry_frames(&video, &cache, &dir.path().join("home"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Stored 160x90 but shown 90x160: the frame is 768 tall, not 768 wide.
+    let size = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=width,height"])
+        .args(["-of", "csv=p=0"])
+        .arg(exact_image(&cache, &video))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&size.stdout).trim(), "432,768");
+}
