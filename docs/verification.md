@@ -10,7 +10,13 @@ metadata estimate; audio timing never truncates a video tail.
 
 Exact timing is cached under the normal Skywrite cache root (override with
 `--cache-dir` or `SKYWRITE_CACHE_DIR`), keyed by source SHA-256, timing-policy
-version and the installed FFmpeg build. Content changes require fresh decoding.
+version (`version` 2, directory `audio-timing-v2`; other versions are ignored and
+re-measured) and the installed FFmpeg build. Content changes require fresh decoding.
+`decoder` names that build compactly: `ffmpeg_version` (the version from the first
+`ffmpeg -version` line) and `build_sha256` (SHA-256 of the complete `ffmpeg -version`
+output, so a different configuration or library version re-measures even when the
+version string is the same). It is read once per command; `verify` reports the same
+object for its audio and video decodes.
 `cache_hit` distinguishes reused evidence. Sample duration excludes timestamp gaps;
 presentation end includes source-relative delay and gaps. The decoder handles
 codec priming. The cache is regeneratable local evidence, not a signed attestation.

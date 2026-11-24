@@ -182,6 +182,16 @@ fn verify_cli_counts_checks_metadata_only_and_protects_input() {
         String::from_utf8_lossy(&out.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The decoder is named once per stream compactly, not by its whole banner.
+    for stream in ["video", "audio"] {
+        let decoder = &value[stream]["decoder"];
+        assert_eq!(decoder.as_object().unwrap().len(), 2, "{decoder}");
+        assert_eq!(decoder["build_sha256"].as_str().unwrap().len(), 64);
+        assert!(serde_json::to_vec(decoder).unwrap().len() < 200);
+    }
+    assert_eq!(value["video"]["decoder"], value["audio"]["decoder"]);
+    // The full banner (about 1.9 KB with FFmpeg 8.0.1) appeared here twice.
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("configuration:"));
     assert_eq!(value["video"]["frames"], 10);
     assert_eq!(value["audio"]["samples"], 24000);
     assert_eq!(value["full_decode_executed"], true);
@@ -268,4 +278,73 @@ fn malformed_vbr_without_seek_header_uses_samples_not_bitrate() {
     assert!((info.duration - t.presentation_end_seconds).abs() > 0.5);
     assert_eq!(t.samples, 49536);
     assert!((t.presentation_end_seconds - 2.064).abs() < 0.000001);
+}
+#[cfg(unix)]
+#[test]
+fn timing_cache_keys_on_the_whole_ffmpeg_build_but_stores_it_compactly() {
+    let d = scratch();
+    let input = d.path().join("tone.wav");
+    tone(&input, "0.3");
+    let real = Command::new("sh")
+        .args(["-c", "command -v ffmpeg"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_owned();
+    // Same version line, one extra banner line: a different build.
+    let bin = d.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("ffmpeg");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -version ]; then\n  '{real}' -version\n  echo 'rebuilt with another configuration'\n  exit 0\nfi\nexec '{real}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shimmed = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let cache = d.path().join("cache");
+    let inspect = |path: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_skywrite"));
+        command
+            .args(["inspect", "--exact-audio", "--cache-dir"])
+            .arg(&cache)
+            .arg(&input);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        value["media"][0]["audio_timing"].clone()
+    };
+    let first = inspect(None);
+    assert_eq!(first["cache_hit"], false);
+    assert_eq!(first["version"], 2);
+    let version = first["decoder"]["ffmpeg_version"].as_str().unwrap();
+    assert!(!version.is_empty() && !version.contains(' '), "{version}");
+    assert_eq!(inspect(None)["cache_hit"], true);
+    let other = inspect(Some(&shimmed));
+    assert_eq!(other["cache_hit"], false, "a build change must re-measure");
+    assert_eq!(other["decoder"]["ffmpeg_version"], version);
+    assert_ne!(
+        other["decoder"]["build_sha256"],
+        first["decoder"]["build_sha256"]
+    );
+    assert_eq!(inspect(Some(&shimmed))["cache_hit"], true);
+    assert_eq!(inspect(None)["cache_hit"], true);
+    let entries: Vec<_> = std::fs::read_dir(cache.join("audio-timing-v2"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert!(std::fs::metadata(&entry).unwrap().len() < 1024);
+    }
 }

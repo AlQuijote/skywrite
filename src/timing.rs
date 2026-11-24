@@ -8,7 +8,7 @@ pub const MAX_DECODE_SECONDS: f64 = 21_600.0;
 pub struct AudioTiming {
     pub version: u32,
     pub source_sha256: String,
-    pub decoder: String,
+    pub decoder: DecoderIdentity,
     pub stream_index: u32,
     pub samples: u64,
     pub sample_rate: u32,
@@ -19,14 +19,47 @@ pub struct AudioTiming {
     pub rms_dbfs: Option<f64>,
     pub cache_hit: bool,
 }
-pub fn decoder_identity() -> Result<String> {
+/// Timing evidence format; entries of other versions are ignored and re-measured.
+const TIMING_VERSION: u32 = 2;
+/// The FFmpeg that decoded, as compact as the banner allows without weakening
+/// the cache key: the version string for people, and a hash of the complete
+/// `ffmpeg -version` output (build configuration and library versions), so any
+/// build change still invalidates cached timing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecoderIdentity {
+    pub ffmpeg_version: String,
+    pub build_sha256: String,
+}
+impl DecoderIdentity {
+    fn from_banner(banner: &[u8]) -> Result<Self> {
+        let text = String::from_utf8_lossy(banner);
+        let version = text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("ffmpeg version "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .filter(|v| !v.is_empty())
+            .context("ffmpeg -version did not report a version")?;
+        Ok(Self {
+            ffmpeg_version: version.chars().take(128).collect(),
+            build_sha256: crate::generation::bytes_sha256(banner),
+        })
+    }
+}
+/// Computed once per process: every measurement in one command shares it.
+pub fn decoder_identity() -> Result<DecoderIdentity> {
+    static IDENTITY: std::sync::OnceLock<DecoderIdentity> = std::sync::OnceLock::new();
+    if let Some(identity) = IDENTITY.get() {
+        return Ok(identity.clone());
+    }
     let out = crate::process::run(
         "ffmpeg",
         &crate::process::args(&["-version"]),
         Duration::from_secs(10),
         64 * 1024,
     )?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let identity = DecoderIdentity::from_banner(&out.stdout)?;
+    Ok(IDENTITY.get_or_init(|| identity).clone())
 }
 fn source_hash(info: &crate::media::MediaInfo) -> Result<String> {
     crate::media::file_sha256_limited(&info.path, 16 * 1024 * 1024 * 1024)
@@ -36,10 +69,15 @@ pub fn measure_audio(info: &crate::media::MediaInfo) -> Result<AudioTiming> {
     let info = crate::media::probe(&info.path)?;
     decode_audio(&info, source_hash(&info)?, decoder_identity()?)
 }
-fn valid(t: &AudioTiming, info: &crate::media::MediaInfo, hash: &str, decoder: &str) -> bool {
-    t.version == 1
+fn valid(
+    t: &AudioTiming,
+    info: &crate::media::MediaInfo,
+    hash: &str,
+    decoder: &DecoderIdentity,
+) -> bool {
+    t.version == TIMING_VERSION
         && t.source_sha256 == hash
-        && t.decoder == decoder
+        && t.decoder == *decoder
         && info
             .audio()
             .is_some_and(|a| a.index == t.stream_index && a.sample_rate == Some(t.sample_rate))
@@ -103,9 +141,12 @@ pub fn exact_audio_timing(
     }
     let hash = source_hash(info)?;
     let decoder = decoder_identity()?;
-    let key =
-        crate::openrouter::cache_key(&[b"audio-timing-v1", hash.as_bytes(), decoder.as_bytes()]);
-    let root = crate::cache::cache_root(cache_override)?.join("audio-timing-v1");
+    let key = crate::openrouter::cache_key(&[
+        b"audio-timing-v2",
+        hash.as_bytes(),
+        decoder.build_sha256.as_bytes(),
+    ]);
+    let root = crate::cache::cache_root(cache_override)?.join("audio-timing-v2");
     std::fs::create_dir_all(&root)?;
     let root = root.canonicalize()?;
     let path = root.join(format!("{key}.json"));
@@ -155,7 +196,7 @@ pub fn exact_audio_timing(
 fn decode_audio(
     info: &crate::media::MediaInfo,
     hash: String,
-    decoder: String,
+    decoder: DecoderIdentity,
 ) -> Result<AudioTiming> {
     let audio = info.audio().context("media has no audio stream")?;
     let sample_rate = audio
@@ -210,7 +251,7 @@ fn decode_audio(
         bail!("nonfinite decoded audio levels");
     }
     let timing = AudioTiming {
-        version: 1,
+        version: TIMING_VERSION,
         source_sha256: hash,
         decoder,
         stream_index: audio.index,

@@ -16,6 +16,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Required transcript content fingerprints for transcript-based caption tracks, `describe frames --transcript` and `review lint --transcript`, matching analysis and edit suggestions; byte-identical media copies are accepted, and media SHA-256 hashes are cached locally.
 - Export to FCPXML, Premiere XML (xmeml), Hyperframes, Remotion and FFmpeg scripts; import Premiere/FCP 7 XML and experimental `.prproj` files.
 - Remotion exports pin `remotion` and `@remotion/cli` 4.0.546, whose own zod pin (4.6.7) carries the GHSA-mrhx-c7xc-m3w5 fix, so the project needs no `overrides` and Remotion prints no version-mismatch warning.
+- Exact-timing evidence (`inspect --exact-audio`, `verify`) names its decoder compactly as `decoder: {ffmpeg_version, build_sha256}`, the hash covering the whole `ffmpeg -version` output, instead of embedding that banner; timing evidence is `version` 2 under `audio-timing-v2`.
 - `edit export --media-root FOLDER` writes FCPXML and Premiere XML media URLs beneath the editor's folder, so exports made on another machine (for example in the cloud) link on open.
 - Native HTML or JSON still graphics through embedded Takumi, with PNG, JPEG and WebP output.
 - Optional image, video, narration and music generation and upscaling through OpenRouter, with durable generation projects and optional S3/R2 uploads.
