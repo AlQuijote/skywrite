@@ -33,6 +33,16 @@ fn skywrite(args: &[&str]) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
 fn fixtures(dir: &Path) {
     let p = |n: &str| dir.join(n).to_str().unwrap().to_owned();
     // "Speaker": picture plus a quiet tone standing in for speech.
@@ -306,54 +316,58 @@ fn lint_reports_objective_problems_and_stays_quiet_otherwise() {
 
     // Phone B-roll stored 90x160 with a quarter-turn rotation shows 160x90, so
     // it covers the speaker as fully as landscape B-roll.
-    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
-    ffmpeg(&[
-        "-v",
-        "error",
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=green:s=90x160:r=30:d=4",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        &p("stored.mp4"),
-    ]);
-    ffmpeg(&[
-        "-v",
-        "error",
-        "-y",
-        "-display_rotation",
-        "90",
-        "-i",
-        &p("stored.mp4"),
-        "-c",
-        "copy",
-        &p("phone.mp4"),
-    ]);
-    let phone = write_edit(
-        dir.path(),
-        "phone.json",
-        base(
-            json!([{"clips":[{"start":0,"source":"talk.mp4","duration":3.5,"audio":{"volume":0}}]},
-               {"clips":[{"start":0,"source":"phone.mp4","duration":3.5}]}]),
-            json!([{"clips":[{"start":0,"source":"bed.wav","duration":3.5,"volume":0.2}]}]),
-        ),
-    );
-    let report = skywrite(&[
-        "review",
-        "lint",
-        &phone,
-        "--transcript",
-        transcript,
-        "--no-levels",
-    ]);
-    assert!(
-        !kinds(&report).contains(&"visible_speaker_without_dialogue".to_owned()),
-        "{report}"
-    );
+    if display_rotation_supported() {
+        let p = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
+        ffmpeg(&[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=green:s=90x160:r=30:d=4",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            &p("stored.mp4"),
+        ]);
+        ffmpeg(&[
+            "-v",
+            "error",
+            "-y",
+            "-display_rotation",
+            "90",
+            "-i",
+            &p("stored.mp4"),
+            "-c",
+            "copy",
+            &p("phone.mp4"),
+        ]);
+        let phone = write_edit(
+            dir.path(),
+            "phone.json",
+            base(
+                json!([{"clips":[{"start":0,"source":"talk.mp4","duration":3.5,"audio":{"volume":0}}]},
+                   {"clips":[{"start":0,"source":"phone.mp4","duration":3.5}]}]),
+                json!([{"clips":[{"start":0,"source":"bed.wav","duration":3.5,"volume":0.2}]}]),
+            ),
+        );
+        let report = skywrite(&[
+            "review",
+            "lint",
+            &phone,
+            "--transcript",
+            transcript,
+            "--no-levels",
+        ]);
+        assert!(
+            !kinds(&report).contains(&"visible_speaker_without_dialogue".to_owned()),
+            "{report}"
+        );
+    } else {
+        eprintln!("skipping the rotated phone B-roll case: FFmpeg lacks -display_rotation (6.0+)");
+    }
 
     // A cut inside a word is flagged; a straight split through the same word is not.
     let clipped = write_edit(

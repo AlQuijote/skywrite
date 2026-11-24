@@ -844,8 +844,24 @@ fn wide_sources_are_written_as_stereo_pairs_with_a_note() {
     );
 }
 
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
 #[test]
 fn video_is_scaled_to_fit_the_sequence_like_the_render() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping video_is_scaled_to_fit_the_sequence_like_the_render: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     media(dir.path());
     let p = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
