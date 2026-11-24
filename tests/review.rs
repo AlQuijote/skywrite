@@ -212,10 +212,16 @@ fn lint_accepts_matching_transcript_fingerprint_case_insensitively() {
 
 /// `(frames, timeline_start)` of every brief_shot warning for these tracks.
 fn brief_shots(dir: &Path, name: &str, video: Value) -> Vec<(u64, f64)> {
+    brief_shots_at(dir, name, (30, 1), video)
+}
+
+/// `brief_shots` at another frame rate; start times are rounded to frames.
+fn brief_shots_at(dir: &Path, name: &str, (num, den): (u32, u32), video: Value) -> Vec<(u64, f64)> {
+    let rate = num as f64 / den as f64;
     let edit = write_edit(
         dir,
         name,
-        json!({"version":1,"width":160,"height":90,"fps":{"num":30,"den":1},"video":video}),
+        json!({"version":1,"width":160,"height":90,"fps":{"num":num,"den":den},"video":video}),
     );
     let report = skywrite(&["review", "lint", &edit, "--no-levels"]);
     assert_eq!(report["checked"]["min_shot_seconds"], 0.5, "{report}");
@@ -233,8 +239,8 @@ fn brief_shots(dir: &Path, name: &str, video: Value) -> Vec<(u64, f64)> {
             let start = w["timeline_start"].as_f64().unwrap();
             let end = w["timeline_end"].as_f64().unwrap();
             let frames = w["frames"].as_u64().unwrap();
-            assert!((end - start - frames as f64 / 30.0).abs() < 1e-9, "{w}");
-            (frames, (start * 30.0).round() / 30.0)
+            assert!((end - start - frames as f64 / rate).abs() < 1e-9, "{w}");
+            (frames, (start * rate).round() / rate)
         })
         .collect()
 }
@@ -285,9 +291,16 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         [(2, 0.0), (2, at(118.0))]
     );
 
-    // A 2-frame hole in the only track flashes black.
+    // A 2-frame hole in the only track flashes black; a quick fade through
+    // black (0.2 s out, 0.2 s in) is a transition, not a black shot.
     let gap = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(2.0667, 3.0, 1.9333)]}]);
     assert_eq!(brief_shots(d, "black.json", gap), [(2, 2.0)]);
+    let mut down = talk(0.0, 0.0, 2.0);
+    down["fade_out"] = json!(0.2);
+    let mut up = talk(2.0, 3.0, 2.0);
+    up["fade_in"] = json!(0.2);
+    let through = json!([{"clips":[down, up]}]);
+    assert_eq!(brief_shots(d, "through-black.json", through), []);
 
     // An opening fade from black is not a shot; an invisible overlay is not a
     // change; a 2-frame overlay with 1-frame fades still flashes.
@@ -302,13 +315,13 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     assert_eq!(brief_shots(d, "fades.json", fades), [(1, at(91.0))]);
 
     // A 12-frame overlay with 0.19 s fades is a soft flash: it rises and falls
-    // gradually, but is a detour from the base and back; its middle 5 frames
-    // differ from both sides by more than a quarter of the picture.
+    // gradually (FFmpeg fades it over 6 frames each way), but is a detour from
+    // the base and back; it dominates the picture for 6 frames.
     let mut soft = broll(2.0, 0.0, 0.4);
     soft["fade_in"] = json!(0.19);
     soft["fade_out"] = json!(0.19);
     let soft = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[soft]}]);
-    assert_eq!(brief_shots(d, "soft.json", soft), [(5, at(64.0))]);
+    assert_eq!(brief_shots(d, "soft.json", soft), [(6, at(64.0))]);
     // A 2-frame overlay at opacity 0.3 is a visible flash; at 0.2 it is under
     // a quarter of the picture.
     for (opacity, expected) in [(0.3, vec![(2, 2.0)]), (0.2, vec![])] {
@@ -345,6 +358,53 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     held["fade_out"] = json!(0.049);
     let held = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[held]}]);
     assert_eq!(brief_shots(d, "held.json", held), []);
+    // FFmpeg rounds fades to whole frames, so a fade-out under 1.5 frames
+    // leaves a 0.5 s overlay unchanged on screen: not a brief shot, at 30,
+    // 29.97 and 23.976 fps (12 frames with a 60 ms fade).
+    for (rate, frames, fade) in [
+        ((30, 1), 15, 0.049),
+        ((30000, 1001), 15, 0.049),
+        ((24000, 1001), 12, 0.06),
+    ] {
+        let seconds = |f: u32| f64::from(f) * f64::from(rate.1) / f64::from(rate.0);
+        let mut overlay = broll(seconds(30), 0.0, seconds(frames));
+        overlay["fade_out"] = json!(fade);
+        let full = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[overlay]}]);
+        assert_eq!(brief_shots_at(d, "full.json", rate, full), [], "{rate:?}");
+    }
+    // A shot between two 0.4 s dissolves is measured from the middle of one to
+    // the middle of the other: B dominates for 19 frames (not brief), and when C
+    // comes in 0.4 s earlier, for under half a second (brief).
+    for (c_start, brief) in [(1.6, false), (1.2, true)] {
+        let mut b = broll(1.0, 0.0, 1.0);
+        b["fade_in"] = json!(0.4);
+        let mut c = talk(c_start, 2.0, 4.0 - c_start);
+        c["fade_in"] = json!(0.4);
+        let stack = json!([{"clips":[talk(0.0, 0.0, 1.4)]},{"clips":[b]},{"clips":[c]}]);
+        let found = brief_shots(d, "dissolves.json", stack);
+        assert_eq!(!found.is_empty(), brief, "{c_start}: {found:?}");
+        assert!(found.iter().all(|(frames, _)| *frames < 15), "{found:?}");
+    }
+    // Stills and other overlays that do not cover the frame never dim what is
+    // beneath, so a partial-opacity one needs about twice the opacity to count:
+    // a 2-frame PNG at 0.3 is quiet, at 0.6 it is a flash.
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=blue:s=160x90",
+        "-frames:v",
+        "1",
+        d.join("blue.png").to_str().unwrap(),
+    ]);
+    for (opacity, expected) in [(0.3, vec![]), (0.6, vec![(2, 2.0)])] {
+        let still = json!({"start":2.0,"source":"blue.png","duration":0.0667,"opacity":opacity});
+        let still = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[still]}]);
+        assert_eq!(brief_shots(d, "still.json", still), expected, "{opacity}");
+    }
     // A take split with a tiny opacity change stays one shot, and a fade-out
     // shorter than two frames only ends the shot at its last frame.
     let mut dim = broll(1.0, 1.0, 0.0667);
@@ -455,8 +515,11 @@ fn lint_help_explains_brief_shots_for_agents() {
         "0 to 10 (default 0.5); 0 turns the brief-shot",
         "not pixels",
         "half the sum of their weight differences",
-        "at least 0.25 from the pictures just before and after",
+        "measured over its whole transient",
+        "as FFmpeg's fade filter renders them",
+        "about twice as opaque to count",
         "a detour rather than a step on the way",
+        "at least 0.5 more than theirs from each other",
         "or a black gap",
         "dissolves and fades from one picture to another",
         "opacity 0",
