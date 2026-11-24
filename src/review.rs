@@ -47,7 +47,10 @@ pub struct SheetArgs {
     #[arg(long, default_value_t = 4)]
     pub columns: u32,
     /// Width of each tile in pixels.
-    #[arg(long, default_value_t = 320)]
+    ///
+    /// Default 320. Tile height follows the source's displayed aspect ratio
+    /// (rotation applied), so rotated phone footage gets upright portrait tiles.
+    #[arg(long, default_value_t = 320, value_name = "PIXELS")]
     pub tile_width: u32,
     #[arg(short, long)]
     pub output: PathBuf,
@@ -286,10 +289,8 @@ fn sheet(args: &SheetArgs) -> Result<Value> {
         MAX_SHEET_FRAMES,
     )?;
     let video = info.video().context("source has no video stream")?;
-    let (w, h) = (
-        video.width.unwrap_or(16) as f64,
-        video.height.unwrap_or(9) as f64,
-    );
+    let (w, h) = video.display_size().unwrap_or((16, 9));
+    let (w, h) = (w as f64, h as f64);
     let tile_height = ((args.tile_width as f64 * h / w).round() as u32).max(16);
     let label = 28u32;
     let columns = args.columns.min(frames.len() as u32);

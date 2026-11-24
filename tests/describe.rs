@@ -39,11 +39,20 @@ fn fixture_video(path: &std::path::Path) {
 }
 
 fn exact_image(cache: &std::path::Path, video: &std::path::Path) -> std::path::PathBuf {
+    exact_image_at(cache, video, 768)
+}
+
+/// The persisted frame at 0 s, named by its fitted width.
+fn exact_image_at(
+    cache: &std::path::Path,
+    video: &std::path::Path,
+    width: u32,
+) -> std::path::PathBuf {
     cache
         .join("assets")
         .join(skywrite::media::file_sha256(video).unwrap())
         .join("exact-frames")
-        .join(format!("{:015.6}-fit768.jpg", 0.0))
+        .join(format!("{:015.6}-w{width}.jpg", 0.0))
 }
 
 fn dry_frames(
@@ -363,7 +372,8 @@ fn seeded_frame_descriptions_are_reused_across_overlapping_passes() {
     // Seed one second-spaced frames: 0, 1, 2 seconds.
     for second in 0..3 {
         let target = skywrite::providers::resolve(model, &Default::default()).unwrap();
-        let key = skywrite::describe::frame_cache_key(&sha, second as f64, &target, None).unwrap();
+        let key =
+            skywrite::describe::frame_cache_key(&sha, second as f64, 768, &target, None).unwrap();
         let path = cache.join("frame-descriptions").join(format!("{key}.json"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -487,4 +497,79 @@ fn seeded_frame_descriptions_are_reused_across_overlapping_passes() {
         &home,
     );
     assert!(!invalid.status.success());
+}
+
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
+#[test]
+fn frames_of_rotated_phone_footage_fit_their_displayed_shape() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping frames_of_rotated_phone_footage_fit_their_displayed_shape: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let stored = dir.path().join("stored.mp4");
+    fixture_video(&stored);
+    let video = dir.path().join("phone.mp4");
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-display_rotation", "90", "-i"])
+        .arg(&stored)
+        .args(["-c", "copy"])
+        .arg(&video)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let cache = dir.path().join("cache");
+    let out = dry_frames(&video, &cache, &dir.path().join("home"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Stored 160x90 but shown 90x160: the frame is 768 tall, not 768 wide.
+    let size = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=width,height"])
+        .args(["-of", "csv=p=0"])
+        .arg(exact_image_at(&cache, &video, 432))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&size.stdout).trim(), "432,768");
+}
+
+#[test]
+fn help_says_sizes_follow_the_displayed_picture() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = |args: &[&str]| {
+        let out = run(args, dir.path(), dir.path());
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let video = help(&["describe", "video", "--help"]);
+    for fact in [
+        "--height <PIXELS>",
+        "never upscaled",
+        "displayed height",
+        "rounded down to an even number",
+        "encoding field names the height sent",
+    ] {
+        assert!(video.contains(fact), "missing {fact:?} in:\n{video}");
+    }
+    let sheet = help(&["review", "sheet", "--help"]);
+    for fact in [
+        "--tile-width <PIXELS>",
+        "displayed aspect ratio",
+        "upright portrait tiles",
+    ] {
+        assert!(sheet.contains(fact), "missing {fact:?} in:\n{sheet}");
+    }
 }

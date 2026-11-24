@@ -13,9 +13,16 @@ pub struct VerifyArgs {
     pub expected_duration: Option<f64>,
     #[arg(long, default_value_t = 0.05)]
     pub duration_tolerance: f64,
-    #[arg(long)]
+    /// Expected displayed width in pixels, from stream metadata (basis
+    /// stream_metadata), with the display rotation applied: a phone clip stored
+    /// 1920x1080 with rotation 90 or -90 is 1080 wide. A mismatch fails the check
+    /// (nonzero exit, report still printed). Example: --expected-width 1080
+    /// --expected-height 1920 for an upright vertical phone clip.
+    #[arg(long, value_name = "PIXELS")]
     pub expected_width: Option<u32>,
-    #[arg(long)]
+    /// Expected displayed height in pixels (rotation applied, like
+    /// --expected-width): a phone clip stored 1920x1080 with rotation 90 is 1920 high.
+    #[arg(long, value_name = "PIXELS")]
     pub expected_height: Option<u32>,
     #[arg(long)]
     pub expected_fps: Option<f64>,
@@ -97,17 +104,12 @@ fn execute_with_limit(args: VerifyArgs, hash_limit: u64) -> Result<Value> {
     if let Some(expected) = args.expected_duration {
         checks.push(json!({"property":"duration","expected":expected,"actual":duration,"tolerance":args.duration_tolerance,"basis":if measured_duration.is_some(){"decoded_presentation"}else{"metadata_estimate"},"passed":(duration-expected).abs() <= args.duration_tolerance}));
     }
+    let (width, height) = info
+        .video()
+        .map_or((None, None), |v| v.display_dimensions());
     for (name, expected, actual) in [
-        (
-            "width",
-            args.expected_width,
-            info.video().and_then(|v| v.width),
-        ),
-        (
-            "height",
-            args.expected_height,
-            info.video().and_then(|v| v.height),
-        ),
+        ("width", args.expected_width, width),
+        ("height", args.expected_height, height),
     ] {
         if let Some(expected) = expected {
             checks.push(json!({"property":name,"expected":expected,"actual":actual,"basis":"stream_metadata","passed":actual==Some(expected)}));

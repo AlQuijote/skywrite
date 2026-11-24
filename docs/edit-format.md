@@ -346,7 +346,15 @@ no track's placement depends on another's retiming. It references original files
 rather than embedding them. The format follows Apple's
 [FCPXML reference](https://developer.apple.com/documentation/professional-video-applications/fcpxml-reference)
 and [timeMap specification](https://developer.apple.com/documentation/professional-video-applications/timemap).
-Actual import into Final Cut Pro requires validation on macOS.
+Actual import into Final Cut Pro requires validation on macOS. Source `<format>`
+elements carry each file's stored width and height, not the displayed size of
+rotated phone footage (a clip stored 3840x2160 with rotation -90 is written as
+3840x2160), and no transform is written, so fitting is left to Final Cut Pro's
+own conform. Whether Final Cut Pro expects the stored or the displayed size for
+rotated media has not been checked; check the framing of rotated clips after import.
+Premiere XML likewise writes the stored size in each file's `samplecharacteristics`
+(Premiere reads the media itself), while its Basic Motion Scale uses the
+displayed size.
 
 Composition projects copy unique media into their output directory, with a
 20 GiB total media limit; `external_sources` in the result lists every copied

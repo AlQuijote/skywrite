@@ -805,6 +805,80 @@ fn unreachable_and_slow_servers_fail_once_with_a_clear_error() {
     );
 }
 
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
+#[test]
+fn video_ranges_of_rotated_phone_footage_keep_their_displayed_height() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping video_ranges_of_rotated_phone_footage_keep_their_displayed_height: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
+    let env = Env::new();
+    let server = Server::start(env.path());
+    env.ok(&["providers", "add", "local", "--base-url", &server.base()]);
+    let stored = env.video();
+    let phone = env.path().join("phone.mp4");
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-display_rotation", "90", "-i", &stored])
+        .args(["-c", "copy"])
+        .arg(&phone)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // The fixture answers with a frame description, so only the request matters.
+    let out = env.run(&[
+        "describe",
+        "video",
+        phone.to_str().unwrap(),
+        "--duration",
+        "1",
+        "--height",
+        "240",
+        "--model",
+        "local:video-small",
+    ]);
+    // The reported encoding (and the cache key) name the height actually sent.
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+        serde_json::from_slice(&out.stderr).expect("describe video prints JSON")
+    });
+    let encoding = report["encoding"]
+        .as_str()
+        .or(report["error"]["details"]["encoding"].as_str());
+    assert_eq!(
+        encoding,
+        Some("h264-crf28-upright-h160-noaudio"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let requests = server.requests();
+    let url = requests[0]["body"]["messages"][0]["content"][1]["video_url"]["url"]
+        .as_str()
+        .unwrap();
+    let clip = env.path().join("sent.mp4");
+    std::fs::write(
+        &clip,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            url.strip_prefix("data:video/mp4;base64,").unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Shown 90x160: a 240-row cap keeps all 160 rows instead of shrinking to 90.
+    let video = skywrite::media::probe(&clip).unwrap();
+    assert_eq!(video.video().unwrap().height, Some(160));
+}
+
 #[test]
 fn provider_catalogs_label_unverified_capabilities() {
     let env = Env::new();
