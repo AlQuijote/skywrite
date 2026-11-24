@@ -89,7 +89,8 @@ pub struct LintArgs {
     ///
     /// Seconds of output time, 0 to 10 (default 0.5); 0 turns the brief-shot
     /// check off. Only shots between two hard cuts are checked (fades and
-    /// dissolves are not checked yet); a brief_shot warning reports its frames,
+    /// dissolves are not checked yet, black gaps only between full-frame
+    /// pictures); a brief_shot warning reports its frames,
     /// timeline_start and timeline_end. Raise it to match the edit's pacing
     /// (for example 1). Values outside 0..10 are refused.
     #[arg(long, default_value_t = 0.5, value_name = "SECONDS")]
@@ -98,7 +99,7 @@ pub struct LintArgs {
 
 const LINT_ABOUT: &str = "Objective checks of an edit before you render it, from the edit JSON and word-timed transcripts. It never changes the edit and never judges taste.
 
-Run it on every draft, before skywrite edit render; after rendering, check the file with skywrite verify. Supply one --transcript per dialogue source (from skywrite transcribe; usage.source_sha256 must match the media). Without transcripts only the level and brief-shot checks run. The report's not_checked list (also printed to stderr) says which checks were skipped, which dialogue sources had no transcript and which short shots brief_shot did not check because of a fade or dissolve.
+Run it on every draft, before skywrite edit render; after rendering, check the file with skywrite verify. Supply one --transcript per dialogue source (from skywrite transcribe; usage.source_sha256 must match the media). Without transcripts only the level and brief-shot checks run. The report's not_checked list (also printed to stderr) says which checks were skipped, which dialogue sources had no transcript and which short shots brief_shot did not check because of a fade, dissolve or opacity change, or black not between full-frame pictures.
 
 Warnings (kind):
   visible_speaker_without_dialogue  a speaker's picture is visible while their words are inaudible

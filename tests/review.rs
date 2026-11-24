@@ -560,6 +560,48 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
 }
 
 #[test]
+fn lint_counts_brief_shots_on_the_29_97_frame_grid() {
+    let dir = tempfile::tempdir().unwrap();
+    fixtures(dir.path());
+    let d = dir.path();
+    let rate = 30000.0 / 1001.0;
+    // A B-roll cutaway of 14 frames is brief; 15 frames (also `duration: 0.5`,
+    // which rounds to 15 frames, 0.5005 s) is not.
+    for (frames, duration, expected) in [
+        (14, 14.0 / rate, true),
+        (15, 15.0 / rate, false),
+        (15, 0.5, false),
+    ] {
+        let edit = write_edit(
+            d,
+            "ntsc.json",
+            json!({"version":1,"width":160,"height":90,"fps":{"num":30000,"den":1001},"video":[
+                {"clips":[{"start":0,"source":"talk.mp4","source_in":0,"duration":4.0}]},
+                {"clips":[{"start":60.0 / rate,"source":"broll.mp4","source_in":0,"duration":duration}]}]}),
+        );
+        let report = skywrite(&["review", "lint", &edit, "--no-levels"]);
+        let brief: Vec<&Value> = report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["kind"] == "brief_shot")
+            .collect();
+        if expected {
+            assert_eq!(brief.len(), 1, "{frames}: {report}");
+            assert_eq!(brief[0]["frames"], frames, "{report}");
+            assert!((brief[0]["timeline_start"].as_f64().unwrap() - 60.0 / rate).abs() < 1e-9);
+        } else {
+            assert!(brief.is_empty(), "{frames} {duration}: {report}");
+        }
+        assert_eq!(
+            report["checked"]["brief_shots_not_checked"],
+            json!([]),
+            "{report}"
+        );
+    }
+}
+
+#[test]
 fn lint_does_not_check_brief_shots_at_fades_or_dissolves() {
     let dir = tempfile::tempdir().unwrap();
     fixtures(dir.path());
