@@ -627,11 +627,17 @@ fn cancellation_reaps_real_ffmpeg_and_preserves_existing_publication() {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
-    while !marker.exists() {
+    // The wrapper's redirection creates the file before printf writes the PID.
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|text| text.parse().ok())
+        {
+            break pid;
+        }
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    };
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
     while child.try_wait().unwrap().is_none() {
         assert!(Instant::now() < deadline);

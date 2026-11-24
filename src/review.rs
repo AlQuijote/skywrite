@@ -26,11 +26,8 @@ pub enum ReviewCommand {
     Sheet(SheetArgs),
     /// Short audition clips around every cut in an edit, for listening and watching.
     Cuts(CutsArgs),
-    /// Objective checks: silent visible speakers, repeated or clipped words, sound cut off mid-flow, beds near dialogue level, brief shots.
-    #[command(
-        long_about = "Objective checks of an edit JSON, before or after rendering: a speaker visible with no dialogue audible (visible_speaker_without_dialogue), repeated or clipped words at cuts, filler words, sound cut off mid-flow, beds within 10 dB of dialogue, and brief shots: flash frames, a picture on screen for less than --min-shot-seconds between two hard cuts (brief_shot; fades and dissolves are not checked yet). Prints one JSON object with warnings (each with kind and message plus timing fields for its kind in output seconds, such as timeline_start), checked (what was measured, including min_shot_seconds, brief_shots_not_checked and uncertain_cover_sources) and limitations. It reads the edit and probes its media; it never changes the edit, renders nothing and makes no network calls. Speaker and word checks need --transcript for each dialogue source; level checks decode short audio windows (at most 256), which --no-levels skips. Use it after every edit pass; then watch and listen with `skywrite review cuts`, which these checks do not replace.",
-        after_long_help = "Brief shots (brief_shot) are checked only between hard cuts; fades and dissolves are not checked yet. They are judged from clip placement and opacity, not pixels. Each frame's picture is the visible weight of each clip: its opacity, reduced by full-frame opaque video above it, with black taking the rest. Two pictures differ by half the sum of their weight differences (1 for a cut between full-frame shots, 0.25 when a 25%-opacity full-frame overlay appears), and a cut is a frame where they differ by at least 0.25. A shot runs from one cut to the next (black lies beyond the timeline's ends), and its length is exact from the edit. It is reported when it is shorter than --min-shot-seconds and both its cuts are hard: no visible clip fades in the shot or in the frame on either side of it, and no take continues at another opacity at its cuts or inside it. That catches a flash frame, a short cutaway, a short overlay at partial opacity, or a black gap cut in and out. A shot with a fade, dissolve or opacity change at either cut is never reported; when its clip edges are under the threshold it is listed in checked.brief_shots_not_checked (timeline_start, timeline_end) to watch with skywrite review cuts. Not cuts: clips at opacity 0, a straight split continuing the same take (same source and track, contiguous within one frame of the slower clip's source step), and cuts under full-frame opaque video on a higher track. Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE argb) never hide or dim what is beneath them, so a cut under them counts fully, but a partial-opacity one of them must be about twice as opaque to count (0.5 rather than 0.25). Each brief_shot warning has frames, timeline_start and timeline_end.\n\nExamples:\n  skywrite review lint edit.json --no-levels\n      Fast picture-only pass: reports flash frames shorter than 0.5 s.\n  skywrite review lint edit.json --transcript talk.transcript.json --min-shot-seconds 1\n      All checks, with shots under 1 s reported as brief.\n  skywrite review lint edit.json --min-shot-seconds 0\n      Turns the brief-shot check off."
-    )]
+    /// Objective checks of an edit before rendering, including brief shots between hard cuts; pass --transcript WORDS.json for each dialogue source, or the word checks (unfinished endings, dead air, repeated or clipped words, silent visible speakers) do not run.
+    #[command(long_about = LINT_ABOUT, after_long_help = LINT_EXAMPLES)]
     Lint(LintArgs),
 }
 
@@ -85,6 +82,9 @@ pub struct LintArgs {
     /// Skip audio level measurements (faster; disables level checks).
     #[arg(long)]
     pub no_levels: bool,
+    /// Longest silence between heard dialogue words, in timeline seconds, before a dead_air warning (0.1 to 10).
+    #[arg(long, default_value_t = 0.6, value_name = "SECONDS")]
+    pub dead_air_seconds: f64,
     /// Report shots on screen for less than this many seconds (flash frames).
     ///
     /// Seconds of output time, 0 to 10 (default 0.5); 0 turns the brief-shot
@@ -95,6 +95,33 @@ pub struct LintArgs {
     #[arg(long, default_value_t = 0.5, value_name = "SECONDS")]
     pub min_shot_seconds: f64,
 }
+
+const LINT_ABOUT: &str = "Objective checks of an edit before you render it, from the edit JSON and word-timed transcripts. It never changes the edit and never judges taste.
+
+Run it on every draft, before skywrite edit render; after rendering, check the file with skywrite verify. Supply one --transcript per dialogue source (from skywrite transcribe; usage.source_sha256 must match the media). Without transcripts only the level and brief-shot checks run. The report's not_checked list (also printed to stderr) says which checks were skipped, which dialogue sources had no transcript and which short shots brief_shot did not check because of a fade or dissolve.
+
+Warnings (kind):
+  visible_speaker_without_dialogue  a speaker's picture is visible while their words are inaudible
+  repeated_word_across_cut / repeated_word_in_select  the same word twice in a row
+  word_clipped_at_cut               a cut inside a transcribed word
+  filler_words                      um, uh and similar inside audible dialogue
+  unfinished_ending                 the edit's last heard dialogue stops mid-thought: reasons no_sentence_final_punctuation (the last kept word has no . ! ? or similar; only judged when the transcript has punctuation), next_word_continues (the next source word, within 2 s, is a continuation such as and, but, so, because, which; also common German, French, Spanish, Italian, Portuguese and Dutch ones), open_list (a counted list such as \"three reasons\" or first/second stops before its last item). It reports the last heard words, the cut-off source words and their times.
+  dead_air                          silences between heard dialogue words longer than --dead-air-seconds (default 0.6 s), measured on the output timeline after cuts, speed changes, J/L cuts and muted B-roll sound. Each item has timeline_start, timeline_end, seconds, the words either side, across_cut and other_sound (music or effects audible in the gap, which does not hide a pause). Silence before the first and after the last word is not counted. A deliberate pause is marked in the edit itself: a top-level \"pauses\": [{\"start\": 41.2, \"end\": 43, \"note\": \"laugh\"}] (timeline seconds) passes any gap it covers except for at most --dead-air-seconds; those gaps are listed in checked.dead_air.excluded_by_pause.
+  sound_cut_mid_flow                a clip ends while its source keeps sounding (applause, music tails)
+  bed_close_to_dialogue             music or ambience within 10 dB of the dialogue
+  brief_shot                        a picture on screen for less than --min-shot-seconds (default 0.5 s) between two hard cuts: a flash frame, a short cutaway or a black gap. Fades and dissolves are not checked yet.
+
+Brief shots (brief_shot) are checked only between hard cuts; fades and dissolves are not checked yet. They are judged from clip placement and opacity, not pixels. Each frame's picture is the visible weight of each clip: its opacity, reduced by full-frame opaque video above it, with black taking the rest. Two pictures differ by half the sum of their weight differences (1 for a cut between full-frame shots, 0.25 when a 25%-opacity full-frame overlay appears), and a cut is a frame where they differ by at least 0.25. A shot runs from one cut to the next (black lies beyond the timeline's ends), and its length is exact from the edit. It is reported when it is shorter than --min-shot-seconds and both its cuts are hard: no visible clip fades in the shot or in the frame on either side of it, and no take continues at another opacity at its cuts or inside it. That catches a flash frame, a short cutaway, a short overlay at partial opacity, or a black gap cut in and out. A shot with a fade, dissolve or opacity change at either cut is never reported; when its clip edges are under the threshold it is listed in checked.brief_shots_not_checked (timeline_start, timeline_end) to watch with skywrite review cuts. Not cuts: clips at opacity 0, a straight split continuing the same take (same source and track, contiguous within one frame of the slower clip's source step), and cuts under full-frame opaque video on a higher track. Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE argb) never hide or dim what is beneath them, so a cut under them counts fully, but a partial-opacity one of them must be about twice as opaque to count (0.5 rather than 0.25). Video whose pixel format FFmpeg does not describe never counts as cover either and is listed in checked.uncertain_cover_sources. Each brief_shot warning has frames, timeline_start and timeline_end; checked.min_shot_seconds is the threshold used.
+
+Transcript checks are only as good as the transcript: missing words (laughter, crosstalk) read as silence, and word times are alignment estimates (Parakeet, for example, uses 80 ms steps). The JSON's checked object says what was and was not measured. Cost: no network; only the level checks decode audio (at most 256 short windows; --no-levels skips them). Exit status is 0 with warnings; it fails only on unreadable inputs or mismatched transcripts.";
+
+const LINT_EXAMPLES: &str = "Examples:
+  skywrite review lint edit.json --transcript talk.transcript.json
+  skywrite review lint edit.json --transcript host.json --transcript guest.json --no-levels --dead-air-seconds 0.8
+  skywrite review lint edit.json --no-levels --min-shot-seconds 1
+      Shots under 1 s between hard cuts are reported as brief (default 0.5 s).
+  skywrite review lint edit.json --min-shot-seconds 0
+      Turns the brief-shot check off.";
 
 pub fn execute(command: ReviewCommand) -> Result<Value> {
     match command {
@@ -637,6 +664,10 @@ fn lint(args: &LintArgs) -> Result<Value> {
         args.min_shot_seconds.is_finite() && (0.0..=10.0).contains(&args.min_shot_seconds),
         "--min-shot-seconds must be 0..10 seconds"
     );
+    ensure!(
+        args.dead_air_seconds.is_finite() && (0.1..=10.0).contains(&args.dead_air_seconds),
+        "--dead-air-seconds must be 0.1..10"
+    );
     let edit = timeline::load_and_validate(&args.edit)?;
     let mut transcripts = HashMap::<PathBuf, Transcript>::new();
     for path in &args.transcript {
@@ -789,7 +820,7 @@ fn lint(args: &LintArgs) -> Result<Value> {
     // listed in checked.brief_shots_not_checked when their clip edges are
     // under the threshold.
     let mut brief = Vec::new();
-    let mut not_checked = Vec::new();
+    let mut brief_not_checked = Vec::new();
     if args.min_shot_seconds > 0.0 {
         // Frames strictly under the threshold: ceil(threshold * fps) frames
         // or more are long enough.
@@ -799,7 +830,7 @@ fn lint(args: &LintArgs) -> Result<Value> {
                 if shot.hard {
                     brief.push(shot);
                 } else {
-                    not_checked.push(json!({
+                    brief_not_checked.push(json!({
                         "timeline_start": fps.seconds(shot.start),
                         "timeline_end": fps.seconds(shot.end),
                     }));
@@ -931,6 +962,12 @@ fn lint(args: &LintArgs) -> Result<Value> {
         }));
     }
 
+    // 2c. Where the edit's dialogue stops, and pauses between heard words.
+    let ending = unfinished_ending(&spans, &transcripts, fps.seconds(1));
+    warnings.extend(ending.warning);
+    let dead = dead_air(&spans, &transcripts, args.dead_air_seconds, &edit.pauses);
+    warnings.extend(dead.warning);
+
     // 3 and 4 need decoded audio levels.
     let mut measurements = 0usize;
     let mut levels_checked = false;
@@ -1047,6 +1084,20 @@ fn lint(args: &LintArgs) -> Result<Value> {
             }
         }
     }
+    let mut not_checked = transcript_gaps(&spans, &transcripts);
+    if !brief_not_checked.is_empty() {
+        let count = brief_not_checked.len();
+        not_checked.push(format!(
+            "{count} shot{} under --min-shot-seconds by clip edges {} a fade, dissolve or opacity change at a cut, so brief_shot did not check {} (fades and dissolves are not checked yet); watch {} with skywrite review cuts (spans in checked.brief_shots_not_checked)",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "has" } else { "have" },
+            if count == 1 { "it" } else { "them" },
+            if count == 1 { "it" } else { "them" },
+        ));
+    }
+    for line in &not_checked {
+        eprintln!("review lint: {line}");
+    }
     warnings.sort_by(|a, b| {
         a["timeline_start"]
             .as_f64()
@@ -1063,9 +1114,12 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "levels": levels_checked,
             "min_shot_seconds": args.min_shot_seconds,
             "uncertain_cover_sources": uncertain_cover,
-            "brief_shots_not_checked": not_checked,
+            "brief_shots_not_checked": brief_not_checked,
             "level_measurements": measurements,
+            "ending": ending.checked,
+            "dead_air": dead.checked,
         },
+        "not_checked": not_checked,
         "limitations": [
             "Checks are objective signals, not editorial judgement: they cannot assess delivery, emotional fit, B-roll relevance or music choice.",
             "Speaker and repetition checks only cover sources whose transcripts were supplied, and only as well as those transcripts capture what was said.",
@@ -1074,6 +1128,488 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement and opacity, not pixels: only full-frame video whose pixel format has no alpha channel covers what is beneath it, so cuts under stills, letterboxed pictures and alpha-capable video (even fully opaque ProRes 4444) count as visible and can add warnings; video whose pixel format FFmpeg does not describe is listed in checked.uncertain_cover_sources and never covers; overlays that do not cover the frame never dim what is beneath, so at partial opacity they count about half as much; and changes inside a clip's own picture (a cut baked into the source) are not seen."
         ],
     }))
+}
+
+// ---------------------------------------------------------------- endings and pauses
+
+/// What the word checks could not cover: no transcripts at all, or audible
+/// dialogue-role sources without one.
+fn transcript_gaps(
+    spans: &[timeline::AudibleSpan],
+    transcripts: &HashMap<PathBuf, Transcript>,
+) -> Vec<String> {
+    if transcripts.is_empty() {
+        return vec!["no --transcript was supplied, so unfinished_ending, dead_air, repeated, clipped and filler words and silent visible speakers were not checked; pass --transcript WORDS.json (from skywrite transcribe) for each dialogue source".into()];
+    }
+    let mut missing: Vec<String> = spans
+        .iter()
+        .filter(|s| s.role == Some(timeline::Role::Dialogue) && !transcripts.contains_key(s.source))
+        .map(|s| s.source.display().to_string())
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+        .into_iter()
+        .map(|source| {
+            format!("dialogue source {source} has no --transcript, so its words were not checked")
+        })
+        .collect()
+}
+
+/// One lint check's warning (if any) and what it measured.
+struct LintCheck {
+    warning: Option<Value>,
+    checked: Value,
+}
+
+/// Sentence-final punctuation, ignoring closing quotes and brackets. An
+/// ellipsis trails off, so it does not end the thought.
+fn ends_sentence(text: &str) -> bool {
+    let text = text.trim_end_matches(|c: char| c.is_whitespace() || "\"'”’»)]".contains(c));
+    if text.ends_with("..") || text.ends_with('…') {
+        return false;
+    }
+    text.ends_with(['.', '!', '?', '。', '！', '？', '؟', '।', '‽'])
+}
+
+/// Words that join the next clause to this one, even at the start of a new
+/// sentence ("And that's why…"). English, German, French, Spanish, Italian,
+/// Portuguese and Dutch; words that are also common English words are left out.
+const JOINING_WORDS: &[&str] = &[
+    "and", "but", "so", "because", "cause", "cos", "or", "nor", "plus", "und", "aber", "weil",
+    "oder", "denn", "sondern", "et", "mais", "parce", "donc", "ou", "y", "pero", "porque", "sino",
+    "e", "ma", "perché", "quindi", "però", "oppure", "mas", "porém", "maar", "omdat", "dus",
+];
+/// Words that continue a clause when the previous word has no sentence-final
+/// punctuation, but often start a new sentence after one.
+const CLAUSE_WORDS: &[&str] = &[
+    "then", "which", "that", "who", "whose", "whom", "where", "although", "though", "unless",
+    "until", "while", "whereas", "since", "if", "when", "also", "whether", "dass", "wenn",
+    "obwohl", "damit", "quand", "lorsque", "puisque", "alors", "puis", "entonces", "pues",
+    "aunque", "cuando", "mentre", "allora", "então", "enquanto", "terwijl", "toen",
+];
+const LIST_NOUNS: &[&str] = &[
+    "things",
+    "reasons",
+    "ways",
+    "steps",
+    "tips",
+    "points",
+    "questions",
+    "ideas",
+    "rules",
+    "lessons",
+    "mistakes",
+    "parts",
+    "options",
+    "problems",
+    "examples",
+    "tricks",
+    "secrets",
+    "factors",
+    "stages",
+    "phases",
+    "principles",
+    "benefits",
+    "myths",
+    "signs",
+    "types",
+    "kinds",
+];
+
+fn count_word(word: &str) -> Option<u32> {
+    let words = [
+        "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    ];
+    words
+        .iter()
+        .position(|w| *w == word)
+        .map(|i| i as u32 + 2)
+        .or_else(|| word.parse::<u32>().ok().filter(|n| (2..=10).contains(n)))
+}
+
+fn ordinal(word: &str) -> Option<u32> {
+    let ordinals = [
+        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
+        "tenth",
+    ];
+    let word = word.strip_suffix("ly").unwrap_or(word);
+    ordinals
+        .iter()
+        .position(|w| *w == word)
+        .map(|i| i as u32 + 1)
+}
+
+fn closes_list(word: &str) -> bool {
+    matches!(word, "finally" | "lastly" | "last")
+}
+
+/// A counted list that is still open where the heard dialogue stops: an
+/// announced count ("three reasons") with fewer items reached, or an ordinal
+/// sequence whose next item follows in the source after the cut.
+fn open_list(words: &[HeardRun], next: &[&Word], end: f64) -> Option<Value> {
+    let normalized: Vec<String> = words.iter().map(|w| normalize(&w.word.text)).collect();
+    let announced = (0..normalized.len()).rev().find_map(|i| {
+        let count = count_word(&normalized[i])?;
+        normalized[i + 1..]
+            .iter()
+            .take(3)
+            .any(|w| LIST_NOUNS.contains(&w.as_str()))
+            .then_some((i, count))
+    });
+    let reached_after = |from: usize| {
+        let after = &normalized[from..];
+        let reached = after.iter().filter_map(|w| ordinal(w)).max().unwrap_or(0);
+        (reached, after.iter().any(|w| closes_list(w)))
+    };
+    if let Some((index, count)) = announced {
+        let (reached, closed) = reached_after(index + 1);
+        if reached < count && !closed {
+            return Some(
+                json!({"announced": count, "announced_at": words[index].start,
+                "words": words[index..].iter().take(4).map(|w| w.word.text.as_str()).collect::<Vec<_>>().join(" "),
+                "reached": reached}),
+            );
+        }
+        return None;
+    }
+    // Ordinals heard in the last minute, with the next one just after the cut.
+    let from = words.iter().position(|w| w.end >= end - 60.0).unwrap_or(0);
+    let (reached, closed) = reached_after(from);
+    if reached == 0 || closed {
+        return None;
+    }
+    let after_cut = next
+        .iter()
+        .find(|w| ordinal(&normalize(&w.text)) == Some(reached + 1))?;
+    Some(
+        json!({"reached": reached, "next_item_word": after_cut.text, "next_item_source_seconds": after_cut.start}),
+    )
+}
+
+/// Whether the edit's last heard dialogue stops mid-thought.
+fn unfinished_ending(
+    spans: &[timeline::AudibleSpan],
+    transcripts: &HashMap<PathBuf, Transcript>,
+    frame: f64,
+) -> LintCheck {
+    // The heard dialogue's end, from the gain-aware runs: a word whose tail is
+    // muted still ends the dialogue where it stops being heard.
+    let runs = heard_runs(spans, transcripts);
+    let Some(last) = runs.iter().max_by(|a, b| a.end.total_cmp(&b.end)) else {
+        return LintCheck {
+            warning: None,
+            checked: json!({"measured": false, "reason": "no dialogue words are heard"}),
+        };
+    };
+    let source = spans[last.span].source;
+    let transcript = &transcripts[source];
+    let punctuated = transcript.words.iter().any(|w| ends_sentence(&w.text));
+    // The final continuous playback: the last clip and the clips that run
+    // straight into it (same source, contiguous in source and timeline).
+    let mut playback = vec![last.span];
+    while let Some(previous) = spans.iter().enumerate().position(|(i, o)| {
+        let current = &spans[*playback.last().unwrap_or(&last.span)];
+        !playback.contains(&i)
+            && o.source == current.source
+            && (o.source_in + o.duration * o.speed - current.source_in).abs()
+                <= frame * o.speed.max(current.speed) * 1.01
+            && (o.start + o.duration - current.start).abs() <= frame * 1.01
+    }) {
+        playback.push(previous);
+    }
+    // The source words after the cut: from the last heard word on, minus the
+    // words that playback already played (overlapping words are not cut off;
+    // words played earlier in the edit, out of order, still are).
+    let heard = |word: &Word| {
+        runs.iter()
+            .any(|r| playback.contains(&r.span) && std::ptr::eq(r.word, word))
+    };
+    let mut next: Vec<&Word> = transcript
+        .words
+        .iter()
+        .filter(|w| w.start >= last.word.start && w.start <= last.word.end + 30.0 && !heard(w))
+        .collect();
+    next.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let finished = ends_sentence(&last.word.text);
+    let mut reasons = Vec::new();
+    if punctuated && !finished {
+        reasons.push(json!({"reason": "no_sentence_final_punctuation", "word": last.word.text}));
+    }
+    if let Some(following) = next.first()
+        && following.start - last.word.end <= 2.0
+    {
+        let word = normalize(&following.text);
+        if JOINING_WORDS.contains(&word.as_str())
+            || (!(punctuated && finished) && CLAUSE_WORDS.contains(&word.as_str()))
+        {
+            reasons.push(json!({"reason": "next_word_continues", "word": following.text, "source_seconds": following.start}));
+        }
+    }
+    // Heard words in timeline order, a word split by a cut or a mute once.
+    let mut heard_words: Vec<HeardRun> = Vec::new();
+    for run in &runs {
+        if let Some(previous) = heard_words.last_mut()
+            && std::ptr::eq(previous.word, run.word)
+        {
+            previous.end = previous.end.max(run.end);
+            continue;
+        }
+        heard_words.push(HeardRun {
+            start: run.start,
+            end: run.end,
+            word: run.word,
+            span: run.span,
+        });
+    }
+    let list = open_list(&heard_words, &next, last.end);
+    if let Some(list) = &list {
+        let mut list = list.clone();
+        list["reason"] = json!("open_list");
+        reasons.push(list);
+    }
+    let mut tail: Vec<&str> = Vec::new();
+    for run in runs.iter().filter(|r| r.end <= last.end).rev() {
+        if tail.len() == 6 {
+            break;
+        }
+        // A word split by a cut or a mute is one word.
+        if tail.last() != Some(&run.word.text.as_str()) {
+            tail.push(run.word.text.as_str());
+        }
+    }
+    tail.reverse();
+    let cut_off: Vec<&str> = next.iter().take(6).map(|w| w.text.as_str()).collect();
+    let checked = json!({
+        "measured": true,
+        "last_word": last.word.text,
+        "timeline_end": last.end,
+        "source": source,
+        "source_seconds": last.word.end,
+        "punctuation": if punctuated {"judged"} else {"not judged: the transcript has no sentence-final punctuation"},
+        "next_source_words": cut_off.join(" "),
+        "continuation_languages": "English, German, French, Spanish, Italian, Portuguese, Dutch",
+        "counted_lists": "English number words, digits 2-10 and ordinals",
+    });
+    let warning = (!reasons.is_empty()).then(|| {
+        json!({
+            "kind": "unfinished_ending",
+            "timeline_start": last.start,
+            "timeline_end": last.end,
+            "source": source,
+            "source_seconds": last.word.end,
+            "last_words": tail.join(" "),
+            "next_source_words": cut_off.join(" "),
+            "reasons": reasons,
+            "message": format!(
+                "The edit's dialogue ends at {:.2}s on \"{}\", which may stop mid-thought (next in the source: \"{}\"). Listen to the ending; extend it to the end of the sentence or list, or end on an earlier complete thought.",
+                last.end, tail.join(" "), cut_off.join(" ")
+            ),
+        })
+    });
+    LintCheck { warning, checked }
+}
+
+/// A stretch of one transcribed word heard through one clip, on the timeline.
+struct HeardRun<'a> {
+    start: f64,
+    end: f64,
+    word: &'a Word,
+    span: usize,
+}
+
+/// Every stretch of every transcribed word that a clip plays with its gain
+/// above zero, computed per clip (so a word split by a cut keeps each part's
+/// own gain) and sampled every 10 ms (at most 1000 samples per word).
+fn heard_runs<'a>(
+    spans: &[timeline::AudibleSpan],
+    transcripts: &'a HashMap<PathBuf, Transcript>,
+) -> Vec<HeardRun<'a>> {
+    let mut runs = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        let Some(transcript) = transcripts.get(span.source) else {
+            continue;
+        };
+        let source_end = span.source_in + span.duration * span.speed;
+        for word in &transcript.words {
+            if word.end <= span.source_in || word.start >= source_end {
+                continue;
+            }
+            let t0 = span.start + (word.start.max(span.source_in) - span.source_in) / span.speed;
+            let t1 = span.start + (word.end.min(source_end) - span.source_in) / span.speed;
+            let steps = (((t1 - t0) / 0.01).ceil() as usize).clamp(1, 1000);
+            let at = |i: usize| t0 + (t1 - t0) * i as f64 / steps as f64;
+            let heard_at = |t: f64| {
+                span.mix
+                    .gain((t - span.start).clamp(0.0, span.duration), span.duration)
+                    > 0.0
+            };
+            let audible = |i: usize| heard_at(at(i));
+            // The samples find where the gain changes; the exact point between
+            // two samples is found by bisection, so a fade ending at a word's
+            // end ends the heard run there, not a sample earlier.
+            let edge = |mut heard: f64, mut silent: f64| {
+                for _ in 0..40 {
+                    let middle = (heard + silent) / 2.0;
+                    if heard_at(middle) {
+                        heard = middle;
+                    } else {
+                        silent = middle;
+                    }
+                }
+                (heard + silent) / 2.0
+            };
+            let mut run: Option<(f64, f64)> = None;
+            for i in 0..=steps {
+                if audible(i) {
+                    run = Some(match run {
+                        Some((start, _)) => (start, at(i)),
+                        None if i > 0 => (edge(at(i), at(i - 1)), at(i)),
+                        None => (at(i), at(i)),
+                    });
+                } else if let Some((start, _)) = run.take() {
+                    runs.push(HeardRun {
+                        start,
+                        end: edge(at(i - 1), at(i)),
+                        word,
+                        span: index,
+                    });
+                }
+            }
+            if let Some((start, end)) = run {
+                runs.push(HeardRun {
+                    start,
+                    end,
+                    word,
+                    span: index,
+                });
+            }
+        }
+    }
+    runs.sort_by(|a, b| a.start.total_cmp(&b.start));
+    runs
+}
+
+/// Silences longer than `threshold` between heard dialogue words, on the
+/// output timeline. A gap the edit's `pauses` cover, except for at most
+/// `threshold`, is deliberate.
+fn dead_air(
+    spans: &[timeline::AudibleSpan],
+    transcripts: &HashMap<PathBuf, Transcript>,
+    threshold: f64,
+    pauses: &[timeline::Pause],
+) -> LintCheck {
+    let mut items = Vec::new();
+    let mut excluded = Vec::new();
+    let mut gaps = 0usize;
+    // Only the parts of words whose gain is above zero are heard, so volume
+    // automation that mutes part of a word opens a gap where it falls silent.
+    let heard = heard_runs(spans, transcripts);
+    // The heard run that ends last so far, so overlapping speakers are one stream.
+    let mut latest: Option<&HeardRun> = None;
+    for word in &heard {
+        if let Some(previous) = latest {
+            gaps += 1;
+            let (start, end) = (previous.end, word.start);
+            if end - start > threshold + 1e-9 {
+                let overlapping =
+                    |s: &&timeline::AudibleSpan| s.start < end && s.start + s.duration > start;
+                let labels = |dialogue: bool| -> Vec<String> {
+                    spans
+                        .iter()
+                        .filter(overlapping)
+                        .filter(|s| !transcripts.contains_key(s.source))
+                        .filter(|s| (s.role == Some(timeline::Role::Dialogue)) == dialogue)
+                        .map(|s| s.label.clone())
+                        .collect()
+                };
+                let item = json!({
+                    "timeline_start": start,
+                    "timeline_end": end,
+                    "seconds": end - start,
+                    "before": previous.word.text,
+                    "after": word.word.text,
+                    "across_cut": previous.span != word.span,
+                    "other_sound": labels(false),
+                    "untranscribed_dialogue": labels(true),
+                });
+                let covered: f64 = pauses
+                    .iter()
+                    .map(|p| (p.end.min(end) - p.start.max(start)).max(0.0))
+                    .sum();
+                if covered > 0.0 && end - start - covered <= threshold + 1e-9 {
+                    let mut item = item;
+                    item["pause_notes"] = json!(
+                        pauses
+                            .iter()
+                            .filter(|p| p.start < end && p.end > start)
+                            .map(|p| p.note.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    excluded.push(item);
+                } else {
+                    items.push(item);
+                }
+            }
+        }
+        if latest.is_none_or(|l| word.end > l.end) {
+            latest = Some(word);
+        }
+    }
+    let checked = json!({
+        "threshold_seconds": threshold,
+        "word_gaps_measured": gaps,
+        "pauses": pauses,
+        "excluded_by_pause": excluded,
+        "basis": "transcript word times mapped to the output timeline; silence before the first and after the last heard word is not counted",
+    });
+    let warning = (!items.is_empty()).then(|| {
+        let longest = items
+            .iter()
+            .max_by(|a, b| a["seconds"].as_f64().unwrap_or(0.0).total_cmp(&b["seconds"].as_f64().unwrap_or(0.0)))
+            .cloned()
+            .unwrap_or(Value::Null);
+        json!({
+            "kind": "dead_air",
+            "timeline_start": items[0]["timeline_start"],
+            "count": items.len(),
+            "threshold_seconds": threshold,
+            "longest_seconds": longest["seconds"],
+            "items": items.iter().take(64).collect::<Vec<_>>(),
+            "message": format!(
+                "{} pause(s) longer than {threshold} s between heard dialogue words (longest {:.2} s at {:.2}s). Listen with skywrite review cuts; tighten the cut, or mark a deliberate beat in the edit's pauses list (start and end in timeline seconds, optional note).",
+                items.len(),
+                longest["seconds"].as_f64().unwrap_or(0.0),
+                longest["timeline_start"].as_f64().unwrap_or(0.0),
+            ),
+        })
+    });
+    LintCheck { warning, checked }
+}
+
+#[cfg(test)]
+mod ending_tests {
+    use super::*;
+
+    #[test]
+    fn sentence_ends_and_continuations() {
+        for finished in ["late.", "Done!", "really?", "end.\"", "(quoted.)", "完了。"] {
+            assert!(ends_sentence(finished), "{finished}");
+        }
+        for open in ["early,", "and", "so...", "well…", "plan"] {
+            assert!(!ends_sentence(open), "{open}");
+        }
+        assert!(JOINING_WORDS.contains(&normalize("And,").as_str()));
+        assert!(JOINING_WORDS.contains(&normalize("Weil").as_str()));
+        assert!(CLAUSE_WORDS.contains(&normalize("which").as_str()));
+        assert!(!JOINING_WORDS.contains(&"the") && !CLAUSE_WORDS.contains(&"the"));
+        assert_eq!(count_word("three"), Some(3));
+        assert_eq!(count_word("10"), Some(10));
+        assert_eq!(count_word("one"), None);
+        assert_eq!(ordinal("secondly"), Some(2));
+        assert_eq!(ordinal("third"), Some(3));
+        assert_eq!(ordinal("early"), None);
+    }
 }
 
 /// Share of the picture that must change at once for a cut (see

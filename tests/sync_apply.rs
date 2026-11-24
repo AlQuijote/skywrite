@@ -455,6 +455,67 @@ fn segmented_result_places_one_clip_per_segment() {
     assert!(!ok && wrong.to_string().contains("--clip"), "{wrong}");
 }
 
+/// An offset just past a frame boundary (within the frame-grid snap) places
+/// the asset from its first sample on that frame. FFmpeg 9.1's decode of the
+/// scratch track in the short-overlap test measures 18.000000004 s, which used
+/// to give source_in -4e-9 s and no placement at all.
+#[test]
+fn offset_within_the_frame_snap_places_from_the_asset_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    camera(dir, 30.0);
+    wav(&dir.join("recorder.wav"), 20.0, 18.0, 1.0);
+    camera_edit(dir, 0.0, 0.0, 30.0);
+    // 24 fps: the snap is 1e-6 frame = 4.2e-8 s.
+    for (offset, start, source_in) in [
+        (18.000000004, 18.0, 0.0),
+        (18.00000004, 18.0, 0.0),
+        (17.99999996, 18.0, 4e-8),
+        (18.0000001, 18.0 + 1.0 / 24.0, 1.0 / 24.0 - 1e-7),
+    ] {
+        let segment = json!({"asset_range":[0.0, 20.0],"offset_seconds":offset,"scale":1.0,"playback_rate":1.0,
+            "drift_ppm":0.0,"drift_estimated":true,"quality":"strong","inliers":40,"anchor_span_seconds":10.0,
+            "asset_interval":[1.0, 11.0],"reference_interval":[offset + 1.0, offset + 11.0],
+            "median_error_seconds":0.0001,"p95_error_seconds":0.0003,"scale_uncertainty_ppm":1.0});
+        write(
+            &dir.join("snap.json"),
+            &json!({"version":1,"method":"audio_waveform","reference":dir.join("camera.mp4").canonicalize().unwrap(),
+                "asset":dir.join("recorder.wav").canonicalize().unwrap(),
+                "mapping":"reference_time = offset_seconds + scale * asset_time",
+                "offset_seconds":offset,"scale":1.0,"playback_rate":1.0,"drift_ppm":0.0,"drift_estimated":true,
+                "quality":"strong","candidate_matches":40,"inliers":40,"inlier_ratio":1.0,"anchor_span_seconds":10.0,
+                "asset_interval":[1.0,11.0],"reference_interval":[offset + 1.0, offset + 11.0],"median_error_seconds":0.0001,
+                "p95_error_seconds":0.0003,"scale_uncertainty_ppm":1.0,"timing_resolution_seconds":0.0005,
+                "strong_p95_limit_seconds":0.005,"discontinuous":false,"segments":[segment],"warnings":[],"anchors":[]}),
+        );
+        let _ = std::fs::remove_file(dir.join("snap-out.json"));
+        let (ok, out) = skywrite(
+            dir,
+            &[
+                "sync",
+                "apply",
+                "--sync",
+                "snap.json",
+                "--edit",
+                "edit.json",
+                "-o",
+                "snap-out.json",
+            ],
+        );
+        assert!(ok, "offset {offset}: {out}");
+        let p = &out["placements"][0];
+        assert!(
+            (p["start"].as_f64().unwrap() - start).abs() < 1e-12,
+            "offset {offset}: {out}"
+        );
+        let placed = p["source_in"].as_f64().unwrap();
+        assert!(
+            placed >= 0.0 && (placed - source_in).abs() < 1e-9,
+            "offset {offset}: {out}"
+        );
+    }
+}
+
 #[test]
 fn reference_audio_clip_on_the_destination_track_is_muted_after_sorting() {
     let tmp = tempfile::tempdir().unwrap();

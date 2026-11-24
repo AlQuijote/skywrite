@@ -312,7 +312,10 @@ fn checked_timing(path: &Path) -> Result<crate::media::AudioTiming> {
     }
     Ok(timing)
 }
-fn loudness_stats(
+/// EBU R128 measurements of the first audio stream (FFmpeg `loudnorm`
+/// analysis: `input_i` LUFS, `input_tp` dBTP, `input_lra` LU, `input_thresh`),
+/// as the strings loudnorm prints; digital silence reports `-inf`.
+pub(crate) fn loudness_stats(
     path: &Path,
     target: f64,
     peak: f64,
@@ -538,7 +541,7 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
     let speed_filters = crate::stretch::SpeedFilters::resolve(options.stretcher, options.tempo)?;
     if let Some(speed) = options.tempo {
         filter.push(',');
-        filter.push_str(&speed_filters.filter(speed, selection_samples)?);
+        filter.push_str(&speed_filters.filter(speed, selection_samples, "tempo")?);
     }
     filter_file(&source, &prepared, &filter, deadline)?;
     let prepared_timing = checked_timing(&prepared)?;

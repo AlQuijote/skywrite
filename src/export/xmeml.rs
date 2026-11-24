@@ -521,6 +521,7 @@ pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<(String,
                 fps.frames(c.start)
             )
         })
+        .chain(pause_markers(edit, fps, &mut notes))
         .collect();
     let out = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE xmeml>\n<xmeml version=\"5\"><sequence id=\"sequence-1\" explodedTracks=\"true\"><name>{name}</name><duration>{duration}</duration>{rate}<timecode>{rate}<string>00:00:00:00</string><frame>0</frame><displayformat>NDF</displayformat></timecode><media><video><format><samplecharacteristics>{rate}<width>{width}</width><height>{height}</height><anamorphic>FALSE</anamorphic><pixelaspectratio>square</pixelaspectratio><fielddominance>none</fielddominance></samplecharacteristics></format>{video_tracks}</video><audio><numOutputChannels>2</numOutputChannels><format><samplecharacteristics><depth>16</depth><samplerate>48000</samplerate></samplecharacteristics></format>{OUTPUTS}{audio_tracks}</audio></media>{markers}</sequence></xmeml>\n",
@@ -531,6 +532,32 @@ pub(super) fn compile(edit: &ValidatedEdit, urls: &MediaUrls) -> Result<(String,
         height = edit.height,
     );
     Ok((out, notes))
+}
+
+/// Pauses as whole-frame sequence markers, kept inside the sequence and
+/// apart from each other; a pause that rounds to no frame is left out (noted).
+fn pause_markers(edit: &ValidatedEdit, fps: Rational, notes: &mut Vec<String>) -> Vec<String> {
+    let mut markers = Vec::new();
+    let mut previous_out = 0;
+    let mut dropped = 0usize;
+    for p in &edit.pauses {
+        let start = fps.frames(p.start).max(previous_out);
+        let end = fps.frames(p.end).min(edit.duration_frames);
+        if end <= start {
+            dropped += 1;
+            continue;
+        }
+        previous_out = end;
+        markers.push(format!(
+            "<marker><name>{}</name><comment>{}</comment><in>{start}</in><out>{end}</out></marker>",
+            crate::timeline::PAUSE_MARKER,
+            xml(&p.note),
+        ));
+    }
+    if dropped > 0 {
+        notes.push(format!("{dropped} pause(s) shorter than a frame after rounding to whole frames were not written as Premiere markers"));
+    }
+    markers
 }
 
 #[cfg(test)]

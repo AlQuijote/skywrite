@@ -85,8 +85,9 @@ recorder.
 
 `source_in` is measured from the source's first presented sample (the container's
 reported presentation start). Inspection reports elapsed presentation duration:
-Matroska/WebM's ending timestamp is rebased to that start; MP4 and MPEG-TS
-already report elapsed duration. `duration` is always **output seconds**;
+Matroska/WebM's ending timestamp is rebased to that start; MPEG-TS already
+reports elapsed duration; for MP4/MOV it is the span of the audio and video streams' own start
+and duration (FFmpeg 5.1 reports an MP4's header duration from 0 instead). `duration` is always **output seconds**;
 `speed` is **source seconds per output second**. A 10-second output clip at speed
 1.01 consumes 10.1 source seconds. Source trims are not timeline positions.
 
@@ -107,10 +108,18 @@ FFmpeg is checked once per command (`ffmpeg -hide_banner -filters`), only when a
 clip needs stretching. `rubberband` runs with `window=short:channels=together`.
 FFmpeg's filter leaves the library's latency in its output, off by an amount
 that depends on speed (14.7 ms early at 0.5x, 6.1 ms late at 2x), so Skywrite pads the clip audio with 16384 samples
-of silence at each end and drops the leading output samples that a calibration
+at each end and drops the leading output samples that a calibration
 measured for that exact speed: five 50 ms bursts through the same filter chain on
 this FFmpeg. Above 2x it chains 2x stages; a single 4–8x stage loses most of a
-short sound and moves it by up to 28 ms. `atempo` cannot be corrected the same
+short sound and moves it by up to 28 ms. The pad before the clip is its own
+first 16384 samples time-reversed (a shorter clip is looped to that length first), not silence: a silent pad made every stretched
+clip start after an artificial onset, which rubberband rendered 3.5 dB quiet for
+150 ms on pink noise and, with some library versions, 15 dB quiet on a steady
+tone ([validation](validation.md#ffmpeg-version-compatibility)); the pad after it
+is silence. A pure tone after digital silence inside a clip can still come out
+up to 15 dB low with rubberband, depending on frequency, speed and library, and
+a short pure-tone clip sped up (0.8x and faster) can come out 2–9 dB low
+depending on the phase at the cut; broadband sound is not affected that way. `atempo` cannot be corrected the same
 way, because its offset moves between events. Measured with FFmpeg 8.0.1 and
 librubberband 4.0 (onsets of 10 ms clicks every 2 s, AAC render):
 
@@ -246,7 +255,8 @@ Unlinked sound becomes audio tracks. Stereo partners merge only when source,
 start, end, in point, speed and enabled state match and their source channels differ
 (or they link to each other with no conflicting channel identity); same-channel layers
 stay separate. Time Remap speed, Opacity and Audio Levels values and keyframes,
-fades, markers (as chapters) and the sequence rate and size carry over.
+fades, markers (ranged markers named `Pause` as `pauses`, other markers as
+chapters) and the sequence rate and size carry over.
 Generators, transitions and other effects are reported rather than silently
 dropped. Media paths are kept absolute; if they live on another machine the
 result reports validation errors so you can relink. Imported files are trusted
@@ -282,6 +292,7 @@ What each target carries:
 | Master limiter | yes | warning | warning | warning | warning |
 | Subframe `source_in` | yes | rounded to frames (warned) | yes | rounded to frames | yes |
 | Captions / chapters | yes | markers only | note + markers | sidecars | sidecars |
+| Pauses | ignored | sequence markers | markers | ignored | ignored |
 
 The Python script uses only the standard library and FFmpeg; it invokes FFmpeg
 with an argument list, never a shell. Both direct rendering and the script
@@ -457,6 +468,31 @@ XML as SRT, to import together with it. Hyperframes and Remotion preserve SRT/VT
 and JSON sidecars; their generated compositions do not apply them automatically.
 The FFmetadata sidecar contains chapter boundaries; JSON preserves exact titles,
 including trailing backslashes that FFmetadata cannot round-trip reliably.
+
+## Pauses
+
+`pauses` marks deliberate silences (a beat, a laugh, a reveal) on the **output
+timeline**, in seconds, so `skywrite review lint` does not report them as
+`dead_air`:
+
+```json
+"pauses": [{"start": 41.2, "end": 43, "note": "laugh"}]
+```
+
+Each pause needs `0 <= start < end <=` the timeline duration; pauses are ordered
+by `start` and must not overlap (one may start where the previous ends). `note` is
+optional, at most 512 bytes, without control characters or U+FFFE/U+FFFF; at
+most 1000 pauses.
+Lint passes a gap between heard words when the pauses cover all of it except at
+most `--dead-air-seconds`, and lists it in `checked.dead_air.excluded_by_pause`
+with the pauses' notes. Renderers (MP4, Python, Remotion, Hyperframes) ignore
+pauses. FCPXML writes each as a `<marker value="Pause">` with its duration and
+`note`; Premiere XML as a sequence marker named `Pause` with in and out points
+rounded to whole frames, kept inside the sequence and apart (a pause that rounds to
+no frame is left out, with a warning), and the note as its comment. Premiere XML
+import reads ranged `Pause` markers back as pauses, leaving out (with a note) any
+that overlap another or run past the sequence; comment line breaks and other
+control characters become spaces and comments are cut to 512 bytes (noted).
 After rendering either optional backend, run:
 
 ```sh

@@ -894,7 +894,7 @@ fn provider_catalogs_label_unverified_capabilities() {
     ]);
     let models = listed["models"].as_array().unwrap();
     let ids: Vec<_> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["vision-small", "vlm"]);
+    assert_eq!(ids, ["vision-small", "vlm", "vlm-structured"]);
     assert_eq!(models[0]["capabilities_verified"], false);
     assert_eq!(models[0]["reference"], "local:vision-small");
     assert_eq!(models[1]["capabilities_verified"], true);
@@ -906,7 +906,7 @@ fn provider_catalogs_label_unverified_capabilities() {
     );
     // Cached for the TTL; offline works without the server.
     let offline = env.ok(&["models", "list", "--provider", "local", "--offline"]);
-    assert_eq!(offline["models"].as_array().unwrap().len(), 3);
+    assert_eq!(offline["models"].as_array().unwrap().len(), 4);
     assert_eq!(server.requests().len(), 1);
     assert!(
         server.requests()[0]["headers"]

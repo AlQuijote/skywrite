@@ -10,7 +10,7 @@ use std::time::Duration;
     name = "skywrite",
     version,
     about = "Agent-friendly media understanding, synchronization, and editing",
-    after_help = "All successful commands emit JSON to stdout; diagnostics go to stderr. Start with skywrite init, then skywrite schema for the layered edit format.\n\nBefore creative choices (music, B-roll, pacing, color), check skywrite styles list for the user's saved preferences; ask the user when none apply.\n\nChoosing cuts: transcribe for word timestamps, survey with skywrite describe frames SOURCE --every 30, then focus in around each candidate with --around TIME --window 1 (or skywrite review sheet). Audition with skywrite review cuts and check with skywrite review lint.\n\nCompose tools: render HTML graphics as image clips on upper video tracks in FCPXML/Premiere/FFmpeg/Hyperframes/Remotion edits; generate character images and reference frames before video generation.\n\nAgents: record ALL frustrations, bugs and missing features with skywrite nit <description>. When Skywrite cannot decode or verify something (camera color metadata, an unsupported format, an NLE import you could not check), include the raw inspect/command output, the camera or app and its operator-confirmed settings, and the relevant source file from https://github.com/FlyCockpit/skywrite (for example src/color.rs or src/export/xmeml.rs)."
+    after_help = "All successful commands emit JSON to stdout; diagnostics go to stderr. Start with skywrite init, then skywrite schema for the layered edit format.\n\nBefore creative choices (music, B-roll, pacing, color), check skywrite styles list for the user's saved preferences; ask the user when none apply.\n\nWhat is in the picture: skywrite describe frames SOURCE --interval 1 --focus \"bounding box of every visible face\" asks a vision model about each frame (one per second here) and returns your answer per frame; for boxes add --focus-schema with \"x-skywrite\": \"box\" (example in skywrite describe frames --help) so answers are checked 0..1 coordinates; results are cached, --dry-run shows what a run would cost, and skywrite describe cache SOURCE lists what is stored.\n\nChoosing cuts: transcribe for word timestamps, survey with skywrite describe frames SOURCE --every 30, then focus in around each candidate with --around TIME --window 1 (or skywrite review sheet). Audition with skywrite review cuts.\n\nYou can't watch or hear the result: run the measured checks, quote the numbers, and say what was and wasn't measured. Before rendering, skywrite review lint EDIT --transcript WORDS.json (clipped or repeated words, unfinished endings, dead air); after rendering, skywrite verify OUT.mp4 --ends-together --loudness --black --frozen --edit EDIT (its own fades and stills pass).\n\nCompose tools: render HTML graphics as image clips on upper video tracks in FCPXML/Premiere/FFmpeg/Hyperframes/Remotion edits; generate character images and reference frames before video generation.\n\nAgents: record ALL frustrations, bugs and missing features with skywrite nit <description>. When Skywrite cannot decode or verify something (camera color metadata, an unsupported format, an NLE import you could not check), include the raw inspect/command output, the camera or app and its operator-confirmed settings, and the relevant source file from https://github.com/FlyCockpit/skywrite (for example src/color.rs or src/export/xmeml.rs)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,7 +39,8 @@ enum Command {
         #[command(flatten)]
         output: OutputOptions,
     },
-    /// Verify local metadata, decoded counts, duration and audio levels.
+    /// Verify a file (usually a finished render): decoded counts and duration, and on request loudness, black or frozen frames, and picture and sound ending together.
+    #[command(long_about = skywrite::verify::VERIFY_ABOUT, after_long_help = skywrite::verify::VERIFY_EXAMPLES)]
     Verify(skywrite::verify::VerifyArgs),
     /// Sample timestamped frames and optionally request structured model understanding.
     Analyze(AnalyzeArgs),
@@ -123,7 +124,7 @@ enum Command {
         #[command(subcommand)]
         command: skywrite::outputs::OutputsCommand,
     },
-    /// Model descriptions of exact frames (cached per frame) or short video ranges.
+    /// Ask a vision model about exact frames or short video ranges, cached: general descriptions, plus --focus for exactly what you need (e.g. a bounding box for every face, 0..1 coordinates).
     Describe {
         #[command(subcommand)]
         command: skywrite::describe::DescribeCommand,
@@ -1208,7 +1209,8 @@ fn schema() -> Value {
         "video":{"type":"array","maxItems":16,"description":"Video tracks; index 0 is the bottom layer. Clips on one track must not overlap.","items":track(video_clip)},
         "audio":{"type":"array","maxItems":32,"description":"Audio-only tracks, mixed with linked sound from video clips","items":track(audio_clip)},
         "master":{"type":"object","additionalProperties":false,"properties":{"limiter_db":{"type":"number","minimum":-24,"maximum":0,"description":"Optional output limiter ceiling in dBFS. Without it, the mix is summed at unity gain and may clip."}}},
-        "captions":{"type":"array","description":"Caption tracks: {\"from_transcripts\":[\"words.json\"],\"language\":\"eng\"} maps source words through the edit (recommended), or {\"source\":\"cues.srt\"} for cues already on the output timeline. See docs/edit-format.md"},"chapters":{"type":"array","description":"See docs/edit-format.md"}
+        "captions":{"type":"array","description":"Caption tracks: {\"from_transcripts\":[\"words.json\"],\"language\":\"eng\"} maps source words through the edit (recommended), or {\"source\":\"cues.srt\"} for cues already on the output timeline. See docs/edit-format.md"},"chapters":{"type":"array","description":"See docs/edit-format.md"},
+        "pauses":{"type":"array","maxItems":1000,"description":"Deliberate pauses on the output timeline (seconds), ordered and non-overlapping, inside the timeline. review lint does not report a gap they cover as dead_air; FCPXML and Premiere XML exports write them as markers named Pause; renderers ignore them.","items":{"type":"object","additionalProperties":false,"required":["start","end"],"properties":{"start":{"type":"number","minimum":0},"end":{"type":"number","description":"Greater than start, at most the timeline duration"},"note":{"type":"string","maxLength":512,"description":"Why the pause is there, such as laugh or reveal; no control characters"}}}}
     }});
     json!({"version":skywrite::timeline::EDIT_VERSION,"edit":edit,"edit_example":{"version":skywrite::timeline::EDIT_VERSION,"name":"Interview","width":1280,"height":720,"fps":{"num":30,"den":1},
         "video":[
