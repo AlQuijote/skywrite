@@ -21,6 +21,12 @@ enum Command {
     /// Check installed media tools, and whether configured custom providers answer (no generation).
     Doctor,
     /// Inspect local media metadata using ffprobe.
+    ///
+    /// Prints one JSON object with each input's container duration, size and
+    /// streams (codec, width and height as stored, frame rates, sample rate,
+    /// channels). A video stream's rotation is its display-matrix rotation in
+    /// whole degrees, or null: phone footage stored landscape reports -90 or 90
+    /// and plays (and renders) upright, with width and height swapped.
     #[command(alias = "ingest")]
     Inspect {
         #[arg(required = true)]
@@ -309,6 +315,16 @@ enum EditCommand {
     Export {
         file: PathBuf,
         /// premiere writes Final Cut Pro 7 XML (xmeml v5), which Premiere Pro imports.
+        ///
+        /// In Premiere XML each video clip is fitted inside the sequence like the
+        /// render, with a Basic Motion Scale (percent) of min(width / clip width,
+        /// height / clip height) * 100 from its displayed size. Rotated phone
+        /// footage fits by its displayed (upright) size, so a clip stored 3840x2160
+        /// with rotation -90 shows as 2160x3840 and gets Scale 50 in a 1080x1920
+        /// sequence; a clip whose fit is exactly 100% (for example one that matches
+        /// the sequence) gets no Scale. Non-square-pixel (anamorphic, DV) sources frame differently in
+        /// Premiere, which applies their pixel aspect ratio. Example:
+        /// skywrite edit export reel.json --to premiere -o reel.xml
         #[arg(long,value_parser=["fcpxml","premiere","ffmpeg","hyperframes","remotion"])]
         to: String,
         #[arg(short, long)]

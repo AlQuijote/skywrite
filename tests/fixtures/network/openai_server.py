@@ -1,7 +1,7 @@
 # TEST ONLY. Owned-loopback stand-in for an OpenAI-compatible provider
 # (llama-server, Ollama, LM Studio, whisper.cpp). Prints its port, appends one
 # JSON line per request to argv[1], and exits after 30 idle seconds.
-import json, os, sys, time
+import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = sys.argv[1]
@@ -27,6 +27,7 @@ def multipart(content_type, body):
 
 class Handler(BaseHTTPRequestHandler):
     half_bad = 0
+    half_bad_lock = threading.Lock()
 
     def log_message(self, *args):
         pass
@@ -89,9 +90,11 @@ class Handler(BaseHTTPRequestHandler):
             usage['cost'] = 0.25
         if model == 'half-bad':
             # The first answer is not JSON; both completed requests report a cost.
-            Handler.half_bad += 1
+            with Handler.half_bad_lock:
+                Handler.half_bad += 1
+                first = Handler.half_bad == 1
             usage['cost'] = 0.25
-            if Handler.half_bad == 1:
+            if first:
                 content = 'not json at all'
         self.reply(200, {'object': 'chat.completion', 'model': model,
                          'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': content}}],

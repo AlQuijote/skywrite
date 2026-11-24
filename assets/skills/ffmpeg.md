@@ -7,4 +7,4 @@
 5. For a portable script, use `skywrite edit export edit.json --to ffmpeg --output render.py`, then `python3 render.py --output edit.mp4`.
 6. Inspect the rendered MP4 and watch/listen across cuts, layers, fades, delays, empty timeline, held images, retiming, gain keyframes and audio tracks. Confirm duration and streams against the approved edit.
 
-Use explicit `--overwrite` only for an intended output replacement. The generated script needs Python's standard library and installed FFmpeg. Unsupported effects must be authored in a composition or NLE instead of being silently omitted.
+Renders, exported scripts and `skywrite audio` loops give the same picture and sound on FFmpeg 5.1 or newer, including 7.0 and 7.1 (black lead-ins before late-starting video, crossfaded loops of short cues); docs/validation.md has the measured versions. Use explicit `--overwrite` only for an intended output replacement. The generated script needs Python's standard library and installed FFmpeg. Unsupported effects must be authored in a composition or NLE instead of being silently omitted.

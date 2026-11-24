@@ -516,11 +516,14 @@ fn video_clip(
         // An audio-only prefix has no video frame to seed tpad.
         return Ok((transparent(edit, frames, label), prefix));
     }
+    // The black lead is added after `fps`, in output seconds: tpad converts
+    // its duration to frames with the link frame rate, which FFmpeg 7.0 and
+    // 7.1 `setpts` clears, so a lead placed after `setpts` added no frames.
     let mut chain = format!(
-        "[{input}:v:0]setpts=PTS-STARTPTS,trim=start={},setpts=PTS-STARTPTS,tpad=start_mode=add:start_duration={}:color=black,setpts=PTS/{},fps={fps}",
+        "[{input}:v:0]setpts=PTS-STARTPTS,trim=start={},setpts=(PTS-STARTPTS)/{},fps={fps},tpad=start_mode=add:start_duration={}:color=black",
         number(video_trim),
-        number(video_lead),
-        number(clip.speed)
+        number(clip.speed),
+        number(video_lead / clip.speed)
     );
     if let Some((marker, three_d)) = lut_marker {
         // Only generated ASCII sidecar paths enter the filter graph.
