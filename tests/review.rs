@@ -219,6 +219,11 @@ fn brief_shots(dir: &Path, name: &str, video: Value) -> Vec<(u64, f64)> {
     );
     let report = skywrite(&["review", "lint", &edit, "--no-levels"]);
     assert_eq!(report["checked"]["min_shot_seconds"], 0.5, "{report}");
+    assert_eq!(
+        report["checked"]["uncertain_cover_sources"],
+        json!([]),
+        "{report}"
+    );
     report["warnings"]
         .as_array()
         .unwrap()
@@ -272,6 +277,10 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         .push(json!({"clips":[talk(3.0, 0.0, 0.0667)]}));
     assert_eq!(brief_shots(d, "beside.json", beside), [(2, 3.0)]);
 
+    // A 2-frame hole in the only track flashes black.
+    let gap = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(2.0667, 3.0, 1.9333)]}]);
+    assert_eq!(brief_shots(d, "black.json", gap), [(2, 2.0)]);
+
     // An opening fade from black is not a shot; an invisible overlay is not a
     // change; a 2-frame overlay with 1-frame fades still flashes.
     let mut opening = talk(0.0, 0.0, 4.0);
@@ -283,6 +292,23 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     faded["fade_out"] = json!(0.0333);
     let fades = json!([{"clips":[opening]},{"clips":[invisible, faded]}]);
     assert_eq!(brief_shots(d, "fades.json", fades), [(1, at(91.0))]);
+
+    // A 12-frame overlay with 0.19 s fades is a soft flash: it rises and falls
+    // gradually, yet dominates the picture for 7 frames (alpha above 0.5).
+    let mut soft = broll(2.0, 0.0, 0.4);
+    soft["fade_in"] = json!(0.19);
+    soft["fade_out"] = json!(0.19);
+    let soft = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[soft]}]);
+    assert_eq!(brief_shots(d, "soft.json", soft), [(7, at(63.0))]);
+    // A take split with a tiny opacity change stays one shot, and a fade-out
+    // shorter than two frames only ends the shot at its last frame.
+    let mut dim = broll(1.0, 1.0, 0.0667);
+    dim["opacity"] = json!(0.99);
+    let mut short = broll(1.0667, 1.0667, 1.0);
+    short["fade_out"] = json!(0.049);
+    let subtle = json!([{"clips":[talk(0.0, 0.0, 4.0)]},
+        {"clips":[broll(0.0, 0.0, 1.0), dim, short]}]);
+    assert_eq!(brief_shots(d, "subtle.json", subtle), []);
 
     // An opacity-0 piece inside a split upper take shows the base for 2 frames.
     let mut gap = broll(1.0, 1.0, 0.0667);
@@ -383,10 +409,13 @@ fn lint_help_explains_brief_shots_for_agents() {
         "--min-shot-seconds <SECONDS>",
         "0 to 10 (default 0.5); 0 turns the brief-shot",
         "not pixels",
-        "at least half the visible picture changes at once",
-        "dissolves and longer fades",
+        "the clip that dominates it plus every clip at least half visible",
+        "abrupt change",
+        "part of the picture for less than --min-shot-seconds",
+        "dissolves, fades from or to black",
         "opacity 0",
         "straight split continuing the same take",
+        "uncertain_cover_sources",
         "alpha-capable video",
         "timeline_start",
         "never changes the edit",

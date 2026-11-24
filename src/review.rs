@@ -28,8 +28,8 @@ pub enum ReviewCommand {
     Cuts(CutsArgs),
     /// Objective checks: silent visible speakers, repeated or clipped words, sound cut off mid-flow, beds near dialogue level, brief shots.
     #[command(
-        long_about = "Objective checks of an edit JSON, before or after rendering: a speaker visible with no dialogue audible (visible_speaker_without_dialogue), repeated or clipped words at cuts, filler words, sound cut off mid-flow, beds within 10 dB of dialogue, and brief shots: flash frames where the picture changes twice within --min-shot-seconds (brief_shot). Prints one JSON object with warnings (each with kind, timeline_start, timeline_end in output seconds, and a message), checked (what was measured, including min_shot_seconds) and limitations. It reads the edit and probes its media; it never changes the edit, renders nothing and makes no network calls. Speaker and word checks need --transcript for each dialogue source; level checks decode short audio windows (at most 256), which --no-levels skips. Use it after every edit pass; then watch and listen with `skywrite review cuts`, which these checks do not replace.",
-        after_long_help = "Brief shots (brief_shot) are judged from clip placement, opacity and fades, not pixels. A picture change is a frame where at least half the visible picture changes at once: a hard cut, a clip starting or ending, a jump in source time, or a fade of only a few frames. Not changes: dissolves and longer fades (gradual), clips at opacity 0, a straight split continuing the same take (same source and track, contiguous within one frame of the slower clip's source step, same opacity, no fade at the seam), and cuts under full-frame opaque video on a higher track. Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE argb) never hide a cut beneath them. Each brief_shot warning has frames, timeline_start and timeline_end.\n\nExamples:\n  skywrite review lint edit.json --no-levels\n      Fast picture-only pass: reports flash frames shorter than 0.5 s.\n  skywrite review lint edit.json --transcript talk.transcript.json --min-shot-seconds 1\n      All checks, with shots under 1 s reported as brief.\n  skywrite review lint edit.json --min-shot-seconds 0\n      Turns the brief-shot check off."
+        long_about = "Objective checks of an edit JSON, before or after rendering: a speaker visible with no dialogue audible (visible_speaker_without_dialogue), repeated or clipped words at cuts, filler words, sound cut off mid-flow, beds within 10 dB of dialogue, and brief shots: flash frames, a picture on screen for less than --min-shot-seconds (brief_shot). Prints one JSON object with warnings (each with kind and message plus timing fields for its kind in output seconds, such as timeline_start), checked (what was measured, including min_shot_seconds and uncertain_cover_sources) and limitations. It reads the edit and probes its media; it never changes the edit, renders nothing and makes no network calls. Speaker and word checks need --transcript for each dialogue source; level checks decode short audio windows (at most 256), which --no-levels skips. Use it after every edit pass; then watch and listen with `skywrite review cuts`, which these checks do not replace.",
+        after_long_help = "Brief shots (brief_shot) are judged from clip placement, opacity and fades, not pixels. Each frame's picture is the clip that dominates it plus every clip at least half visible; a clip's weight is its opacity times its fades, reduced by full-frame opaque video above it. A shot is a stretch with the same picture. Reported: a clip that is part of the picture for less than --min-shot-seconds (a short overlay or cutaway, even one with fades), and a stretch with one picture shorter than that which starts or ends with an abrupt change (at least half the visible picture changing between two frames: a cut, a jump in source time, a black gap, a clip at opacity 0 inside a take). Not reported: gradual transitions from one picture to another (dissolves, fades from or to black), clips at opacity 0, a straight split continuing the same take (same source and track, contiguous within one frame of the slower clip's source step), and cuts under full-frame opaque video on a higher track. Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE argb) never hide a cut beneath them. Each brief_shot warning has frames, timeline_start and timeline_end.\n\nExamples:\n  skywrite review lint edit.json --no-levels\n      Fast picture-only pass: reports flash frames shorter than 0.5 s.\n  skywrite review lint edit.json --transcript talk.transcript.json --min-shot-seconds 1\n      All checks, with shots under 1 s reported as brief.\n  skywrite review lint edit.json --min-shot-seconds 0\n      Turns the brief-shot check off."
     )]
     Lint(LintArgs),
 }
@@ -777,30 +777,79 @@ fn lint(args: &LintArgs) -> Result<Value> {
         }
     }
 
-    // 1b. Brief shots: the visible picture changes abruptly twice within
-    // --min-shot-seconds. Each frame's picture is the weight each clip shows
-    // with (opacity times its fades, as the renderer's alpha ramps, attenuated
-    // by full-frame opaque cover above it). A change is a frame where at least
-    // half the picture changes at once; dissolves and fades are gradual and so
-    // are not changes. A straight split that continues the same take (same
-    // source, contiguous within one frame of the slower clip's source step, same
-    // opacity, no fade at the seam) keeps its weight across the seam.
+    // 1b. Brief shots: a picture on screen for less than --min-shot-seconds.
+    // Each frame's picture is the take that dominates it plus every take at
+    // least half visible, from each clip's weight: opacity times its fades (the
+    // renderer's linear alpha ramps) times what full-frame opaque cover above it
+    // lets through. Reported: a take that is part of the picture only briefly
+    // (a short overlay, even with fades), and a stretch with one picture that
+    // starts or ends with an abrupt change (at least half the visible weight
+    // moving between two frames), such as a black gap. A gradual transition
+    // from one picture to another (a dissolve, a fade from or to black) is not
+    // a shot of its own.
     let changes = picture_changes(&edit, &covers_frame);
-    for pair in changes.windows(2) {
-        let (start, end) = (fps.seconds(pair[0]), fps.seconds(pair[1]));
-        if end - start < args.min_shot_seconds - 1e-9 {
-            warnings.push(json!({
-                "kind": "brief_shot",
-                "timeline_start": start,
-                "timeline_end": end,
-                "frames": pair[1] - pair[0],
-                "message": format!(
-                    "The picture holds for only {} frames ({:.2}s) from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
-                    pair[1] - pair[0], end - start, args.min_shot_seconds
-                ),
-            }));
+    let short = |start: u64, end: u64| {
+        end > start && fps.seconds(end) - fps.seconds(start) < args.min_shot_seconds - 1e-9
+    };
+    let mut brief: Vec<(u64, u64)> = Vec::new();
+    if args.min_shot_seconds > 0.0 {
+        for pair in changes.windows(2) {
+            if (pair[0].abrupt || pair[1].abrupt) && short(pair[0].frame, pair[1].frame) {
+                brief.push((pair[0].frame, pair[1].frame));
+            }
         }
+        let mut shown = HashMap::<usize, u64>::new();
+        let mut takes = Vec::new();
+        for change in &changes {
+            shown.retain(|id, start| {
+                let on = change.state.contains(id);
+                if !on && short(*start, change.frame) {
+                    takes.push((*start, change.frame));
+                }
+                on
+            });
+            for id in &change.state {
+                shown.entry(*id).or_insert(change.frame);
+            }
+        }
+        for (start, end) in takes {
+            if !brief.iter().any(|&(s, e)| s < end && start < e) {
+                brief.push((start, end));
+            }
+        }
+        brief.sort_unstable();
+        brief.dedup();
     }
+    for (first, last) in brief {
+        let (start, end) = (fps.seconds(first), fps.seconds(last));
+        warnings.push(json!({
+            "kind": "brief_shot",
+            "timeline_start": start,
+            "timeline_end": end,
+            "frames": last - first,
+            "message": format!(
+                "The picture holds for only {} frames ({:.2}s) from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
+                last - first, end - start, args.min_shot_seconds
+            ),
+        }));
+    }
+    // Video whose pixel format FFmpeg does not describe never counts as cover;
+    // say so, because it can add warnings beneath it.
+    let mut uncertain_cover: Vec<&Path> = edit
+        .video_clips()
+        .filter(|c| {
+            c.kind == MediaKind::Video
+                && c.media.video().is_some_and(|v| {
+                    v.pix_fmt
+                        .as_deref()
+                        .and_then(media::pixel_format_has_alpha)
+                        .is_none()
+                })
+        })
+        .map(|c| c.source.as_path())
+        .collect();
+    uncertain_cover.sort();
+    uncertain_cover.dedup();
 
     // 2. Repeated words, across or inside cuts, and filler words in selects.
     for pair in words.windows(2) {
@@ -1025,13 +1074,14 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "dialogue_words_heard": words.len(),
             "levels": levels_checked,
             "min_shot_seconds": args.min_shot_seconds,
+            "uncertain_cover_sources": uncertain_cover,
             "level_measurements": measurements,
         },
         "limitations": [
             "Checks are objective signals, not editorial judgement: they cannot assess delivery, emotional fit, B-roll relevance or music choice.",
             "Speaker and repetition checks only cover sources whose transcripts were supplied, and only as well as those transcripts capture what was said.",
             "Level checks measure short windows of the source audio with the edit's gains applied; they do not replace listening to the mix (skywrite review cuts).",
-            "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement, opacity and fades, not pixels: only full-frame video whose pixel format has no alpha channel covers what is beneath it, so cuts under stills, letterboxed pictures and alpha-capable video (even fully opaque ProRes 4444) count as visible and can add warnings; changes inside a clip's own picture (a cut baked into the source) are not seen."
+            "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement, opacity and fades, not pixels: only full-frame video whose pixel format has no alpha channel covers what is beneath it, so cuts under stills, letterboxed pictures and alpha-capable video (even fully opaque ProRes 4444) count as visible and can add warnings; video whose pixel format FFmpeg does not describe is listed in checked.uncertain_cover_sources and never covers; fades are modelled as linear ramps sampled at frame starts, and changes inside a clip's own picture (a cut baked into the source) are not seen."
         ],
     }))
 }
@@ -1051,12 +1101,21 @@ fn clip_alpha(clip: &timeline::ValidatedVideoClip, fps: timeline::Rational, n: u
     alpha
 }
 
-/// Frames where the visible picture changes abruptly, plus the timeline ends,
-/// in order. See `lint` (1b) for the model.
+/// A frame where the visible picture changes; the picture from then on is
+/// `state` (take ids), and `abrupt` says at least half of the visible weight
+/// moved between the two frames (a cut rather than part of a fade).
+struct PictureChange {
+    frame: u64,
+    abrupt: bool,
+    state: Vec<usize>,
+}
+
+/// Picture changes in order, starting with frame 0 and ending with the
+/// timeline end (both abrupt). See `lint` (1b) for the model.
 fn picture_changes(
     edit: &timeline::ValidatedEdit,
     covers_frame: &dyn Fn(&timeline::ValidatedVideoClip) -> bool,
-) -> Vec<u64> {
+) -> Vec<PictureChange> {
     let fps = edit.fps();
     let frame = fps.seconds(1);
     let total = edit.duration_frames();
@@ -1071,38 +1130,67 @@ fn picture_changes(
     for track in &mut tracks {
         track.sort_by_key(|c| c.start_frames);
     }
-    // Visible weight of each clip at frame n, from the top track down.
+    // A straight split continues the take: same track and source, abutting,
+    // and source-contiguous within one frame of the slower clip's step. Its
+    // opacity and fades are compared as weights, not as identity.
+    let continues = |a: &timeline::ValidatedVideoClip, b: &timeline::ValidatedVideoClip| {
+        a.source == b.source
+            && a.end_frames() == b.start_frames
+            && (a.source_in + fps.seconds(a.duration_frames) * a.speed - b.source_in).abs()
+                <= frame * a.speed.min(b.speed) * 1.01
+    };
+    let mut takes: Vec<Vec<usize>> = Vec::with_capacity(tracks.len());
+    let mut next = 0;
+    for track in &tracks {
+        let mut ids = Vec::with_capacity(track.len());
+        for (i, clip) in track.iter().enumerate() {
+            if i > 0 && continues(track[i - 1], clip) {
+                ids.push(ids[i - 1]);
+            } else {
+                ids.push(next);
+                next += 1;
+            }
+        }
+        takes.push(ids);
+    }
+    // Visible weight of each take at frame n, from the top track down: alpha
+    // times what full-frame opaque cover above lets through.
     let weights = |n: u64| {
         let mut through = 1.0;
-        let mut out = Vec::new();
-        for track in tracks.iter().rev() {
+        let mut out: Vec<(usize, f64)> = Vec::new();
+        for (track, ids) in tracks.iter().zip(&takes).rev() {
             let at = track.partition_point(|c| c.start_frames <= n);
-            let Some(clip) = at.checked_sub(1).map(|i| track[i]) else {
+            let Some(i) = at.checked_sub(1) else {
                 continue;
             };
+            let clip = track[i];
             if n >= clip.end_frames() {
                 continue;
             }
             let alpha = clip_alpha(clip, fps, n);
-            out.push((clip, alpha * through));
+            out.push((ids[i], alpha * through));
             if covers_frame(clip) {
                 through *= 1.0 - alpha;
             }
         }
         out
     };
-    let continues = |a: &timeline::ValidatedVideoClip, b: &timeline::ValidatedVideoClip| {
-        a.track == b.track
-            && a.source == b.source
-            && a.end_frames() == b.start_frames
-            && a.opacity == b.opacity
-            && a.fade_out == 0.0
-            && b.fade_in == 0.0
-            && (a.source_in + fps.seconds(a.duration_frames) * a.speed - b.source_in).abs()
-                <= frame * a.speed.min(b.speed) * 1.01
-    };
-    let same = |a: &timeline::ValidatedVideoClip, b: &timeline::ValidatedVideoClip| {
-        (a.track, a.index) == (b.track, b.index) || continues(a, b)
+    // The picture: the take that dominates the frame (the top one on a tie)
+    // and every take at least half visible; empty when nothing is on screen.
+    let state = |weights: &[(usize, f64)]| {
+        let mut top: Option<(usize, f64)> = None;
+        for &(id, w) in weights {
+            if top.is_none_or(|(_, best)| w > best) {
+                top = Some((id, w));
+            }
+        }
+        let mut state: Vec<usize> = weights
+            .iter()
+            .filter(|(id, w)| *w >= 0.5 || top.is_some_and(|(t, _)| t == *id))
+            .map(|(id, _)| *id)
+            .collect();
+        state.sort_unstable();
+        state
     };
     // Weights only change at clip boundaries and inside fades.
     let mut candidates = std::collections::BTreeSet::new();
@@ -1119,31 +1207,41 @@ fn picture_changes(
             candidates.extend(end.saturating_sub(fade_out).max(start)..end);
         }
     }
-    let mut changes = vec![0];
+    let mut changes = vec![PictureChange {
+        frame: 0,
+        abrupt: true,
+        state: state(&weights(0)),
+    }];
     for n in candidates.into_iter().filter(|&n| n > 0 && n < total) {
         let (before, after) = (weights(n - 1), weights(n));
-        let mut moved: f64 = after
-            .iter()
-            .map(|(clip, w)| {
-                let was = before
-                    .iter()
-                    .find(|(old, _)| same(old, clip))
-                    .map_or(0.0, |(_, w)| *w);
-                (w - was).abs()
-            })
-            .sum();
-        moved += before
-            .iter()
-            .filter(|(old, _)| !after.iter().any(|(clip, _)| same(old, clip)))
-            .map(|(_, w)| w)
-            .sum::<f64>();
-        if moved >= 0.5 {
-            changes.push(n);
+        let now = state(&after);
+        if now == changes.last().expect("starts with frame 0").state {
+            continue;
         }
+        let weight = |list: &[(usize, f64)], id: usize| {
+            list.iter().find(|(k, _)| *k == id).map_or(0.0, |(_, w)| *w)
+        };
+        let moved: f64 = after
+            .iter()
+            .map(|(id, w)| (w - weight(&before, *id)).abs())
+            .chain(
+                before
+                    .iter()
+                    .filter(|(id, _)| !after.iter().any(|(k, _)| k == id))
+                    .map(|(_, w)| *w),
+            )
+            .sum();
+        changes.push(PictureChange {
+            frame: n,
+            abrupt: moved >= 0.5,
+            state: now,
+        });
     }
-    if total > 0 {
-        changes.push(total);
-    }
+    changes.push(PictureChange {
+        frame: total,
+        abrupt: true,
+        state: Vec::new(),
+    });
     changes
 }
 

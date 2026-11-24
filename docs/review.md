@@ -67,19 +67,26 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   omits fillers, so their absence proves nothing.
 - `sound_cut_mid_flow`: a clip ends without a fade while its source keeps sounding
   at a similar level, as when applause or a music tail is cut off.
-- `brief_shot`: the visible picture changes abruptly twice within
-  `--min-shot-seconds` (default 0.5, allowed 0 to 10; `0` turns the check off;
-  `checked.min_shot_seconds` reports the value used), such as a talking shot
-  showing for a few frames between two B-roll clips. Each warning gives
-  `timeline_start`, `timeline_end` (seconds) and `frames`. The check works from
-  clip placement, opacity and fades, not pixels: a change is a frame where at
-  least half of the visible picture changes at once. Not changes: a straight split
-  that continues the same take on the same track (same source, contiguous within
-  one frame of the slower clip's source step after frame rounding, same opacity,
-  no fade at the seam); a cut hidden under full-frame opaque video on a higher
-  track; clips at `opacity: 0`; and dissolves and fades, which change the picture
-  gradually (a fade of only a few frames still counts as abrupt). Raise the
-  threshold to match your pacing (for example `1`).
+- `brief_shot`: a picture on screen for less than `--min-shot-seconds` (default
+  0.5, allowed 0 to 10; `0` turns the check off; `checked.min_shot_seconds`
+  reports the value used), such as a talking shot showing for a few frames between
+  two B-roll clips. Each warning gives `timeline_start`, `timeline_end` (seconds)
+  and `frames`. The check works from clip placement, opacity and fades, not
+  pixels. Each frame's picture is the clip that dominates it plus every clip at
+  least half visible; a clip's weight is its opacity times its fades (the
+  renderer's linear alpha ramps, sampled at frame starts), reduced by full-frame
+  opaque video above it. Reported: a clip that is part of the picture for less
+  than the threshold (a short overlay or cutaway, even one with fades), and a
+  stretch with one picture, shorter than the threshold, that starts or ends with
+  an abrupt change (at least half of the visible picture changing between two
+  frames: a cut, a jump in source time, a black gap, an `opacity: 0` piece inside
+  a take). Not reported: gradual
+  transitions from one picture to another (a dissolve, a fade from or to black),
+  clips at `opacity: 0`, a straight split that continues the same take on the
+  same track (same source, contiguous within one frame of the slower clip's
+  source step after frame rounding), and cuts hidden under full-frame opaque
+  video on a higher track. Raise the threshold to match your pacing (for example
+  `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
   `role` are classified by it; otherwise a source without a transcript is a bed.
@@ -93,4 +100,5 @@ size, so rotated phone footage counts) at full opacity whose pixel format has no
 alpha channel, per FFmpeg's pixel format list, hides what lies beneath it.
 Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE `argb`)
 never count as cover, even when every pixel is opaque, so a speaker or a cut under
-them stays visible and can add warnings.
+them stays visible and can add warnings. Video whose pixel format FFmpeg does not
+describe is never cover either and is listed in `checked.uncertain_cover_sources`.
