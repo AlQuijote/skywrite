@@ -277,6 +277,14 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         .push(json!({"clips":[talk(3.0, 0.0, 0.0667)]}));
     assert_eq!(brief_shots(d, "beside.json", beside), [(2, 3.0)]);
 
+    // 2-frame shots at either end of the timeline are brief (black lies
+    // beyond the ends).
+    let ends = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[broll(0.0667, 0.0, 3.8667)]}]);
+    assert_eq!(
+        brief_shots(d, "ends.json", ends),
+        [(2, 0.0), (2, at(118.0))]
+    );
+
     // A 2-frame hole in the only track flashes black.
     let gap = json!([{"clips":[talk(0.0, 0.0, 2.0), talk(2.0667, 3.0, 1.9333)]}]);
     assert_eq!(brief_shots(d, "black.json", gap), [(2, 2.0)]);
@@ -294,12 +302,49 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     assert_eq!(brief_shots(d, "fades.json", fades), [(1, at(91.0))]);
 
     // A 12-frame overlay with 0.19 s fades is a soft flash: it rises and falls
-    // gradually, yet dominates the picture for 7 frames (alpha above 0.5).
+    // gradually, but is a detour from the base and back; its middle 5 frames
+    // differ from both sides by more than a quarter of the picture.
     let mut soft = broll(2.0, 0.0, 0.4);
     soft["fade_in"] = json!(0.19);
     soft["fade_out"] = json!(0.19);
     let soft = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[soft]}]);
-    assert_eq!(brief_shots(d, "soft.json", soft), [(7, at(63.0))]);
+    assert_eq!(brief_shots(d, "soft.json", soft), [(5, at(64.0))]);
+    // A 2-frame overlay at opacity 0.3 is a visible flash; at 0.2 it is under
+    // a quarter of the picture.
+    for (opacity, expected) in [(0.3, vec![(2, 2.0)]), (0.2, vec![])] {
+        let mut faint = broll(2.0, 0.0, 0.0667);
+        faint["opacity"] = json!(opacity);
+        let faint = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[faint]}]);
+        assert_eq!(brief_shots(d, "faint.json", faint), expected, "{opacity}");
+    }
+    // Gradual pictures are not flashes: a take flickering 0.501 -> 0.499, a
+    // long take at opacity 0.51 with long fades, a dissolve chain (B fades in
+    // and out over A while C fades in above), and a 15-frame overlay whose
+    // 0.049 s fade-out dims only its last frame.
+    let piece = |start: f64, source_in: f64, duration: f64, opacity: f64| {
+        let mut clip = broll(start, source_in, duration);
+        clip["opacity"] = json!(opacity);
+        clip
+    };
+    let flicker = json!([{"clips":[talk(0.0, 0.0, 4.0)]},
+        {"clips":[piece(0.0, 0.0, 1.0, 0.501), piece(1.0, 1.0, 0.0667, 0.499), piece(1.0667, 1.0667, 2.9333, 0.501)]}]);
+    assert_eq!(brief_shots(d, "flicker.json", flicker), []);
+    let mut faded = piece(0.0, 0.0, 3.9, 0.51);
+    faded["fade_in"] = json!(1.9);
+    faded["fade_out"] = json!(1.9);
+    let faded = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[faded]}]);
+    assert_eq!(brief_shots(d, "long-fades.json", faded), []);
+    let mut b = broll(1.0, 0.0, 3.0);
+    b["fade_in"] = json!(1.5);
+    b["fade_out"] = json!(1.5);
+    let mut c = talk(1.5, 2.0, 2.5);
+    c["fade_in"] = json!(1.5);
+    let chain = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[b]},{"clips":[c]}]);
+    assert_eq!(brief_shots(d, "chain.json", chain), []);
+    let mut held = piece(2.0, 0.0, 0.5, 0.7);
+    held["fade_out"] = json!(0.049);
+    let held = json!([{"clips":[talk(0.0, 0.0, 4.0)]},{"clips":[held]}]);
+    assert_eq!(brief_shots(d, "held.json", held), []);
     // A take split with a tiny opacity change stays one shot, and a fade-out
     // shorter than two frames only ends the shot at its last frame.
     let mut dim = broll(1.0, 1.0, 0.0667);
@@ -409,10 +454,11 @@ fn lint_help_explains_brief_shots_for_agents() {
         "--min-shot-seconds <SECONDS>",
         "0 to 10 (default 0.5); 0 turns the brief-shot",
         "not pixels",
-        "the clip that dominates it plus every clip at least half visible",
-        "abrupt change",
-        "part of the picture for less than --min-shot-seconds",
-        "dissolves, fades from or to black",
+        "half the sum of their weight differences",
+        "at least 0.25 from the pictures just before and after",
+        "a detour rather than a step on the way",
+        "or a black gap",
+        "dissolves and fades from one picture to another",
         "opacity 0",
         "straight split continuing the same take",
         "uncertain_cover_sources",

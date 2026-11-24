@@ -243,7 +243,7 @@ pub fn pixel_format_has_alpha(name: &str) -> Option<bool> {
             crate::process::run(
                 "ffprobe",
                 &crate::process::args(&["-v", "error", "-show_pixel_formats", "-of", "json"]),
-                Duration::from_secs(10),
+                Duration::from_secs(30),
                 4 * 1024 * 1024,
             )
             .ok()

@@ -72,21 +72,21 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   reports the value used), such as a talking shot showing for a few frames between
   two B-roll clips. Each warning gives `timeline_start`, `timeline_end` (seconds)
   and `frames`. The check works from clip placement, opacity and fades, not
-  pixels. Each frame's picture is the clip that dominates it plus every clip at
-  least half visible; a clip's weight is its opacity times its fades (the
-  renderer's linear alpha ramps, sampled at frame starts), reduced by full-frame
-  opaque video above it. Reported: a clip that is part of the picture for less
-  than the threshold (a short overlay or cutaway, even one with fades), and a
-  stretch with one picture, shorter than the threshold, that starts or ends with
-  an abrupt change (at least half of the visible picture changing between two
-  frames: a cut, a jump in source time, a black gap, an `opacity: 0` piece inside
-  a take). Not reported: gradual
-  transitions from one picture to another (a dissolve, a fade from or to black),
-  clips at `opacity: 0`, a straight split that continues the same take on the
-  same track (same source, contiguous within one frame of the slower clip's
-  source step after frame rounding), and cuts hidden under full-frame opaque
-  video on a higher track. Raise the threshold to match your pacing (for example
-  `1`).
+  pixels. Each frame's picture is the visible weight of each clip: its opacity
+  times its fades (the renderer's linear alpha ramps, sampled at frame starts,
+  which can differ from FFmpeg's own rounding by a fraction of a frame), reduced
+  by full-frame opaque video above it, with black taking the rest. Two pictures
+  differ by half the sum of their weight differences: 1 for a cut between
+  full-frame shots, 0.25 when a 25%-opacity overlay appears. A brief shot is a
+  stretch shorter than the threshold that differs by at least 0.25 from the
+  pictures just before and after it and is a detour, not a step on the way from
+  one to the other: a flash frame, a short cutaway, a short overlay (even with
+  fades or at partial opacity) or a black gap. Not reported: dissolves and fades
+  from one picture to another, clips at `opacity: 0`, a straight split that
+  continues the same take on the same track (same source, contiguous within one
+  frame of the slower clip's source step after frame rounding), and cuts hidden
+  under full-frame opaque video on a higher track. Raise the threshold to match
+  your pacing (for example `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
   `role` are classified by it; otherwise a source without a transcript is a bed.
