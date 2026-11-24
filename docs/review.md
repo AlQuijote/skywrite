@@ -150,8 +150,9 @@ are decoded once, as the renderer decodes them, for their alpha and their size
 after any EXIF rotation (phone photos are often stored landscape and marked to
 turn upright; measured: FFmpeg 8.0.1 turns them). Black
 gaps are checked only between pictures that fill the frame to the pixel as the
-renderer fits them: 1366x768 on a 1920x1080 edit is fitted to 1920x1079, so it
-hides what is beneath it but a black gap next to it is not checked.
+renderer fits them: 1366x768 on a 1920x1080 edit is fitted to 1920x1079, and
+1904x1080 leaves 8-pixel bars a side; both are within 1% of the frame's shape,
+so they hide what is beneath them, but a black gap next to them is not checked.
 Pictures whose shape is more than 1% off the frame's (letterboxed or
 pillarboxed), alpha-capable video (QTRLE `argb`, ProRes 4444 with alpha)
 and stills with transparent pixels (PNG titles) never count as cover, even when

@@ -828,6 +828,7 @@ fn lint_help_explains_brief_shots_for_agents() {
         "more than 1% off the frame's",
         "fill the frame to the pixel",
         "each still used by a clip is decoded once",
+        "thin bars (up to about 1% of the frame",
         "opacity 0",
         "clips continuing it across straight splits",
         "uncertain_cover_sources",
