@@ -164,9 +164,9 @@ skywrite verify out.mp4 --loudness --target-lufs -14 --max-true-peak -1
   `not_measured` says the edit's intent was not considered.
 
 Requested video checks on a file without video, and `--loudness` on a file without
-audio, fail with a `reason`. `--black` and `--frozen` run in the video decode verify
-already makes (on a split copy of its frames); `--loudness`
-adds one audio pass. The filter output parsed here (`black_start:`/`black_end:`,
+audio, fail with a `reason`. `--black` and `--frozen` run together in one more video
+decode (a padded copy in the same filter graph as the counted decode aborts FFmpeg
+7.0 and 7.1); `--loudness` adds one audio pass. The filter output parsed here (`black_start:`/`black_end:`,
 `lavfi.freezedetect.freeze_start:`/`freeze_end:` and loudnorm's JSON) is the same on
 FFmpeg 5.1.2, 6.1.1, 7.0.2, 7.1, 7.1.1, 8.0.1, 8.1.2 and 9.1 apart from filter
 instance names, which are not used; on 5.1.2 the lines can share a line with

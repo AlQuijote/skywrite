@@ -206,7 +206,7 @@ Checks:
   --frozen [--frozen-min-seconds 2 --frozen-noise-db -60]   frozen pictures (FFmpeg freezedetect): spans where the picture does not change for at least --frozen-min-seconds. Each span has start_seconds, end_seconds, duration_seconds, allowed and fails. Intentional stills, title cards and slides are frozen too (pass --edit); spans inside black spans are not counted twice.
   --edit EDIT.json [--edit-tolerance 0.1]   the edit the file was rendered from, so its intended black and stills pass: a black span at the start that lies within the first clip's fade_in (allowed: fade_in, which also passes first_frame_black), a black span at the end within the last clip's fade_out (allowed: fade_out), and a frozen span within a still-image clip while no other clip is on screen (allowed: still), each with --edit-tolerance seconds of slack. Only visible clips (opacity above 0) count, and the fade-in window ends where any visible clip on screen is fully shown (the fade-out window likewise). A gap before the first clip, or black or a freeze longer than the fade or still, still fails. The edit is validated as skywrite edit validate does, so its sources must be present. Without --edit, not_measured says the edit's intent was not considered.
 
-Times are seconds from the start of the file. --metadata-only skips decoding and cannot run the decode checks. Cost: one full decode per stream plus one loudness pass for --loudness; --black and --frozen share the video decode. No network.";
+Times are seconds from the start of the file. --metadata-only skips decoding and cannot run the decode checks. Cost: one full decode per stream plus one loudness pass for --loudness; --black and --frozen add one more video decode (both together). No network.";
 
 pub const VERIFY_EXAMPLES: &str = "Examples:
   skywrite verify out.mp4 --ends-together --loudness --black --frozen --edit edit.json
@@ -475,7 +475,7 @@ fn parse_rate(rate: &str) -> Option<f64> {
     let value = n.parse::<f64>().ok()? / d.parse::<f64>().ok()?;
     (value.is_finite() && value > 0.0).then_some(value)
 }
-/// Optional detectors that run in the full video decode.
+/// Optional detectors that run in a second video decode.
 #[derive(Default)]
 struct Detect {
     /// blackdetect pixel threshold and the span length that fails.
@@ -802,42 +802,31 @@ fn decode_video(
         let threshold = (duration - frame * 1.5).max(0.01);
         filters.push(format!("freezedetect=n={noise:.3}dB:d={threshold:.6}"));
     }
-    let mut args = crate::process::args(&[
-        "-hide_banner",
-        "-nostdin",
-        "-loglevel",
-        // The detectors log at info level.
-        if filters.is_empty() { "error" } else { "info" },
-        "-xerror",
+    let input = |loglevel: &str| {
+        let mut args = crate::process::args(&[
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            loglevel,
+            "-xerror",
+            "-threads",
+            "1",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-i",
+        ]);
+        args.push(info.path.clone().into_os_string());
+        args
+    };
+    let mut args = input("error");
+    args.extend(crate::process::args(&[
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
         "-threads",
         "1",
-        "-protocol_whitelist",
-        "file,pipe",
-        "-i",
-    ]);
-    args.push(info.path.clone().into_os_string());
-    if filters.is_empty() {
-        args.extend(crate::process::args(&["-map", "0:v:0"]));
-    } else {
-        // The detectors get their own copy of the decoded frames plus one
-        // white frame after the last, so spans that run to the end of the
-        // stream close there; the counted output is unchanged.
-        args.extend(crate::process::args(&[
-            "-filter_complex_threads",
-            "1",
-            "-filter_complex",
-            &format!(
-                "[0:v:0]split=2[counted][detect];[detect]setpts=PTS-STARTPTS,tpad=stop=1:stop_mode=add:color=white,{},nullsink",
-                filters.join(",")
-            ),
-            "-map",
-            "[counted]",
-        ]));
-    }
-    args.extend(crate::process::args(&[
-        "-an", "-sn", "-dn", "-threads", "1",
-    ]));
-    args.extend(crate::process::args(&[
         "-t",
         "21601",
         "-fps_mode",
@@ -868,11 +857,45 @@ fn decode_video(
     if frames < 1.0 || !end.is_finite() || end <= 0.0 || end >= crate::timing::MAX_DECODE_SECONDS {
         bail!("video decode empty or exceeds six-hour work limit");
     }
-    // The detectors see times from the stream's first frame (FFmpeg's own
-    // rebasing differs between containers: MP4 keeps the container origin,
-    // MPEG-TS can start the stream at zero); report them from the container
-    // start like the packet timestamps.
-    let detections = parse_detections(&String::from_utf8_lossy(&out.stderr)).offset(video_start);
+    let mut detections = Detections::default();
+    if !filters.is_empty() {
+        // The detectors run in a second decode, from the first frame, with
+        // one white frame after the last so spans that run to the end of the
+        // stream close there. Their chain is the only output: FFmpeg 7.0 and
+        // 7.1 abort on a padded branch ending in a nullsink beside a mapped
+        // output, and with two outputs the progress end is not the picture's.
+        let mut args = input("info");
+        args.extend(crate::process::args(&[
+            "-filter_complex_threads",
+            "1",
+            "-filter_complex",
+            &format!(
+                "[0:v:0]setpts=PTS-STARTPTS,tpad=stop=1:stop_mode=add:color=white,{}[detect]",
+                filters.join(",")
+            ),
+            "-map",
+            "[detect]",
+            "-an",
+            "-sn",
+            "-dn",
+            "-threads",
+            "1",
+            "-t",
+            "21601",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "null",
+            "-",
+            "-nostats",
+        ]));
+        let out = crate::process::run("ffmpeg", &args, Duration::from_secs(600), 1024 * 1024)?;
+        // The detectors see times from the stream's first frame (FFmpeg's own
+        // rebasing differs between containers: MP4 keeps the container
+        // origin, MPEG-TS can start the stream at zero); report them from the
+        // container start like the packet timestamps.
+        detections = parse_detections(&String::from_utf8_lossy(&out.stderr)).offset(video_start);
+    }
     Ok((
         json!({"full_decode_executed":true,"frames":frames as u64,"presentation_end_seconds":end,"decoder":crate::timing::decoder_identity()?}),
         detections,

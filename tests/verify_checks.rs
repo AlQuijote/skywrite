@@ -545,11 +545,14 @@ fn matroska_vp9_and_opus_ends_are_measured() {
     }
     let (_, report) = verify(path.to_str().unwrap(), &["--ends-together"]);
     // Opus pre-skip puts the container start a few ms before zero, and ends
-    // are measured from the container start.
+    // are measured from the container start. FFmpeg 5.1 also delays the video
+    // stream by the pre-skip, so the 3-s picture ends 3 s after its own start.
     let ends = &report["stream_ends"];
-    let start = report["media"]["start_time"].as_f64().unwrap();
+    let media = &report["media"];
+    let video_start =
+        media["streams"][0]["start_time"].as_f64().unwrap() - media["start_time"].as_f64().unwrap();
     let video_end = ends["video_end_seconds"].as_f64().unwrap();
-    assert!((video_end + start - 3.0).abs() < 2e-3, "{report}");
+    assert!((video_end - video_start - 3.0).abs() < 2e-3, "{report}");
     assert!(
         ends["difference_seconds"].as_f64().unwrap().abs() < 0.03,
         "{report}"
@@ -783,6 +786,10 @@ fn detector_times_are_from_the_container_start_in_mp4_and_mpeg_ts() {
             "libx264",
             "-pix_fmt",
             "yuv420p",
+            // FFmpeg before 9 otherwise fills the offset with copies of the
+            // first frame in MP4, so the picture would start at 0.
+            "-fps_mode",
+            "passthrough",
             "-c:a",
             "aac",
             path.to_str().unwrap(),
