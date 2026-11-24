@@ -28,8 +28,8 @@ pub enum ReviewCommand {
     Cuts(CutsArgs),
     /// Objective checks: silent visible speakers, repeated or clipped words, sound cut off mid-flow, beds near dialogue level, brief shots.
     #[command(
-        long_about = "Objective checks of an edit JSON, before or after rendering: a speaker visible with no dialogue audible (visible_speaker_without_dialogue), repeated or clipped words at cuts, filler words, sound cut off mid-flow, beds within 10 dB of dialogue, and brief shots: flash frames, a picture on screen for less than --min-shot-seconds (brief_shot). Prints one JSON object with warnings (each with kind and message plus timing fields for its kind in output seconds, such as timeline_start), checked (what was measured, including min_shot_seconds and uncertain_cover_sources) and limitations. It reads the edit and probes its media; it never changes the edit, renders nothing and makes no network calls. Speaker and word checks need --transcript for each dialogue source; level checks decode short audio windows (at most 256), which --no-levels skips. Use it after every edit pass; then watch and listen with `skywrite review cuts`, which these checks do not replace.",
-        after_long_help = "Brief shots (brief_shot) are judged from clip placement, opacity and fades, not pixels. Each frame's picture is the visible weight of each clip: its opacity times its fades (computed as FFmpeg's fade filter renders them, in whole frames), reduced by full-frame opaque video above it, with black taking the rest. Two pictures differ by half the sum of their weight differences (1 for a cut between full-frame shots, 0.25 when a 25%-opacity full-frame overlay appears). A shot is measured over its whole transient, from the middle of the transition into it to the middle of the transition out of it (the cut itself for a hard cut). It is brief when that is shorter than --min-shot-seconds, it differs by at least 0.25 from the most different pictures within that time before and after it, and it is a detour rather than a step on the way from one to the other (its distance from them adds up to at least 0.5 more than theirs from each other): a flash frame, a short cutaway, a short overlay even with fades or at partial opacity, a shot between two quick dissolves, or a black gap cut in and out. Not reported: dissolves and fades from one picture to another (including through black), clips at opacity 0, a straight split continuing the same take (same source and track, contiguous within one frame of the slower clip's source step), and cuts under full-frame opaque video on a higher track. Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE argb) never hide or dim what is beneath them, so a cut under them counts fully, but a partial-opacity one of them must be about twice as opaque to count (0.5 rather than 0.25). Each brief_shot warning has frames, timeline_start and timeline_end.\n\nExamples:\n  skywrite review lint edit.json --no-levels\n      Fast picture-only pass: reports flash frames shorter than 0.5 s.\n  skywrite review lint edit.json --transcript talk.transcript.json --min-shot-seconds 1\n      All checks, with shots under 1 s reported as brief.\n  skywrite review lint edit.json --min-shot-seconds 0\n      Turns the brief-shot check off."
+        long_about = "Objective checks of an edit JSON, before or after rendering: a speaker visible with no dialogue audible (visible_speaker_without_dialogue), repeated or clipped words at cuts, filler words, sound cut off mid-flow, beds within 10 dB of dialogue, and brief shots: flash frames, a picture on screen for less than --min-shot-seconds between two hard cuts (brief_shot; fades and dissolves are not checked yet). Prints one JSON object with warnings (each with kind and message plus timing fields for its kind in output seconds, such as timeline_start), checked (what was measured, including min_shot_seconds, brief_shots_not_checked and uncertain_cover_sources) and limitations. It reads the edit and probes its media; it never changes the edit, renders nothing and makes no network calls. Speaker and word checks need --transcript for each dialogue source; level checks decode short audio windows (at most 256), which --no-levels skips. Use it after every edit pass; then watch and listen with `skywrite review cuts`, which these checks do not replace.",
+        after_long_help = "Brief shots (brief_shot) are checked only between hard cuts; fades and dissolves are not checked yet. They are judged from clip placement and opacity, not pixels. Each frame's picture is the visible weight of each clip: its opacity, reduced by full-frame opaque video above it, with black taking the rest. Two pictures differ by half the sum of their weight differences (1 for a cut between full-frame shots, 0.25 when a 25%-opacity full-frame overlay appears), and a cut is a frame where they differ by at least 0.25. A shot runs from one cut to the next (black lies beyond the timeline's ends), and its length is exact from the edit. It is reported when it is shorter than --min-shot-seconds and both its cuts are hard: no visible clip fades in the shot or in the frame on either side of it, and no take continues at another opacity at its cuts or inside it. That catches a flash frame, a short cutaway, a short overlay at partial opacity, or a black gap cut in and out. A shot with a fade, dissolve or opacity change at either cut is never reported; when its clip edges are under the threshold it is listed in checked.brief_shots_not_checked (timeline_start, timeline_end) to watch with skywrite review cuts. Not cuts: clips at opacity 0, a straight split continuing the same take (same source and track, contiguous within one frame of the slower clip's source step), and cuts under full-frame opaque video on a higher track. Stills, letterboxed pictures and alpha-capable video (ProRes 4444, QTRLE argb) never hide or dim what is beneath them, so a cut under them counts fully, but a partial-opacity one of them must be about twice as opaque to count (0.5 rather than 0.25). Each brief_shot warning has frames, timeline_start and timeline_end.\n\nExamples:\n  skywrite review lint edit.json --no-levels\n      Fast picture-only pass: reports flash frames shorter than 0.5 s.\n  skywrite review lint edit.json --transcript talk.transcript.json --min-shot-seconds 1\n      All checks, with shots under 1 s reported as brief.\n  skywrite review lint edit.json --min-shot-seconds 0\n      Turns the brief-shot check off."
     )]
     Lint(LintArgs),
 }
@@ -88,9 +88,10 @@ pub struct LintArgs {
     /// Report shots on screen for less than this many seconds (flash frames).
     ///
     /// Seconds of output time, 0 to 10 (default 0.5); 0 turns the brief-shot
-    /// check off. A shot is the time between two picture changes; a brief_shot
-    /// warning reports its frames, timeline_start and timeline_end. Raise it to
-    /// match the edit's pacing (for example 1). Values outside 0..10 are refused.
+    /// check off. Only shots between two hard cuts are checked (fades and
+    /// dissolves are not checked yet); a brief_shot warning reports its frames,
+    /// timeline_start and timeline_end. Raise it to match the edit's pacing
+    /// (for example 1). Values outside 0..10 are refused.
     #[arg(long, default_value_t = 0.5, value_name = "SECONDS")]
     pub min_shot_seconds: f64,
 }
@@ -778,33 +779,45 @@ fn lint(args: &LintArgs) -> Result<Value> {
         }
     }
 
-    // 1b. Brief shots: a picture on screen for less than --min-shot-seconds.
-    // Each frame's picture is the visible weight of each take: opacity times
-    // its fades (the renderer's linear alpha ramps) times what full-frame opaque
-    // cover above it lets through, with black taking the rest. A brief shot is
-    // a stretch shorter than the threshold that differs from the pictures
-    // before and after it by at least a quarter of the picture and is a detour
-    // rather than a step on the way from one to the other: a flash or short
-    // cutaway, even with fades or at partial opacity. Dissolves and fades from
-    // one picture to another are not.
+    // 1b. Brief shots: a picture on screen for less than --min-shot-seconds,
+    // checked only between hard cuts. Each frame's picture is the visible
+    // weight of each take: its opacity times what full-frame opaque cover above
+    // it lets through, with black taking the rest. A cut is a frame where at
+    // least a quarter of the picture changes. A shot is checked only when no
+    // fade, dissolve or opacity step of a visible clip touches it or the frames
+    // beside it, so its length is exact from the edit; shots with one are
+    // listed in checked.brief_shots_not_checked when their clip edges are
+    // under the threshold.
     let mut brief = Vec::new();
+    let mut not_checked = Vec::new();
     if args.min_shot_seconds > 0.0 {
         // Frames strictly under the threshold: ceil(threshold * fps) frames
         // or more are long enough.
         let max_frames = (args.min_shot_seconds * fps.value() - 1e-6).ceil().max(1.0) as u64;
-        let runs = picture_runs(&edit, &covers_frame);
-        brief = brief_shots(&runs, edit.duration_frames(), max_frames);
+        for shot in shots(&edit, &covers_frame) {
+            if shot.end - shot.start < max_frames {
+                if shot.hard {
+                    brief.push(shot);
+                } else {
+                    not_checked.push(json!({
+                        "timeline_start": fps.seconds(shot.start),
+                        "timeline_end": fps.seconds(shot.end),
+                    }));
+                }
+            }
+        }
     }
-    for (first, last) in brief {
-        let (start, end) = (fps.seconds(first), fps.seconds(last));
+    for Shot { start, end, .. } in brief {
+        let frames = end - start;
+        let (start, end) = (fps.seconds(start), fps.seconds(end));
         warnings.push(json!({
             "kind": "brief_shot",
             "timeline_start": start,
             "timeline_end": end,
-            "frames": last - first,
+            "frames": frames,
             "message": format!(
-                "The picture holds for only {} frames ({:.2}s) from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
-                last - first, end - start, args.min_shot_seconds
+                "The picture holds for only {frames} frames ({:.2}s) between two hard cuts, from {start:.2}s to {end:.2}s, under {}s; it reads as a flash. Check with skywrite review cuts; extend or remove the shot, or cover it, if unintended.",
+                end - start, args.min_shot_seconds
             ),
         }));
     }
@@ -1050,71 +1063,34 @@ fn lint(args: &LintArgs) -> Result<Value> {
             "levels": levels_checked,
             "min_shot_seconds": args.min_shot_seconds,
             "uncertain_cover_sources": uncertain_cover,
+            "brief_shots_not_checked": not_checked,
             "level_measurements": measurements,
         },
         "limitations": [
             "Checks are objective signals, not editorial judgement: they cannot assess delivery, emotional fit, B-roll relevance or music choice.",
             "Speaker and repetition checks only cover sources whose transcripts were supplied, and only as well as those transcripts capture what was said.",
             "Level checks measure short windows of the source audio with the edit's gains applied; they do not replace listening to the mix (skywrite review cuts).",
-            "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement, opacity and fades, not pixels: only full-frame video whose pixel format has no alpha channel covers what is beneath it, so cuts under stills, letterboxed pictures and alpha-capable video (even fully opaque ProRes 4444) count as visible and can add warnings; video whose pixel format FFmpeg does not describe is listed in checked.uncertain_cover_sources and never covers; fades follow FFmpeg's fade filter, which rounds them to whole frames; overlays that do not cover the frame never dim what is beneath, so at partial opacity they count about half as much; and changes inside a clip's own picture (a cut baked into the source) are not seen."
+            "Brief shots are checked only between hard cuts; fades and dissolves are not checked yet: a shot with a fade, dissolve or opacity change at either cut is never reported as brief, and when its clip edges are under the threshold it is listed in checked.brief_shots_not_checked instead, to watch with skywrite review cuts.",
+            "Cover (for silent speakers and brief shots) and brief shots are judged from clip placement and opacity, not pixels: only full-frame video whose pixel format has no alpha channel covers what is beneath it, so cuts under stills, letterboxed pictures and alpha-capable video (even fully opaque ProRes 4444) count as visible and can add warnings; video whose pixel format FFmpeg does not describe is listed in checked.uncertain_cover_sources and never covers; overlays that do not cover the frame never dim what is beneath, so at partial opacity they count about half as much; and changes inside a clip's own picture (a cut baked into the source) are not seen."
         ],
     }))
 }
 
-/// Factor (0..1) of FFmpeg's `fade` filter for frame `k` of a clip, as the
-/// renderer applies it after `fps=` (time base 1/fps, frame k at pts k).
-/// libavfilter/vf_fade.c, unchanged from FFmpeg 5.1 to 8.0: `st` and `d` are
-/// parsed to microseconds (from the renderer's 9-decimal strings) and rescaled
-/// to the time base rounding to nearest; the 16-bit factor is
-/// `(pts - st) * 65535 / d`, 0 before `st` and full after `st + d`, inverted for
-/// a fade-out. A fade shorter than half a frame switches at `st`.
-fn fade_factor(k: u64, start: f64, duration: f64, fps: timeline::Rational, out: bool) -> f64 {
-    let pts = |seconds: f64| -> i128 {
-        let micros = ((seconds.max(0.0) * 1e9).round() as i128) / 1000;
-        let (a, b) = (micros * fps.num as i128, 1_000_000 * fps.den as i128);
-        (2 * a + b) / (2 * b)
-    };
-    let (st, d, k) = (pts(start), pts(duration), k as i128);
-    let factor = if k < st {
-        0
-    } else if d == 0 {
-        if k > st { 65535 } else { 0 }
-    } else if k > st + d {
-        65535
-    } else {
-        ((k - st) * 65535 / d).min(65535)
-    };
-    let factor = if out { 65535 - factor } else { factor };
-    factor as f64 / 65535.0
-}
-
-/// Clip alpha at output frame `n` (inside the clip): opacity times the
-/// renderer's fades (`fade=…:alpha=1`, see `fade_factor`).
-fn clip_alpha(clip: &timeline::ValidatedVideoClip, fps: timeline::Rational, n: u64) -> f64 {
-    let k = n - clip.start_frames;
-    let duration = fps.seconds(clip.duration_frames);
-    let mut alpha = clip.opacity;
-    if clip.fade_in > 0.0 {
-        alpha *= fade_factor(k, 0.0, clip.fade_in, fps, false);
-    }
-    if clip.fade_out > 0.0 {
-        alpha *= fade_factor(k, duration - clip.fade_out, clip.fade_out, fps, true);
-    }
-    alpha
-}
-
-/// Share of the picture that makes a change visible (see `picture_distance`).
+/// Share of the picture that must change at once for a cut (see
+/// `picture_distance`).
 const PICTURE_CHANGE: f64 = 0.25;
 
 /// Black (no picture) in a frame's weights.
 const BLACK: usize = usize::MAX;
 
-/// A stretch of frames with one picture: the visible weight of each take
-/// (and of black), sorted by take id.
-struct PictureRun {
+/// Frames from one cut to the next. `hard` when no visible clip fades in it or
+/// in the frame on either side, and no visible take continues at another
+/// opacity at its cuts or inside it, so both cuts are hard and its length is
+/// exact.
+struct Shot {
     start: u64,
     end: u64,
-    weights: Vec<(usize, f64)>,
+    hard: bool,
 }
 
 /// How much of the picture differs between two weight lists: half the sum of
@@ -1146,12 +1122,12 @@ fn picture_distance(a: &[(usize, f64)], b: &[(usize, f64)]) -> f64 {
     sum / 2.0
 }
 
-/// The timeline as runs of frames with one picture, in order and covering
-/// every frame. See `lint` (1b) for the model.
-fn picture_runs(
+/// The timeline's shots, in order. See `lint` (1b) for the model; black lies
+/// beyond both ends of the timeline.
+fn shots(
     edit: &timeline::ValidatedEdit,
     covers_frame: &dyn Fn(&timeline::ValidatedVideoClip) -> bool,
-) -> Vec<PictureRun> {
+) -> Vec<Shot> {
     let fps = edit.fps();
     let frame = fps.seconds(1);
     let total = edit.duration_frames();
@@ -1167,8 +1143,7 @@ fn picture_runs(
         track.sort_by_key(|c| c.start_frames);
     }
     // A straight split continues the take: same track and source, abutting,
-    // and source-contiguous within one frame of the slower clip's step. Its
-    // opacity and fades are compared as weights, not as identity.
+    // and source-contiguous within one frame of the slower clip's step.
     let continues = |a: &timeline::ValidatedVideoClip, b: &timeline::ValidatedVideoClip| {
         a.source == b.source
             && a.end_frames() == b.start_frames
@@ -1189,13 +1164,35 @@ fn picture_runs(
         }
         takes.push(ids);
     }
-    // Visible weight of each take at frame n, from the top track down: alpha
-    // times what full-frame opaque cover above lets through; black gets what
-    // is left.
-    let weights = |n: u64| {
+    // Frames a clip's fades can change, with a frame to spare for FFmpeg
+    // rounding fades to whole frames.
+    let fading = |clip: &timeline::ValidatedVideoClip| {
+        let frames = |seconds: f64| (seconds / frame).ceil() as u64 + 1;
+        let (start, end) = (clip.start_frames, clip.end_frames());
+        let fade_in = if clip.fade_in > 0.0 {
+            start..(start + frames(clip.fade_in)).min(end)
+        } else {
+            start..start
+        };
+        let fade_out = if clip.fade_out > 0.0 {
+            end.saturating_sub(frames(clip.fade_out)).max(start)..end
+        } else {
+            end..end
+        };
+        [fade_in, fade_out]
+    };
+    // The picture at frame n, from the top track down: each take's opacity
+    // times what full-frame opaque cover above lets through, black getting
+    // what is left; whether a visible clip is fading there; and whether a
+    // visible take continues at another opacity there.
+    let picture = |n: u64| {
         let mut through = 1.0;
+        let (mut fades, mut steps) = (false, false);
         let mut out: Vec<(usize, f64)> = Vec::new();
         for (track, ids) in tracks.iter().zip(&takes).rev() {
+            if through <= 1e-9 {
+                break;
+            }
             let at = track.partition_point(|c| c.start_frames <= n);
             let Some(i) = at.checked_sub(1) else {
                 continue;
@@ -1204,224 +1201,64 @@ fn picture_runs(
             if n >= clip.end_frames() {
                 continue;
             }
-            let alpha = clip_alpha(clip, fps, n);
-            out.push((ids[i], alpha * through));
+            fades |= fading(clip).iter().any(|r| r.contains(&n));
+            steps |= clip.start_frames == n
+                && i > 0
+                && ids[i - 1] == ids[i]
+                && track[i - 1].opacity != clip.opacity;
+            out.push((ids[i], clip.opacity * through));
             if covers_frame(clip) {
-                through *= 1.0 - alpha;
+                through *= 1.0 - clip.opacity;
             }
         }
         out.push((BLACK, through));
         out.retain(|(_, w)| *w > 1e-9);
         out.sort_unstable_by_key(|(id, _)| *id);
-        out
+        (out, fades, steps)
     };
-    // Weights only change at clip boundaries and inside fades.
+    // The picture only changes at clip edges and fade ends.
     let mut breaks = std::collections::BTreeSet::from([0]);
     for clip in tracks.iter().flatten() {
-        let (start, end) = (clip.start_frames, clip.end_frames());
-        breaks.insert(start);
-        breaks.insert(end);
-        let fade_in = (clip.fade_in / frame).ceil() as u64 + 2;
-        let fade_out = (clip.fade_out / frame).ceil() as u64 + 2;
-        if clip.fade_in > 0.0 {
-            breaks.extend(start..(start + fade_in).min(end));
-        }
-        if clip.fade_out > 0.0 {
-            breaks.extend(end.saturating_sub(fade_out).max(start)..end);
+        breaks.insert(clip.start_frames);
+        breaks.insert(clip.end_frames());
+        for range in fading(clip) {
+            breaks.insert(range.start);
+            breaks.insert(range.end);
         }
     }
-    let breaks: Vec<u64> = breaks.into_iter().filter(|&n| n < total).collect();
-    let mut runs: Vec<PictureRun> = Vec::with_capacity(breaks.len());
-    for (i, &n) in breaks.iter().enumerate() {
-        let end = breaks.get(i + 1).copied().unwrap_or(total);
-        let now = weights(n);
-        match runs.last_mut() {
-            Some(last) if picture_distance(&last.weights, &now) < 1e-9 => last.end = end,
-            _ => runs.push(PictureRun {
-                start: n,
-                end,
-                weights: now,
-            }),
-        }
-    }
-    runs
-}
-
-/// Brief shots as `(first frame, end frame)`. For each run of one picture, the
-/// references are the most different pictures within `max_frames` before and
-/// after it (the nearest on ties; black beyond the timeline ends). The shot
-/// spans its whole transient: from where the picture is closer to the run than
-/// to the reference before, to where it becomes closer to the reference after
-/// (the middle of a dissolve; the cut itself for a hard cut). It is brief when
-/// that span is shorter than `max_frames`, both references differ from it by
-/// at least `PICTURE_CHANGE`, and it is a detour rather than a step from one
-/// to the other (triangle excess at least `PICTURE_CHANGE`). Overlapping
-/// candidates are one flash, reported once by its most distinct picture.
-fn brief_shots(runs: &[PictureRun], total: u64, max_frames: u64) -> Vec<(u64, u64)> {
+    let starts: Vec<u64> = breaks.into_iter().filter(|&n| n < total).collect();
+    let pictures: Vec<_> = starts.iter().map(|&n| picture(n)).collect();
     let black = [(BLACK, 1.0)];
-    let weights = |i: Option<usize>| -> &[(usize, f64)] {
-        i.map_or(black.as_slice(), |i| runs[i].weights.as_slice())
-    };
-    let mut found: Vec<(u64, u64, f64)> = Vec::new();
-    for (r, run) in runs.iter().enumerate() {
-        let here = run.weights.as_slice();
-        let farthest = |best: Option<(Option<usize>, f64)>, i: Option<usize>| {
-            let d = picture_distance(weights(i), here);
-            match best {
-                Some((_, b)) if d <= b + 1e-9 => best,
-                _ => Some((i, d)),
+    let weights = |i: usize| pictures.get(i).map_or(black.as_slice(), |p| p.0.as_slice());
+    // Cuts as indices into `starts`; `starts.len()` is the timeline's end.
+    let cuts: Vec<usize> = (0..=starts.len())
+        .filter(|&i| {
+            let before = i.checked_sub(1).map_or(black.as_slice(), weights);
+            picture_distance(before, weights(i)) >= PICTURE_CHANGE - 1e-9
+        })
+        .collect();
+    cuts.windows(2)
+        .map(|pair| {
+            let (first, last) = (pair[0], pair[1]);
+            Shot {
+                start: starts[first],
+                end: starts.get(last).copied().unwrap_or(total),
+                // No fade in the shot or the frame on either side, and no
+                // opacity step at its cuts or inside it.
+                hard: !pictures[first.saturating_sub(1)..(last + 1).min(pictures.len())]
+                    .iter()
+                    .any(|p| p.1)
+                    && !pictures[first..(last + 1).min(pictures.len())]
+                        .iter()
+                        .any(|p| p.2),
             }
-        };
-        let window = run.start.saturating_sub(max_frames);
-        let mut before = runs[..r]
-            .iter()
-            .enumerate()
-            .rev()
-            .take_while(|(_, q)| q.end > window)
-            .fold(None, |best, (i, _)| farthest(best, Some(i)));
-        if run.start < max_frames {
-            before = farthest(before, None);
-        }
-        let mut after = runs
-            .iter()
-            .enumerate()
-            .skip(r + 1)
-            .take_while(|(_, s)| s.start < run.end + max_frames)
-            .fold(None, |best, (i, _)| farthest(best, Some(i)));
-        if total - run.end < max_frames {
-            after = farthest(after, None);
-        }
-        let (Some((q, to)), Some((s, from))) = (before, after) else {
-            continue;
-        };
-        let (q_weights, s_weights) = (weights(q), weights(s));
-        let excess = to + from - picture_distance(q_weights, s_weights);
-        // A detour returns, so its excess is twice its distance; a dissolve
-        // between two shots dips at most 0.25 off the straight path.
-        if to < PICTURE_CHANGE || from < PICTURE_CHANGE || excess < 2.0 * PICTURE_CHANGE - 1e-9 {
-            continue;
-        }
-        let from_q = q.map_or(0, |q| q + 1);
-        let first = runs[from_q..=r]
-            .iter()
-            .position(|x| {
-                picture_distance(&x.weights, here) <= picture_distance(&x.weights, q_weights)
-            })
-            .map_or(r, |i| from_q + i);
-        let to_s = s.unwrap_or(runs.len() - 1).max(r) + 1;
-        let last = runs[r + 1..to_s]
-            .iter()
-            .position(|x| {
-                picture_distance(&x.weights, here) > picture_distance(&x.weights, s_weights)
-            })
-            .map(|i| r + 1 + i);
-        // Mostly black is a fade through black unless it is cut in and out.
-        let blackness = here
-            .iter()
-            .find(|(id, _)| *id == BLACK)
-            .map_or(0.0, |(_, w)| *w);
-        let hard = |i: usize| {
-            i == 0
-                || i >= runs.len()
-                || picture_distance(&runs[i - 1].weights, &runs[i].weights) >= PICTURE_CHANGE
-        };
-        if blackness >= 0.5 && !(hard(first) && last.is_none_or(hard)) {
-            continue;
-        }
-        let (first, last) = (
-            runs[first].start,
-            last.map_or(if s.is_some() { run.end } else { total }, |i| runs[i].start),
-        );
-        if last > first && last - first < max_frames {
-            found.push((first, last, excess));
-        }
-    }
-    found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut shots: Vec<(u64, u64, f64)> = Vec::new();
-    let mut group_end = 0;
-    for (first, last, excess) in found {
-        match shots.last_mut() {
-            Some(best) if first < group_end => {
-                if excess > best.2 + 1e-9 {
-                    *best = (first, last, excess);
-                }
-                group_end = group_end.max(last);
-            }
-            _ => {
-                shots.push((first, last, excess));
-                group_end = last;
-            }
-        }
-    }
-    shots
-        .into_iter()
-        .map(|(first, last, _)| (first, last))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Lint's fade model matches the alpha FFmpeg's `fade` filter renders, for
-    /// the renderer's filter strings, at integer and NTSC rates.
-    #[test]
-    fn fade_factor_matches_ffmpeg_rendered_alpha() {
-        let cases: [(u32, u32, u64, f64, f64); 8] = [
-            (30, 1, 15, 0.0, 0.049),
-            (30000, 1001, 15, 0.0, 0.049),
-            (24000, 1001, 12, 0.0, 0.06),
-            (30, 1, 12, 0.19, 0.19),
-            (30, 1, 2, 0.0333, 0.0333),
-            (30, 1, 30, 0.5, 0.0),
-            (24000, 1001, 24, 0.4, 0.4),
-            (30000, 1001, 20, 0.01, 0.3),
-        ];
-        for (num, den, frames, fade_in, fade_out) in cases {
-            let fps = timeline::Rational { num, den };
-            let duration = fps.seconds(frames);
-            let mut chain = format!(
-                "color=white:s=16x16:r={num}/{den}:d={:.9},format=yuva420p",
-                duration + 1.0
-            );
-            if fade_in > 0.0 {
-                chain += &format!(",fade=t=in:st=0:d={fade_in:.9}:alpha=1");
-            }
-            if fade_out > 0.0 {
-                chain += &format!(
-                    ",fade=t=out:st={:.9}:d={fade_out:.9}:alpha=1",
-                    duration - fade_out
-                );
-            }
-            chain += ",alphaextract";
-            let out = std::process::Command::new("ffmpeg")
-                .args(["-v", "error", "-f", "lavfi", "-i", &chain, "-frames:v"])
-                .arg(frames.to_string())
-                .args(["-f", "rawvideo", "-pix_fmt", "gray", "-"])
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let rendered: Vec<u8> = out.stdout.chunks(256).map(|f| f[8 * 16 + 8]).collect();
-            assert_eq!(rendered.len() as u64, frames);
-            for (k, &alpha) in rendered.iter().enumerate() {
-                let mut model = 1.0;
-                if fade_in > 0.0 {
-                    model *= fade_factor(k as u64, 0.0, fade_in, fps, false);
-                }
-                if fade_out > 0.0 {
-                    model *= fade_factor(k as u64, duration - fade_out, fade_out, fps, true);
-                }
-                assert!(
-                    (model * 255.0 - alpha as f64).abs() <= 1.0,
-                    "{num}/{den} {frames} frames, fades {fade_in}/{fade_out}: frame {k} renders {alpha}, model {}",
-                    model * 255.0
-                );
-            }
-        }
-    }
     #[test]
     fn interval_subtraction_and_word_normalization() {
         let pieces = subtract(
