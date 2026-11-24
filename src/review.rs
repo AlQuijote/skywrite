@@ -874,7 +874,7 @@ fn lint(args: &LintArgs) -> Result<Value> {
         let (start, end) = (fps.seconds(start), fps.seconds(end));
         let what = span["source"]
             .as_str()
-            .map_or_else(|| "Black".to_owned(), str::to_owned);
+            .map_or_else(|| "Black".to_owned(), |path| file_name(Path::new(path)));
         warnings.push(json!({
             "kind": "brief_shot",
             "timeline_start": start,
