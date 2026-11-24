@@ -943,3 +943,36 @@ fn media_root_warns_when_sources_leave_the_edit_tree() {
     let warned = result["warnings"].to_string().contains("filesystem root");
     assert_eq!(warned, base.parent().is_none(), "{result}");
 }
+
+#[test]
+fn help_explains_premiere_fit_and_rotation_for_agents() {
+    let help = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_skywrite"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let export = help(&["edit", "export", "--help"]);
+    for fact in [
+        "Basic Motion Scale (percent)",
+        "min(width / clip width, height / clip height) * 100",
+        "displayed (upright)",
+        "gets Scale 50 in a 1080x1920 sequence",
+        "clips that already match get no",
+        "pixel aspect ratio",
+        "skywrite edit export reel.json --to premiere -o reel.xml",
+    ] {
+        assert!(export.contains(fact), "missing {fact:?} in:\n{export}");
+    }
+    let inspect = help(&["inspect", "--help"]);
+    for fact in [
+        "rotation",
+        "whole degrees, or null",
+        "-90 or 90",
+        "width and height swapped",
+    ] {
+        assert!(inspect.contains(fact), "missing {fact:?} in:\n{inspect}");
+    }
+}
