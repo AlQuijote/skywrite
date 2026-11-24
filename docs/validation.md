@@ -92,7 +92,7 @@ by version:
   after `setpts` added no frames: a clip whose video starts 1 s after its audio
   showed its first picture at 0 s (in both the renderer and exported scripts).
   5.1, 6.1 and 8.0 or newer keep the rate. The lead is now added after `fps`,
-  in output seconds.
+  as a whole number of frames.
 - Before FFmpeg 8.0, `acrossfade` ends its output as soon as its second input
   ends, even while it is still reading the first. With the threaded CLI of 7.0
   and 7.1, a crossfaded loop of a 1-s cue was cut short at random points and
@@ -238,10 +238,90 @@ exact in both renderers:
 renderers and checks every frame, and that Premiere XML and FCPXML place each
 clip on the same frames.
 
-Inside a clip, which source frame is shown is FFmpeg `fps` sampling from the
-first source frame at or after `source_in` (unchanged here). For the MP4
-fixtures above, the test also checks each frame's source frame number against
-that sampling.
+### Source frame on screen
+
+A clip's frame shows the source frame on screen at its source time
+(docs/edit-format.md), checked with the same frame-numbered sources (2026-11-24,
+FFmpeg 8.0.1). The sources were MP4 at all six rates, plus Matroska at 29.97, 23.976 and 25
+fps, whose timestamps are rounded to 1 ms and whose picture starts 21 ms after
+its sound. The cases ran with the renderer and with the exported script, at
+edit rates 23.976, 24, 25, 29.97, 30, 50, 59.94 and 60.
+
+Before the change, inside correctly placed clips:
+- The renderer used FFmpeg `fps` sampling from the first source frame at or
+  after `source_in`, so the picture ran ahead of the source time. This happened
+  when `source_in` fell between source frames, when the rates differed, or at
+  speeds other than 1. The lead was up to one source frame plus half an output
+  frame times `speed` with exact timestamps, and more with coarse ones (280 ms
+  for a 25 fps AVI at speed 8).
+- At 29.97, `source_in` 2 on a 29.97 source started on frame 60 instead of 59.
+
+After the change, every frame of every case (40 cases at 8 rates, both
+renderers) shows the expected source frame:
+- the last source frame that starts at or before `source_in + n × speed / fps`,
+  in the file's timeline;
+- or black before a late picture.
+
+How it is done:
+- The decode starts 1 s before `source_in` (from the file's start for MPEG-TS
+  and for a `source_in` at or before the first picture). It starts earlier when
+  the picture on screen at `source_in` started earlier: a variable-frame-rate
+  MP4 holding its first picture for 3 s showed the next picture at `source_in`
+  1.5 and 2.5. To find that picture's start, FFprobe reads at most 2000
+  packets from the keyframe before `source_in`. A packet without a
+  presentation time (H.264 in AVI) counts by its decoding time, which is never
+  later. If the read stops before `source_in`, the latest packet read is still
+  at or before the picture on screen. A file whose packets carry no times at
+  all decodes from its start. (`-noaccurate_seek` would keep the picture too,
+  but input `-t` then counts from the earlier keyframe and cut clips short.)
+  The decode runs 0.5 s past the clip's last source time; without that tail, a 0.125x clip of an AVI
+  (time base one frame) lost the frame on screen at its end and rendered black.
+- Black frames before a late first picture are counted from that picture's
+  time exactly as the frame timing sees it. A 1.25x clip of a Matroska file
+  whose picture starts 21 ms in otherwise showed the picture one 60 fps frame
+  early.
+- Each input keeps its own timestamps (`-copyts`), and the probed container start
+  is subtracted. Without that, FFmpeg shifts each frame by the container start
+  plus `-ss`, rounded to the stream's tick, which put frames up to half a tick
+  off. For MPEG-TS it also shifts by an origin that moves when the clip's sound
+  goes unused: a muted TS clip started one frame late.
+- FFprobe reports start times to the microsecond. Each one is rounded back to
+  a whole tick of its stream's time base (when the tick is at least 2 us), so
+  the subtracted origin is exact. Otherwise a picture-only MP4 starting at
+  76831/15360 s (reported as 5.002018) put every frame 229 ns late, and frames
+  exactly on output frames showed the previous source frame.
+- `setpts` works in nanoseconds and rounds up, so its truncation cannot move a
+  frame earlier. A 20 ns margin in output time keeps a frame exactly on an
+  output frame from being carried past it, since NTSC frames are not whole
+  nanoseconds. At speed 8, microseconds were too coarse: a frame showed one
+  source frame early, or one late at 29.97 (frames 0, 7, 15 instead of 0, 8, 16).
+- `fps` rounds them up (`round=up`), so an output frame takes the last frame
+  whose time is not after its own.
+- When the frame rate does not fall on whole ticks (Matroska 1 ms at 29.97 or
+  30 fps, MOV 1/600), the container rounded the times by up to half a tick
+  either way. A frame within that of its nominal grid is snapped back to it;
+  any other frame keeps its time and counts up to half a tick (at most 0.5 ms)
+  late as on screen.
+- Snapping fixed a 29.97 fps Matroska frame stored 0.37 ms early, which a
+  tolerance alone showed one output frame early in a 60 fps edit. Snapping only
+  frames near the grid keeps a variable-rate Matroska frame 10 ms off the grid
+  at its real time.
+- A clip's sound, for video and audio-only clips alike, decodes from the same
+  seek point, up to 1 s early. It is trimmed at `source_in` on the file's own
+  timeline, wherever the decode resumed.
+  - Counting from the seek point instead went wrong when a lossless picture had
+    a keyframe every 25 frames and the PCM sound was remuxed into Matroska: the
+    sound resumed after the seek point, and the clip's sound came out 77 ms late.
+  - `tests/export_pipeline.rs` checks the sound to the sample in MP4 and MOV,
+    and to 24 samples in Matroska.
+
+`tests/frame_exact_render.rs` checks the source frame number of every output
+frame against this rule, at 23.976, 24, 25, 29.97, 30 and 60 fps through both
+renderers. The sources are:
+- MP4, including one whose timeline starts off its picture's tick grid;
+- Matroska, including frames exactly on rounded timestamps;
+- MPEG-TS with its sound used and unused;
+- a clip at speed 8.
 
 ## Dual-system sound: camera scratch track and separate recorder
 

@@ -182,11 +182,37 @@ integer and NTSC rates alike (each frame decoded at 23.976, 25, 29.97 and 30
 fps; see [validation](validation.md#frame-exact-placement)). FCPXML and Premiere
 XML place clips on the same frames.
 
-Which source frame each of those frames shows is FFmpeg `fps` sampling of the
-clip from the first source frame at or after `source_in`. It can show a frame
-ahead of the exact source time, by an amount that depends on the two frame rates,
-`speed` and the source's timestamp precision. Sound follows `source_in` to the
-48-kHz sample.
+Each of those frames shows the source frame that is on screen at its source time.
+Output frame n of the clip is at source time `source_in + n × speed / fps`, and
+it shows the last source frame that starts at or before that time. The source
+timeline counts from the file's start, as for sound. The picture so stays with
+the sound, which follows `source_in` to the 48-kHz sample (to half a
+millisecond for Matroska, which stores times to 1 ms). FCPXML keeps the
+exact `source_in`. Premiere XML rounds a sub-frame `source_in` to the nearest
+frame (with a warning), so Premiere can start such a clip one source frame away
+from the render. For example, `source_in` 2 on a 29.97 fps source shows source
+frame 59 (1.969 s) first, then frame 60 (2.002 s) from the next output frame.
+
+Output frames before the first picture are black. That happens when a video
+stream starts after `source_in`: for example, a Matroska file whose AAC sound
+starts 21 ms before its picture renders one black frame at `source_in` 0. Some
+cases need care:
+- Timestamps whose frame rate falls on whole ticks of the time base (most MP4)
+  count exactly.
+- Some containers round timestamps, such as Matroska storing 29.97 or 30 fps to
+  1 ms, or MOV at 1/600 s. A frame whose time lies within that rounding of the
+  stream's nominal frame grid (counted from its first frame) is read on the
+  grid, so the rounding does not move a frame.
+- Any other frame, for example in variable-frame-rate video, keeps its time.
+  It counts as on screen up to half a tick (at most 0.5 ms) early. Coarser
+  rounding than that can still show the previous frame.
+- The renderer decodes from 1 s before `source_in`. When the picture on screen
+  then started even earlier (variable-frame-rate video holding a picture), it
+  decodes from that picture's start. That start is found with one FFprobe read
+  per clip, of at most 2000 packets from the keyframe before `source_in`. A
+  file whose packets carry no times at all decodes from its start.
+  MPEG-TS sources, and a `source_in` at or before the first picture, decode from
+  the file's start.
 
 ## Pictures
 

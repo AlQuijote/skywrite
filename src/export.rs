@@ -395,31 +395,166 @@ fn silence(samples: u64, label: &str) -> String {
     format!("anullsrc=r=48000:cl=stereo,atrim=end_sample={samples},asetpts=PTS-STARTPTS[{label}]")
 }
 
+/// Where a clip's input is decoded from: `seek` is the `-ss` point (0: from
+/// the start), `prefix` the decoded time before `source_in` (`source_in - seek`).
+#[derive(Debug, Clone, Copy)]
+struct SourceTimes {
+    source_in: f64,
+    prefix: f64,
+    seek: f64,
+}
+
+impl SourceTimes {
+    fn new(source_in: f64, seek: f64) -> Self {
+        Self {
+            source_in,
+            prefix: source_in - seek,
+            seek,
+        }
+    }
+}
+
+/// How far before `source_in` the picture decode starts, so the source frame
+/// already on screen at `source_in` is decoded (FFmpeg's accurate `-ss` drops
+/// frames that start before the seek point).
+const PICTURE_PREROLL_SECONDS: f64 = 1.0;
+/// Decoded past the clip's last source time, so rounded input timestamps (an
+/// AVI at 1001/30000 s) never drop the frame on screen at the end; the output
+/// is trimmed to the clip's frames anyway.
+const PICTURE_TAIL_SECONDS: f64 = 0.5;
+/// A positive rational such as "1/15360" or "30000/1001".
+fn rational(text: Option<&str>) -> Option<(u64, u64)> {
+    let (num, den) = text?.split_once('/')?;
+    let (num, den) = (num.parse::<u64>().ok()?, den.parse::<u64>().ok()?);
+    (num > 0 && den > 0).then_some((num, den))
+}
+
+/// A stream's start time as its file stores it. FFprobe reports start times
+/// to the microsecond, while a stream's own times are whole ticks of its time
+/// base; with a tick of at least 2 us the reported time rounds back to that
+/// tick exactly (an MP4 starting at 76831/15360 s is reported as 5.002018).
+fn exact_start(stream: &media::MediaStream) -> Option<f64> {
+    let start = stream.start_time?;
+    Some(match rational(stream.time_base.as_deref()) {
+        Some((num, den)) if num as f64 / den as f64 >= 0.000_002 => {
+            let tick = num as f64 / den as f64;
+            (start / tick).round() * tick
+        }
+        _ => start,
+    })
+}
+
+/// The file's timeline origin (its earliest stream start, as FFprobe reports
+/// it) at the exact time of the stream it comes from, and the first picture's
+/// exact time, both in the file's own seconds.
+fn exact_origins(info: &media::MediaInfo) -> (f64, Option<f64>) {
+    let start = info
+        .streams
+        .iter()
+        .filter_map(exact_start)
+        .filter(|exact| (exact - info.start_time).abs() < 0.000_001)
+        .reduce(f64::min)
+        .unwrap_or(info.start_time);
+    (start, info.video().and_then(exact_start))
+}
+
+/// How a video stream's frame times are read for on-screen sampling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PictureTiming {
+    /// How far the container may have rounded a frame time, either way
+    /// (seconds, half a tick; 0 when the times are exact).
+    rounding: f64,
+    /// Nominal frame rate whose grid a frame time within `rounding` of it is
+    /// snapped back to.
+    grid: Option<(u64, u64)>,
+}
+
+/// Timestamps are exact when the stream's frame rate puts every frame on a
+/// whole tick of its time base (30 fps in 1/15360, 29.97 in 1/30000, 25 in
+/// 1/1000). Otherwise the container rounded them, by up to half a tick either
+/// way (Matroska stores 29.97 or 30 fps to 1 ms, MOV often uses 1/600 s). A
+/// frame time within that of its nominal frame grid (counted from the first
+/// picture) is snapped back to the grid; any other frame (variable frame rate)
+/// keeps its time and counts as on screen up to that rounding, at most 0.5 ms
+/// (`early`), late. Without a time base or frame rate, 0.5 ms is assumed.
+impl PictureTiming {
+    /// How late a frame that keeps its own time may start and still count as
+    /// on screen: the rounding, at most 0.5 ms because NTSC frames lie at least
+    /// 1 ms off round seconds.
+    fn early(self) -> f64 {
+        self.rounding.min(0.000_5)
+    }
+}
+
+fn picture_timing(info: &media::MediaInfo) -> PictureTiming {
+    let video = info.video();
+    let time_base = video.and_then(|v| rational(v.time_base.as_deref()));
+    let rate = video.and_then(|v| rational(v.r_frame_rate.as_deref()));
+    match (time_base, rate) {
+        (Some((tick_num, tick_den)), Some((rate_num, rate_den))) => {
+            // Ticks per frame: (rate_den / rate_num) / (tick_num / tick_den).
+            let (whole, per) = (
+                u128::from(rate_den) * u128::from(tick_den),
+                u128::from(rate_num) * u128::from(tick_num),
+            );
+            if whole % per == 0 {
+                PictureTiming {
+                    rounding: 0.0,
+                    grid: None,
+                }
+            } else {
+                PictureTiming {
+                    rounding: tick_num as f64 / tick_den as f64 / 2.0,
+                    grid: Some((rate_num, rate_den)),
+                }
+            }
+        }
+        _ => PictureTiming {
+            rounding: 0.000_5,
+            grid: None,
+        },
+    }
+}
+
+/// Seek point for a video clip: up to the pre-roll before `source_in`, not
+/// before the first picture, in whole microseconds (FFmpeg parses `-ss` to
+/// microseconds). 0 means decode from the start (also for MPEG-TS and a
+/// `source_in` at or before the first picture, see `unseeked_prefix`). Picture
+/// timing does not depend on it: with `-copyts` frames keep the file's times.
+fn picture_seek(info: &media::MediaInfo, source_in: f64) -> f64 {
+    if unseeked_prefix(info, source_in) > 0.0 {
+        return 0.0;
+    }
+    let video = info.video();
+    let first = video
+        .and_then(|v| v.start_time)
+        .map_or(0.0, |start| start - info.start_time);
+    if source_in <= first {
+        // Nothing is on screen before the first picture: decode from the start.
+        return 0.0;
+    }
+    let seek = ((source_in - PICTURE_PREROLL_SECONDS).max(first) * 1e6).round() / 1e6;
+    if seek > 0.0 { seek } else { 0.0 }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn audio_segment(
     speeds: &SpeedFilters,
     input: usize,
     info: &media::MediaInfo,
-    source_times: (f64, f64),
+    source_in: f64,
     output_samples: u64,
     speed: f64,
     envelope: &str,
     label: &str,
 ) -> Result<String> {
-    let (source_in, unseeked_prefix) = source_times;
     let duration = output_samples as f64 / 48000.0;
-    let trim = (unseeked_prefix
-        - info
-            .audio()
-            .map(|audio| audio.start_time.unwrap_or(info.start_time) - info.start_time)
-            .unwrap_or(0.0))
-    .max(0.0);
-    let lead = info
+    let (origin, _) = exact_origins(info);
+    let audio_start = info
         .audio()
-        .map(|audio| {
-            (audio.start_time.unwrap_or(info.start_time) - info.start_time - source_in).max(0.0)
-        })
+        .map(|audio| exact_start(audio).unwrap_or(origin) - origin)
         .unwrap_or(0.0);
+    let lead = (audio_start - source_in).max(0.0);
     let content = (duration * speed - lead).max(0.0);
     if content <= 0.0 {
         return Ok(silence(output_samples, label));
@@ -429,8 +564,12 @@ fn audio_segment(
     let delay = (lead / speed * 48000.0).round() as u64;
     let source_samples = (content * 48000.0).round() as u64;
     Ok(format!(
-        "[{input}:a:0]asetpts=PTS-STARTPTS,atrim=start={},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,atrim=end_sample={source_samples},{},aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={delay}S:all=1,apad=whole_len={output_samples},atrim=end_sample={output_samples},asetpts=N/SR/TB,{envelope}[{label}]",
-        number(trim),
+        "[{input}:a:0]asetpts=round(PTS-{}/TB),atrim=start={},asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,atrim=end_sample={source_samples},{},aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={delay}S:all=1,apad=whole_len={output_samples},atrim=end_sample={output_samples},asetpts=N/SR/TB,{envelope}[{label}]",
+        // With -copyts the sound keeps the file's times: count them from the
+        // container start and trim at `source_in` (or the sound's own start)
+        // there, wherever the decode after a seek happens to begin.
+        number(origin),
+        number(source_in.max(audio_start)),
         speeds.filter(speed, source_samples, label)?,
     ))
 }
@@ -457,6 +596,13 @@ fn transparent(edit: &ValidatedEdit, frames: u64, label: &str) -> String {
 }
 
 /// Add one clip's input and return its picture chain.
+///
+/// Output frame n of the clip shows the source frame on screen at source time
+/// `source_in + n * speed / fps`: the last one that starts at or before it.
+/// Frame timestamps stay relative to `source_in` (the decode starts a pre-roll
+/// earlier), `fps` rounds them up onto output frames (an output frame takes the
+/// latest frame whose time is not after its own), and output frames before the
+/// first picture of a late-starting video stream are black.
 fn video_clip(
     edit: &ValidatedEdit,
     clip: &ValidatedVideoClip,
@@ -464,16 +610,28 @@ fn video_clip(
     input: usize,
     lut_marker: Option<(&str, bool)>,
     label: &str,
-) -> Result<(String, f64)> {
+) -> Result<String> {
     let fps = edit.fps.ffmpeg();
     let duration = edit.fps.seconds(clip.duration_frames);
     let frames = clip.duration_frames;
     let source = clip.source.to_str().context("source path is not UTF-8")?;
     let info = &clip.media;
-    let prefix = if clip.kind == MediaKind::Image {
-        0.0
+    let times = if clip.kind == MediaKind::Image {
+        SourceTimes::new(0.0, 0.0)
     } else {
-        unseeked_prefix(info, clip.source_in)
+        let mut seek = picture_seek(info, clip.source_in);
+        if seek > 0.0 {
+            // A variable-frame-rate picture can stay on screen for longer than
+            // the pre-roll; start the decode no later than it (accurate -ss
+            // drops frames that start before the seek point).
+            // When the file gives no packet times, decode from its start.
+            let (origin, _) = exact_origins(info);
+            seek = match media::picture_start_at_or_before(&clip.source, origin + clip.source_in)? {
+                Some(start) => seek.min(((start - origin) * 1e6).floor() / 1e6),
+                None => 0.0,
+            };
+        }
+        SourceTimes::new(clip.source_in, seek.max(0.0))
     };
     if clip.kind == MediaKind::Image {
         push(
@@ -495,14 +653,14 @@ fn video_clip(
         // Seeking to a video keyframe can skip audio before that frame, even
         // with -ss 0. Decode a pre-video prefix from the beginning and trim
         // its audio in the shared filter.
-        if clip.source_in > 0.0 && prefix == 0.0 {
-            push(args, &["-ss", &number(clip.source_in)]);
+        if times.seek > 0.0 {
+            push(args, &["-ss", &number(times.seek)]);
         }
         push(
             args,
             &[
                 "-t",
-                &number(duration * clip.speed + prefix),
+                &number(duration * clip.speed + times.prefix + PICTURE_TAIL_SECONDS),
                 "-protocol_whitelist",
                 "file,pipe",
                 "-i",
@@ -510,33 +668,74 @@ fn video_clip(
             ],
         );
     }
-    let video_trim = (prefix
-        - info
-            .video()
-            .and_then(|v| v.start_time)
-            .unwrap_or(info.start_time)
-        + info.start_time)
-        .max(0.0);
-    let video_lead = info
-        .video()
-        .map(|video| {
-            (video.start_time.unwrap_or(info.start_time) - info.start_time - clip.source_in)
-                .max(0.0)
-        })
-        .unwrap_or(0.0);
-    if clip.kind == MediaKind::Video && video_lead >= duration * clip.speed {
-        // An audio-only prefix has no video frame to seed tpad.
-        return Ok((transparent(edit, frames, label), prefix));
+    // Output frames before the first picture of a stream that starts after
+    // `source_in` are black: those whose source time is before it.
+    let (origin, picture) = exact_origins(info);
+    let first_picture = picture.map_or(0.0, |start| start - origin - times.source_in);
+    let timing = if clip.kind == MediaKind::Image {
+        PictureTiming {
+            rounding: 0.0,
+            grid: None,
+        }
+    } else {
+        picture_timing(info)
+    };
+    // The first picture's time as the expression below sees it (on the grid
+    // when snapped, else counted `early`), with the same 20 ns margins in
+    // source and output time, gives the output frame it first appears on.
+    let first_seen = first_picture
+        - if timing.grid.is_some() {
+            0.0
+        } else {
+            timing.early()
+        };
+    let first_out = (first_seen - 0.000_000_02) / clip.speed - 0.000_000_02;
+    let lead_frames = if clip.kind == MediaKind::Video && first_out > 0.0 {
+        (first_out * edit.fps.value()).ceil() as u64
+    } else {
+        0
+    };
+    if lead_frames >= frames {
+        // No picture is on screen during the clip (an audio-only prefix).
+        return Ok(transparent(edit, frames, label));
     }
-    // The black lead is added after `fps`, in output seconds: tpad converts
-    // its duration to frames with the link frame rate, which FFmpeg 7.0 and
-    // 7.1 `setpts` clears, so a lead placed after `setpts` added no frames.
+    // `tpad` adds the lead after `fps`, whose output keeps the frame rate that
+    // FFmpeg 7.0 and 7.1 `setpts` clears.
+    // With -copyts a frame's PTS is the file's own time; the source timeline
+    // counts from the container start (`exact_origins`). A frame time the
+    // container may have rounded is snapped to the frame grid from the first
+    // picture when it lies within that rounding of it, else it counts up to the
+    // rounding early. Times, in nanoseconds (exact in a double for 24 h), are
+    // then relative to `source_in` (less 20 ns), in output time, less the lead
+    // and 20 ns of output time so that `ceil` (which keeps setpts's truncation
+    // from moving a frame earlier) cannot carry a frame that is exactly on an
+    // output frame past it: NTSC output frames do not fall on whole
+    // nanoseconds. Commas and semicolons are protected by filtergraph quoting;
+    // only numbers enter the expression.
+    let (start, first) = if clip.kind == MediaKind::Image {
+        (0.0, 0.0)
+    } else {
+        (origin, picture.unwrap_or(origin))
+    };
+    let early = number(timing.early() * 1e9);
+    let time = match timing.grid {
+        Some((rate_num, rate_den)) => format!(
+            "st(0,round((PTS-{origin})/{frame})*{frame}+{origin});if(lte(abs(PTS-ld(0)),{near}),ld(0),PTS-{early})",
+            origin = number(first * 1e9),
+            frame = number(rate_den as f64 * 1e9 / rate_num as f64),
+            near = number(timing.rounding * 1e9 + 2.0),
+        ),
+        None => format!("PTS-{early}"),
+    };
     let mut chain = format!(
-        "[{input}:v:0]setpts=PTS-STARTPTS,trim=start={},setpts=(PTS-STARTPTS)/{},fps={fps},tpad=start_mode=add:start_duration={}:color=black",
-        number(video_trim),
+        "[{input}:v:0]settb=1/1000000000,setpts='ceil((({time})-{})/{}-{})',fps={fps}:start_time=0:round=up",
+        number((start + times.source_in + 0.000_000_02) * 1e9),
         number(clip.speed),
-        number(video_lead / clip.speed)
+        number(edit.fps.seconds(lead_frames) * 1e9 + 20.0),
     );
+    if lead_frames > 0 {
+        write!(chain, ",tpad=start={lead_frames}:color=black")?;
+    }
     if let Some((marker, three_d)) = lut_marker {
         // Only generated ASCII sidecar paths enter the filter graph.
         let filter = if three_d { "lut3d" } else { "lut1d" };
@@ -566,7 +765,7 @@ fn video_clip(
         )?;
     }
     write!(chain, ",{}[{label}]", frame_clock(edit))?;
-    Ok((chain, prefix))
+    Ok(chain)
 }
 
 fn concat(labels: &[String], video: bool, out: &str) -> String {
@@ -594,6 +793,12 @@ fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan
         "-loglevel".into(),
         "error".into(),
         "-y".into(),
+        // Keep each input's own timestamps: FFmpeg otherwise shifts them by the
+        // container start plus -ss, rounded to the stream's tick, and for
+        // MPEG-TS by an origin that changes when a stream goes unused. Video
+        // timing subtracts the probed container start itself; sound and stills
+        // count from their first sample or frame.
+        "-copyts".into(),
         "-filter_complex_threads".into(),
         "1".into(),
     ];
@@ -653,7 +858,7 @@ fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan
             let marker = clip
                 .lut
                 .map(|i| (lut_markers[i].0.as_str(), lut_markers[i].1));
-            let (chain, prefix) = video_clip(edit, clip, &mut args, input, marker, &label)?;
+            let chain = video_clip(edit, clip, &mut args, input, marker, &label)?;
             filters.push(chain);
             pictures.push(label);
             let samples =
@@ -665,7 +870,7 @@ fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan
                     speeds,
                     input,
                     &clip.media,
-                    (clip.source_in, prefix),
+                    clip.source_in,
                     samples,
                     clip.speed,
                     &mix_filters(&clip.audio, edit.fps.seconds(clip.duration_frames)),
@@ -705,10 +910,14 @@ fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan
                 ));
                 sounds.push(label);
             }
-            let prefix = unseeked_prefix(&clip.media, clip.source_in);
+            // As for video clips: decode from up to a second before
+            // `source_in`, so a seek that resumes the sound at a later packet
+            // (just after a keyframe of a video file) never reaches it.
+            let seek = picture_seek(&clip.media, clip.source_in);
+            let prefix = clip.source_in - seek;
             let duration = edit.fps.seconds(clip.duration_frames);
-            if clip.source_in > 0.0 && prefix == 0.0 {
-                push(&mut args, &["-ss", &number(clip.source_in)]);
+            if seek > 0.0 {
+                push(&mut args, &["-ss", &number(seek)]);
             }
             push(
                 &mut args,
@@ -726,7 +935,7 @@ fn render_plan(edit: &ValidatedEdit, speeds: &SpeedFilters) -> Result<RenderPlan
                 speeds,
                 input,
                 &clip.media,
-                (clip.source_in, prefix),
+                clip.source_in,
                 edit.fps.samples_48k(clip.end_frames()) - edit.fps.samples_48k(clip.start_frames),
                 clip.speed,
                 &mix_filters(&clip.mix, duration),
@@ -1381,6 +1590,163 @@ if __name__ == '__main__':
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn picture_media(
+        format: &str,
+        start: f64,
+        video_start: f64,
+        tb: &str,
+        rate: &str,
+    ) -> media::MediaInfo {
+        media::MediaInfo {
+            path: PathBuf::from("source"),
+            duration: 10.0,
+            start_time: start,
+            size_bytes: 1,
+            format_name: format.into(),
+            streams: vec![media::MediaStream {
+                index: 0,
+                codec_type: "video".into(),
+                codec_name: Some("h264".into()),
+                duration: Some(10.0),
+                start_time: Some(video_start),
+                width: Some(160),
+                height: Some(90),
+                rotation: None,
+                sample_rate: None,
+                channels: None,
+                avg_frame_rate: Some(rate.into()),
+                r_frame_rate: Some(rate.into()),
+                time_base: Some(tb.into()),
+                pix_fmt: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn rounded_frame_times_are_snapped_or_tolerated_and_exact_ones_kept() {
+        let exact = PictureTiming {
+            rounding: 0.0,
+            grid: None,
+        };
+        for (tb, rate) in [
+            ("1/15360", "30/1"),
+            ("1/30000", "30000/1001"),
+            ("1/24000", "24000/1001"),
+            ("1/12800", "25/1"),
+            ("1/1000", "25/1"),
+            ("1001/30000", "30000/1001"),
+            ("1/90000", "30000/1001"),
+        ] {
+            let info = picture_media("mov,mp4,m4a,3gp,3g2,mj2", 0.0, 0.0, tb, rate);
+            assert_eq!(picture_timing(&info), exact, "{tb} {rate}");
+        }
+        // Matroska rounds 29.97 and 30 fps to 1 ms, MOV 29.97 to 1/600 s: half
+        // a tick, snapped back to the frame grid where a frame lies that close.
+        for (format, tb, rate, rounding, grid) in [
+            (
+                "matroska,webm",
+                "1/1000",
+                "30000/1001",
+                0.000_5,
+                (30000, 1001),
+            ),
+            ("matroska,webm", "1/1000", "30/1", 0.000_5, (30, 1)),
+            (
+                "matroska,webm",
+                "1/1000",
+                "60000/1001",
+                0.000_5,
+                (60000, 1001),
+            ),
+            (
+                "mov,mp4,m4a,3gp,3g2,mj2",
+                "1/600",
+                "30000/1001",
+                1.0 / 1200.0,
+                (30000, 1001),
+            ),
+            (
+                "matroska,webm",
+                "1/1000",
+                "24000/1001",
+                0.000_5,
+                (24000, 1001),
+            ),
+            ("avi", "1/100", "30000/1001", 0.005, (30000, 1001)),
+        ] {
+            let info = picture_media(format, 0.0, 0.0, tb, rate);
+            let timing = picture_timing(&info);
+            assert_eq!(timing.grid, Some(grid), "{tb} {rate}");
+            assert!((timing.rounding - rounding).abs() < 1e-12, "{tb} {rate}");
+            // A frame off the grid counts at most 0.5 ms early.
+            assert!((timing.early() - rounding.min(0.000_5)).abs() < 1e-12);
+        }
+        // Without a time base: 0.5 ms, no grid.
+        let mut unknown = picture_media("avi", 0.0, 0.0, "1/1000", "30/1");
+        unknown.streams[0].time_base = None;
+        assert_eq!(
+            picture_timing(&unknown),
+            PictureTiming {
+                rounding: 0.000_5,
+                grid: None
+            }
+        );
+    }
+
+    #[test]
+    fn start_times_round_back_to_their_stream_ticks() {
+        // FFprobe reports 76831/15360 s as 5.002018.
+        let mut info = picture_media(
+            "mov,mp4,m4a,3gp,3g2,mj2",
+            5.002018,
+            5.002018,
+            "1/15360",
+            "30/1",
+        );
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        let (origin, picture) = exact_origins(&info);
+        assert!(close(origin, 76831.0 / 15360.0), "{origin}");
+        assert!(close(picture.unwrap(), 76831.0 / 15360.0));
+        // Ticks finer than 2 us cannot be recovered; the reported time stays.
+        info.streams[0].time_base = Some("1/1000000".into());
+        assert_eq!(exact_origins(&info), (5.002018, Some(5.002018)));
+        // The origin comes from the stream that starts the file; a later
+        // picture keeps its own exact time.
+        let mut late = picture_media("mov,mp4,m4a,3gp,3g2,mj2", 0.0, 0.021021, "1/15360", "30/1");
+        late.streams.push(media::MediaStream {
+            index: 1,
+            codec_type: "audio".into(),
+            start_time: Some(0.0),
+            time_base: Some("1/48000".into()),
+            ..late.streams[0].clone()
+        });
+        let (origin, picture) = exact_origins(&late);
+        assert_eq!(origin, 0.0);
+        assert!(close(picture.unwrap(), 323.0 / 15360.0));
+    }
+
+    #[test]
+    fn picture_seek_starts_a_preroll_early() {
+        let mp4 = picture_media("mov,mp4,m4a,3gp,3g2,mj2", 0.0, 0.0, "1/15360", "30/1");
+        // A pre-roll of 1 s before source_in, in whole microseconds.
+        assert_eq!(picture_seek(&mp4, 2.37), 1.37);
+        assert_eq!(picture_seek(&mp4, 2.022_003_4), 1.022_003);
+        // Within the first second: decode from the start.
+        assert_eq!(picture_seek(&mp4, 0.6), 0.0);
+        // Never before the first picture.
+        let late = picture_media("mov,mp4,m4a,3gp,3g2,mj2", 0.0, 5.0, "1/1000", "25/1");
+        assert_eq!(picture_seek(&late, 5.5), 5.0);
+        // At or before the first picture, and MPEG-TS: from the start, as for sound.
+        assert_eq!(picture_seek(&late, 4.0), 0.0);
+        assert_eq!(picture_seek(&late, 0.0), 0.0);
+        assert_eq!(picture_seek(&late, 5.0), 0.0);
+        let ts = picture_media("mpegts", 1.4, 1.4, "1/90000", "30000/1001");
+        assert_eq!(picture_seek(&ts, 3.0), 0.0);
+        assert_eq!(SourceTimes::new(3.0, 0.0).prefix, 3.0);
+        assert!((SourceTimes::new(2.37, 1.37).prefix - 1.0).abs() < 1e-12);
+    }
+
     #[test]
     fn display_rotation_is_detected_and_cleared() {
         let dir = tempfile::tempdir().unwrap();

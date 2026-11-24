@@ -516,6 +516,60 @@ pub struct SampleFrame {
     pub path: PathBuf,
 }
 /// Sample uniformly through a selected range; manifest timestamps use source seconds.
+/// Packets FFprobe reads from the keyframe before a clip's `source_in` when
+/// looking for the picture on screen there; also the read's bound.
+const HELD_PICTURE_PACKETS: u32 = 2000;
+
+/// When the picture on screen at `file_seconds` (the file's own timeline, as
+/// FFmpeg -copyts sees it) started, at the latest: the latest video packet at
+/// or before it. FFprobe seeks to the keyframe before that time and reads at
+/// most `HELD_PICTURE_PACKETS` packets. A packet without a presentation time
+/// (AVI) counts by its decoding time, which is never later. If the read stops
+/// before `file_seconds`, or B-frames come in a different order, the result is
+/// an earlier picture, which is still at or before the one on screen.
+/// `Ok(None)`: no packet in the read has a time, so nothing is known.
+pub fn picture_start_at_or_before(path: &Path, file_seconds: f64) -> Result<Option<f64>> {
+    let path = canonical_file(path)?;
+    let interval = format!("{file_seconds:.9}%+#{HELD_PICTURE_PACKETS}");
+    let mut args = crate::process::args(&[
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-format_whitelist",
+        format_whitelist()?,
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        &interval,
+        "-show_entries",
+        "packet=pts_time,dts_time",
+        "-of",
+        "csv=p=0",
+    ]);
+    args.push(path.into_os_string());
+    let out = crate::process::run("ffprobe", &args, Duration::from_secs(60), 16 * 1024 * 1024)?;
+    let times = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().split(',').map(|f| f.trim().parse::<f64>().ok());
+            let (pts, dts) = (fields.next().flatten(), fields.next().flatten());
+            pts.or(dts)
+        })
+        .collect::<Vec<_>>();
+    if times.is_empty() {
+        return Ok(None);
+    }
+    // The earliest packet read is the keyframe the read began at, which is
+    // at or before `file_seconds` whenever the seek found one.
+    Ok(times
+        .iter()
+        .copied()
+        .filter(|start| *start <= file_seconds + 0.000_000_5)
+        .reduce(f64::max)
+        .or_else(|| times.iter().copied().reduce(f64::min)))
+}
+
 pub fn sample_frames(
     info: &MediaInfo,
     output_dir: &Path,

@@ -791,6 +791,108 @@ fn audio_lands_on_exact_samples_at_unit_and_clock_drift_speeds() {
     }
 }
 
+#[test]
+fn video_clip_sound_lands_on_exact_samples_after_the_picture_preroll() {
+    // The picture decode starts up to 1 s before source_in. After that seek a
+    // file's sound can resume later than the seek point: with mono PCM
+    // remuxed into Matroska, sound counted from the seek came out 77 ms late.
+    // So the sound is trimmed at source_in on the file's own timeline.
+    // Matroska stores times to 1 ms, so its sound lands within half of that
+    // (24 samples); MOV and MP4 to the sample.
+    let dir = tempfile::tempdir().unwrap();
+    let bursts = [3.7, 4.0, 4.3, 4.6];
+    let expression = bursts
+        .iter()
+        .map(|t| {
+            format!("between(t,{t},{t}+0.01)*sin(2*PI*2000*(t-{t}))*0.5*(1-cos(2*PI*(t-{t})/0.01))")
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    let picture = dir.path().join("picture.mp4");
+    let sound = dir.path().join("sound.wav");
+    // A lossless picture with a keyframe every 25 frames puts a Matroska
+    // cluster just before the seek point (2.5025 s for source_in 3.504).
+    let picture_options = [
+        "-c:v", "libx264", "-qp", "0", "-g", "25", "-pix_fmt", "yuv444p", "-threads", "1",
+    ];
+    let sound_options = ["-c:a", "pcm_s16le"];
+    for (input, output, options) in [
+        (
+            "color=red:s=160x90:r=30000/1001:d=6".to_owned(),
+            &picture,
+            &picture_options[..],
+        ),
+        (
+            format!("aevalsrc='{expression}':s=48000:d=6"),
+            &sound,
+            &sound_options[..],
+        ),
+    ] {
+        let mut args = vec!["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", &input];
+        args.extend(options);
+        args.push(output.to_str().unwrap());
+        command("ffmpeg", &args);
+    }
+    for (name, codec, limit) in [
+        ("clicks.mkv", "pcm_s16le", 24),
+        ("clicks.mov", "pcm_s16le", 1),
+        ("clicks.mp4", "aac", 1),
+    ] {
+        let source = dir.path().join(name);
+        command(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                picture.to_str().unwrap(),
+                "-i",
+                sound.to_str().unwrap(),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                codec,
+                source.to_str().unwrap(),
+            ],
+        );
+        let source_in = 3.504;
+        let mut specification = edit();
+        specification["audio"] = json!([]);
+        specification["video"] =
+            json!([{"clips":[{"start":0,"source":name,"source_in":source_in,"duration":1.2}]}]);
+        let validated = timeline::validate(&build(&specification), dir.path()).unwrap();
+        let script = dir.path().join(format!("{name}.py"));
+        export::export(&validated, "ffmpeg", &script, false).unwrap();
+        for python in [false, true] {
+            let output = dir.path().join(format!("{name}-{python}.mp4"));
+            if python {
+                command(
+                    "python3",
+                    &[
+                        script.to_str().unwrap(),
+                        "--output",
+                        output.to_str().unwrap(),
+                    ],
+                );
+            } else {
+                export::render(&validated, &output, false, StretcherChoice::Auto).unwrap();
+            }
+            let expected: Vec<f64> = bursts.iter().map(|t| t - source_in).collect();
+            let errors = burst_onsets(&output, &expected);
+            assert!(
+                errors.iter().all(|e| e.abs() <= limit),
+                "{name} python={python}: sample errors {errors:?}"
+            );
+        }
+    }
+}
+
 /// Clip-audio edit of `clicks.wav` at `speed` covering 3.4 source seconds.
 fn click_edit(dir: &Path, speed: f64) -> timeline::ValidatedEdit {
     let mut specification = edit();
