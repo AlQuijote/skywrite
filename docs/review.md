@@ -67,35 +67,33 @@ or point the transcript/edit at the media it was made from. Hashes use the share
   omits fillers, so their absence proves nothing.
 - `sound_cut_mid_flow`: a clip ends without a fade while its source keeps sounding
   at a similar level, as when applause or a music tail is cut off.
-- `brief_shot`: a picture on screen for less than `--min-shot-seconds` (default
-  0.5, allowed 0 to 10; `0` turns the check off; `checked.min_shot_seconds`
-  reports the value used), such as a talking shot showing for a few frames between
-  two B-roll clips. Each warning gives `timeline_start`, `timeline_end` (seconds)
-  and `frames`. The check works from clip placement, opacity and fades, not
-  pixels. Each frame's picture is the visible weight of each clip: its opacity
-  times its fades, reduced by full-frame opaque video above it, with black taking
-  the rest. Fades are computed the way FFmpeg's `fade` filter renders them
-  (FFmpeg 5.1 to 8.0 alike): start and length are rounded to whole frames, so a
-  fade shorter than one and a half frames can leave a clip's last frame
-  unchanged. Two pictures differ by half the sum of their weight differences: 1
-  for a cut between full-frame shots, 0.25 when a 25%-opacity full-frame overlay
-  appears. A shot is measured over its whole transient, from the middle of the
-  transition into it to the middle of the transition out of it (the cut itself for
-  a hard cut). It is brief when that is shorter than the threshold, it differs by
-  at least 0.25 from the most different pictures within that time before and
-  after it, and it is a detour, not a step on the way from one to the other (its
-  distances from them add up to at least 0.5 more than theirs from each other; a
-  dissolve dips at most 0.25 off that path): a flash frame, a short cutaway, a
-  short overlay (even with fades or at partial opacity), a shot between two quick
-  dissolves, or a black gap cut in and out. Overlapping candidates are reported
-  once. Not reported: dissolves and fades from one picture to another (including
-  a quick fade through black), clips at `opacity: 0`, a straight split that continues the same
-  take on the same track (same source, contiguous within one frame of the slower
-  clip's source step after frame rounding), and cuts hidden under full-frame
-  opaque video on a higher track. Stills, letterboxed pictures and alpha-capable
-  video never dim what is beneath them, so a partial-opacity one must be about
-  twice as opaque to count (a 2-frame PNG at 0.6 is reported, at 0.3 it is not).
-  Raise the threshold to match your pacing (for example `1`).
+- `brief_shot`: a picture on screen for less than `--min-shot-seconds` between
+  two hard cuts (default 0.5, allowed 0 to 10; `0` turns the check off;
+  `checked.min_shot_seconds` reports the value used), such as a talking shot
+  showing for a few frames between two B-roll clips. Each warning gives
+  `timeline_start`, `timeline_end` (seconds) and `frames`. **Fades and dissolves
+  are not checked yet.** The check works from clip placement and opacity, not
+  pixels. Each frame's picture is the visible weight of each clip: its opacity,
+  reduced by full-frame opaque video above it, with black taking the rest. Two
+  pictures differ by half the sum of their weight differences: 1 for a cut
+  between full-frame shots, 0.25 when a 25%-opacity full-frame overlay appears.
+  A cut is a frame where the picture differs by at least 0.25 from the frame
+  before (black lies beyond the timeline's ends), and a shot runs from one cut to
+  the next, so its length is exact from the edit. A shot is checked only when
+  both its cuts are hard: no visible clip fades in the shot or in the frame on
+  either side of it, and no take continues at another opacity at its cuts or
+  inside it. That reports a flash frame, a short cutaway, a short overlay at
+  partial opacity, or a black gap cut in and out. A shot with a fade, a dissolve
+  or an opacity change at either cut is never reported as brief; when its clip
+  edges are under the threshold it is listed in `checked.brief_shots_not_checked`
+  (`timeline_start`, `timeline_end`) so you can watch it with `skywrite review
+  cuts`. Not cuts: clips at `opacity: 0`, a straight split that continues the
+  same take on the same track (same source, contiguous within one frame of the
+  slower clip's source step after frame rounding), and cuts hidden under
+  full-frame opaque video on a higher track. Stills, letterboxed pictures and
+  alpha-capable video never dim what is beneath them, so a partial-opacity one
+  must be about twice as opaque to count (a 2-frame PNG at 0.6 is reported, at
+  0.3 it is not). Raise the threshold to match your pacing (for example `1`).
 - `bed_close_to_dialogue`: a non-dialogue source (music, ambience) within 10 dB of
   the dialogue during speech, with the edit's gains applied. Tracks with a declared
   `role` are classified by it; otherwise a source without a transcript is a bed.
