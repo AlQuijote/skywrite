@@ -40,7 +40,9 @@ command to retry them alone. Progress on stderr, every 25 frames and after the l
 counts each outcome: `Finished 2/2 frames (1 described, 0 cached, 1 failed)`.
 
 Each result lists the source time, estimated frame number, the persistent JPEG that
-was described (under the cache's `assets/<sha>/exact-frames/`), and a JSON
+was described (under the cache's `assets/<sha>/exact-frames/`, named by time and
+width; frames fit in 768 pixels by their displayed shape, so rotated phone footage
+stays upright and 9:16 portrait frames are 432x768), and a JSON
 description: shot size, camera angle, people (position, appearance, gaze,
 expression, mouth, apparent mid-speech, gesture), setting, objects, legible text,
 image issues and a one-sentence summary. `--transcript words.json` attaches the
@@ -86,8 +88,11 @@ visible from several angles (hair, garment colours), and confirm by viewing fram
 skywrite describe video interview.mp4 --start 56 --duration 8 -o laugh.json
 ```
 
-The range is re-encoded to H.264 at 480p without audio (`--height` 240–1080) and
-sent inline. The model reports shots, timed events (gestures, head turns,
+The range is re-encoded to H.264 at up to 480 rows without audio (`--height`
+240–1080, a maximum) and sent inline. It is never upscaled: a source shown smaller than `--height` (by its
+displayed size, so rotated phone footage counts upright) keeps its own height,
+rounded down to an even number, and `encoding` in the result names the height
+sent (for example `h264-crf28-upright-h480-noaudio`). The model reports shots, timed events (gestures, head turns,
 expression changes, visible speech onsets) and people, with clip-relative times plus
 `source_*` times. Ranges are limited to 600 seconds and 17 MiB encoded; shorter
 ranges give finer timing. A custom provider must accept `video_url` input; one

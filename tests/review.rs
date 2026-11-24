@@ -808,6 +808,64 @@ fn contact_sheets_use_exact_consecutive_frames() {
 }
 
 #[test]
+fn contact_sheet_tiles_of_rotated_phone_footage_are_upright() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping contact_sheet_tiles_of_rotated_phone_footage_are_upright: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=green:s=160x90:r=30:d=1",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        &p("stored.mp4"),
+    ]);
+    ffmpeg(&[
+        "-v",
+        "error",
+        "-y",
+        "-display_rotation",
+        "90",
+        "-i",
+        &p("stored.mp4"),
+        "-c",
+        "copy",
+        &p("phone.mp4"),
+    ]);
+    skywrite(&[
+        "review",
+        "sheet",
+        &p("phone.mp4"),
+        "--duration",
+        "0.1",
+        "--every",
+        "3",
+        "--tile-width",
+        "90",
+        "-o",
+        &p("sheet.jpg"),
+    ]);
+    // Shown 90x160: one 90-wide tile is 160 tall, plus its 28-pixel label.
+    let size = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=width,height"])
+        .args(["-of", "csv=p=0", &p("sheet.jpg")])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&size.stdout).trim(), "90,188");
+}
+
+#[test]
 fn interval_sampling_keeps_one_frame_per_vfr_bucket_across_gaps_and_seeks() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("vfr.mkv");

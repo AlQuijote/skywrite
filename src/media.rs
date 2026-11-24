@@ -214,12 +214,18 @@ impl MediaStream {
     /// Width and height as displayed: swapped for a quarter-turn rotation,
     /// matching the upright frames FFmpeg decodes.
     pub fn display_size(&self) -> Option<(u32, u32)> {
-        let (w, h) = (self.width?, self.height?);
-        Some(if self.rotation.unwrap_or(0).rem_euclid(180) == 90 {
-            (h, w)
+        match self.display_dimensions() {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        }
+    }
+    /// Displayed width and height, each kept when the other is unknown.
+    pub fn display_dimensions(&self) -> (Option<u32>, Option<u32>) {
+        if self.rotation.unwrap_or(0).rem_euclid(180) == 90 {
+            (self.height, self.width)
         } else {
-            (w, h)
-        })
+            (self.width, self.height)
+        }
     }
     /// Whether the pixel format is certainly opaque: FFmpeg's descriptor for it
     /// has no alpha flag. Alpha-capable formats (`argb`, `yuva444p`, ProRes 4444
@@ -892,6 +898,51 @@ mod filter_tests {
             " .. atempo  A->A  Adjust audio tempo (not rubberband).\n",
             "rubberband"
         ));
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    #[test]
+    fn displayed_dimensions_swap_for_quarter_turns_and_keep_partial_metadata() {
+        let stream = |width, height, rotation| MediaStream {
+            index: 0,
+            codec_type: "video".into(),
+            codec_name: None,
+            duration: None,
+            start_time: None,
+            width,
+            height,
+            rotation,
+            pix_fmt: None,
+            sample_rate: None,
+            channels: None,
+            avg_frame_rate: None,
+            r_frame_rate: None,
+            time_base: None,
+        };
+        for rotation in [Some(90), Some(-90), Some(270), Some(-270)] {
+            assert_eq!(
+                stream(Some(16), Some(9), rotation).display_size(),
+                Some((9, 16))
+            );
+            assert_eq!(
+                stream(Some(16), None, rotation).display_dimensions(),
+                (None, Some(16))
+            );
+        }
+        for rotation in [None, Some(0), Some(180), Some(-180)] {
+            assert_eq!(
+                stream(Some(16), Some(9), rotation).display_size(),
+                Some((16, 9))
+            );
+        }
+        assert_eq!(
+            stream(Some(16), None, None).display_dimensions(),
+            (Some(16), None)
+        );
+        assert_eq!(stream(Some(16), None, None).display_size(), None);
     }
 }
 

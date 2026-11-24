@@ -348,3 +348,87 @@ fn timing_cache_keys_on_the_whole_ffmpeg_build_but_stores_it_compactly() {
         assert!(std::fs::metadata(&entry).unwrap().len() < 1024);
     }
 }
+/// FFmpeg 6.0 added `-display_rotation`, which the rotated phone fixtures need;
+/// older builds (Skywrite supports 5.1+) skip those cases.
+fn display_rotation_supported() -> bool {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("-display_rotation")
+}
+
+#[test]
+fn verify_checks_the_displayed_size_of_rotated_phone_footage() {
+    if !display_rotation_supported() {
+        eprintln!(
+            "skipping verify_checks_the_displayed_size_of_rotated_phone_footage: FFmpeg lacks -display_rotation (6.0+)"
+        );
+        return;
+    }
+    let d = scratch();
+    let stored = d.path().join("stored.mp4");
+    ffmpeg(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=s=160x90:r=10:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+        &stored,
+    );
+    let phone = d.path().join("phone.mp4");
+    ffmpeg(
+        &[
+            "-display_rotation",
+            "90",
+            "-i",
+            stored.to_str().unwrap(),
+            "-c",
+            "copy",
+        ],
+        &phone,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_skywrite"))
+        .arg("verify")
+        .arg(&phone)
+        .args([
+            "--metadata-only",
+            "--expected-width",
+            "90",
+            "--expected-height",
+            "160",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn verify_help_says_sizes_are_displayed_sizes() {
+    let out = Command::new(env!("CARGO_BIN_EXE_skywrite"))
+        .args(["verify", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for fact in [
+        "--expected-width <PIXELS>",
+        "--expected-height <PIXELS>",
+        "displayed width in pixels",
+        "display rotation applied",
+        "stored 1920x1080 with rotation 90 or -90 is 1080 wide",
+        "stream_metadata",
+        "nonzero exit",
+    ] {
+        assert!(help.contains(fact), "missing {fact:?} in:\n{help}");
+    }
+}

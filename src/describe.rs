@@ -97,8 +97,14 @@ pub struct VideoArgs {
     pub start: f64,
     #[arg(long)]
     pub duration: f64,
-    /// Encoded height for the request (smaller is cheaper; 240..1080).
-    #[arg(long, default_value_t = 480)]
+    /// Maximum encoded height for the request (smaller is cheaper; 240..1080).
+    ///
+    /// Pixels, default 480. The clip is never upscaled: a source whose displayed
+    /// height (rotation applied, so a phone clip stored 1920x1080 with rotation 90
+    /// is 1920 high) is smaller keeps that height, rounded down to an even number.
+    /// The result's encoding field names the height sent, and results are cached
+    /// per encoding.
+    #[arg(long, default_value_t = 480, value_name = "PIXELS")]
     pub height: u32,
     #[arg(long)]
     pub cast: Option<PathBuf>,
@@ -215,6 +221,7 @@ Return only a JSON object:
 pub fn frame_cache_key(
     source_sha256: &str,
     time: f64,
+    width: u32,
     target: &ModelRef,
     cast: Option<&Cast>,
 ) -> Result<String> {
@@ -223,7 +230,7 @@ pub fn frame_cache_key(
         FRAME_PROMPT_VERSION.as_bytes(),
         source_sha256.as_bytes(),
         format!("{time:.6}").as_bytes(),
-        format!("fit{FRAME_FIT}-q{JPEG_QUALITY}").as_bytes(),
+        format!("fit{FRAME_FIT}-w{width}-q{JPEG_QUALITY}").as_bytes(),
         target.provider.identity().as_bytes(),
         target.model.as_bytes(),
         &cast,
@@ -305,11 +312,11 @@ fn ask(
 }
 
 fn fit_width(info: &media::MediaInfo) -> u32 {
-    let video = info.video();
-    let (w, h) = (
-        video.and_then(|v| v.width).unwrap_or(16) as f64,
-        video.and_then(|v| v.height).unwrap_or(9) as f64,
-    );
+    let (w, h) = info
+        .video()
+        .and_then(|v| v.display_size())
+        .unwrap_or((16, 9));
+    let (w, h) = (w as f64, h as f64);
     let width = if w >= h {
         FRAME_FIT as f64
     } else {
@@ -408,6 +415,9 @@ fn frames_with_api(
     let temp = tempfile::Builder::new()
         .prefix("skywrite-describe-")
         .tempdir()?;
+    // The frame size is part of the description's identity: rotated footage
+    // is fitted by its displayed shape.
+    let width = fit_width(&info);
     let extracted = review::extract_frames(
         &info,
         &FrameSelection {
@@ -415,7 +425,7 @@ fn frames_with_api(
             duration,
             every,
             interval: args.interval,
-            width: fit_width(&info),
+            width,
         },
         temp.path(),
         HARD_MAX_FRAMES,
@@ -424,8 +434,8 @@ fn frames_with_api(
     // Persist frame images by exact time so agents can view what was described.
     let mut work = Vec::new();
     for frame in &extracted {
-        let key = frame_cache_key(&source_sha256, frame.time, &target, cast.as_ref())?;
-        let image = image_dir.join(format!("{:015.6}-fit{FRAME_FIT}.jpg", frame.time));
+        let key = frame_cache_key(&source_sha256, frame.time, width, &target, cast.as_ref())?;
+        let image = image_dir.join(format!("{:015.6}-w{width}.jpg", frame.time));
         let bytes = std::fs::read(&frame.path)?;
         crate::io::atomic_write(&image, &bytes, true)?;
         work.push((
@@ -640,7 +650,17 @@ fn video(args: &VideoArgs) -> Result<Value> {
     let model = target.reference();
     let root = crate::cache::cache_root(args.cache_dir.as_deref())?;
     let source_sha256 = media::file_sha256(&info.path)?;
-    let encode = format!("h264-crf28-h{}-noaudio", args.height);
+    // Never upscale: the clip is encoded at --height or the displayed height,
+    // whichever is smaller, rounded down to an even number for H.264 4:2:0.
+    // The encoded height is part of the cache key and the reported encoding;
+    // `upright` marks clips sized by their displayed shape, so descriptions of
+    // rotated footage encoded from its stored shape are not reused.
+    let video_height = info
+        .video()
+        .and_then(|v| v.display_size())
+        .map_or(args.height, |(_, h)| h);
+    let height = (args.height.min(video_height) & !1).max(2);
+    let encode = format!("h264-crf28-upright-h{height}-noaudio");
     let key = openrouter::cache_key(&[
         VIDEO_PROMPT_VERSION.as_bytes(),
         source_sha256.as_bytes(),
@@ -687,7 +707,6 @@ fn video(args: &VideoArgs) -> Result<Value> {
         .prefix("skywrite-video-")
         .tempdir()?;
     let clip = temp.path().join("clip.mp4");
-    let video_height = info.video().and_then(|v| v.height).unwrap_or(args.height);
     let mut command = crate::process::args(&[
         "-hide_banner",
         "-nostdin",
@@ -707,7 +726,7 @@ fn video(args: &VideoArgs) -> Result<Value> {
         "0:v:0",
         "-an",
         "-vf",
-        &format!("scale=-2:{}", args.height.min(video_height)),
+        &format!("scale=-2:{height}"),
         "-c:v",
         "libx264",
         "-preset",
@@ -793,7 +812,7 @@ mod tests {
             .join("assets")
             .join(media::file_sha256(&video).unwrap())
             .join("exact-frames")
-            .join(format!("{:015.6}-fit{FRAME_FIT}.jpg", 0.0));
+            .join(format!("{:015.6}-w{FRAME_FIT}.jpg", 0.0));
         let args = FrameArgs {
             source: video,
             start: 0.0,
@@ -924,15 +943,20 @@ mod tests {
             .unwrap()
         };
         let m = target("m");
-        let a = frame_cache_key("ab", 1.0, &m, None).unwrap();
-        assert_eq!(a, frame_cache_key("ab", 1.0000001, &m, None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.04, &m, None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.0, &target("n"), None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.0, &m, Some(&cast)).unwrap());
+        let a = frame_cache_key("ab", 1.0, 768, &m, None).unwrap();
+        assert_eq!(a, frame_cache_key("ab", 1.0000001, 768, &m, None).unwrap());
+        assert_ne!(a, frame_cache_key("ab", 1.04, 768, &m, None).unwrap());
+        assert_ne!(
+            a,
+            frame_cache_key("ab", 1.0, 768, &target("n"), None).unwrap()
+        );
+        assert_ne!(a, frame_cache_key("ab", 1.0, 768, &m, Some(&cast)).unwrap());
+        // A differently fitted frame (rotated footage) is a different request.
+        assert_ne!(a, frame_cache_key("ab", 1.0, 432, &m, None).unwrap());
         // Same model name and base URL on another provider never shares entries.
         assert_ne!(
             a,
-            frame_cache_key("ab", 1.0, &target("local:m"), None).unwrap()
+            frame_cache_key("ab", 1.0, 768, &target("local:m"), None).unwrap()
         );
         assert!(frame_prompt(Some(&cast)).contains("- Ralph: grey suit"));
     }
