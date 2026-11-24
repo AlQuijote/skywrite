@@ -97,7 +97,7 @@ pub struct VideoArgs {
     pub start: f64,
     #[arg(long)]
     pub duration: f64,
-    /// Encoded height for the request (smaller is cheaper; 240..1080).
+    /// Maximum encoded height for the request (smaller is cheaper; 240..1080).
     ///
     /// Pixels, default 480. The clip is never upscaled: a source whose displayed
     /// height (rotation applied, so a phone clip stored 1920x1080 with rotation 90
@@ -221,6 +221,7 @@ Return only a JSON object:
 pub fn frame_cache_key(
     source_sha256: &str,
     time: f64,
+    width: u32,
     target: &ModelRef,
     cast: Option<&Cast>,
 ) -> Result<String> {
@@ -229,7 +230,7 @@ pub fn frame_cache_key(
         FRAME_PROMPT_VERSION.as_bytes(),
         source_sha256.as_bytes(),
         format!("{time:.6}").as_bytes(),
-        format!("fit{FRAME_FIT}-q{JPEG_QUALITY}").as_bytes(),
+        format!("fit{FRAME_FIT}-w{width}-q{JPEG_QUALITY}").as_bytes(),
         target.provider.identity().as_bytes(),
         target.model.as_bytes(),
         &cast,
@@ -414,6 +415,9 @@ fn frames_with_api(
     let temp = tempfile::Builder::new()
         .prefix("skywrite-describe-")
         .tempdir()?;
+    // The frame size is part of the description's identity: rotated footage
+    // is fitted by its displayed shape.
+    let width = fit_width(&info);
     let extracted = review::extract_frames(
         &info,
         &FrameSelection {
@@ -421,7 +425,7 @@ fn frames_with_api(
             duration,
             every,
             interval: args.interval,
-            width: fit_width(&info),
+            width,
         },
         temp.path(),
         HARD_MAX_FRAMES,
@@ -430,8 +434,8 @@ fn frames_with_api(
     // Persist frame images by exact time so agents can view what was described.
     let mut work = Vec::new();
     for frame in &extracted {
-        let key = frame_cache_key(&source_sha256, frame.time, &target, cast.as_ref())?;
-        let image = image_dir.join(format!("{:015.6}-fit{FRAME_FIT}.jpg", frame.time));
+        let key = frame_cache_key(&source_sha256, frame.time, width, &target, cast.as_ref())?;
+        let image = image_dir.join(format!("{:015.6}-w{width}.jpg", frame.time));
         let bytes = std::fs::read(&frame.path)?;
         crate::io::atomic_write(&image, &bytes, true)?;
         work.push((
@@ -806,7 +810,7 @@ mod tests {
             .join("assets")
             .join(media::file_sha256(&video).unwrap())
             .join("exact-frames")
-            .join(format!("{:015.6}-fit{FRAME_FIT}.jpg", 0.0));
+            .join(format!("{:015.6}-w{FRAME_FIT}.jpg", 0.0));
         let args = FrameArgs {
             source: video,
             start: 0.0,
@@ -937,15 +941,20 @@ mod tests {
             .unwrap()
         };
         let m = target("m");
-        let a = frame_cache_key("ab", 1.0, &m, None).unwrap();
-        assert_eq!(a, frame_cache_key("ab", 1.0000001, &m, None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.04, &m, None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.0, &target("n"), None).unwrap());
-        assert_ne!(a, frame_cache_key("ab", 1.0, &m, Some(&cast)).unwrap());
+        let a = frame_cache_key("ab", 1.0, 768, &m, None).unwrap();
+        assert_eq!(a, frame_cache_key("ab", 1.0000001, 768, &m, None).unwrap());
+        assert_ne!(a, frame_cache_key("ab", 1.04, 768, &m, None).unwrap());
+        assert_ne!(
+            a,
+            frame_cache_key("ab", 1.0, 768, &target("n"), None).unwrap()
+        );
+        assert_ne!(a, frame_cache_key("ab", 1.0, 768, &m, Some(&cast)).unwrap());
+        // A differently fitted frame (rotated footage) is a different request.
+        assert_ne!(a, frame_cache_key("ab", 1.0, 432, &m, None).unwrap());
         // Same model name and base URL on another provider never shares entries.
         assert_ne!(
             a,
-            frame_cache_key("ab", 1.0, &target("local:m"), None).unwrap()
+            frame_cache_key("ab", 1.0, 768, &target("local:m"), None).unwrap()
         );
         assert!(frame_prompt(Some(&cast)).contains("- Ralph: grey suit"));
     }

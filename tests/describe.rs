@@ -39,11 +39,20 @@ fn fixture_video(path: &std::path::Path) {
 }
 
 fn exact_image(cache: &std::path::Path, video: &std::path::Path) -> std::path::PathBuf {
+    exact_image_at(cache, video, 768)
+}
+
+/// The persisted frame at 0 s, named by its fitted width.
+fn exact_image_at(
+    cache: &std::path::Path,
+    video: &std::path::Path,
+    width: u32,
+) -> std::path::PathBuf {
     cache
         .join("assets")
         .join(skywrite::media::file_sha256(video).unwrap())
         .join("exact-frames")
-        .join(format!("{:015.6}-fit768.jpg", 0.0))
+        .join(format!("{:015.6}-w{width}.jpg", 0.0))
 }
 
 fn dry_frames(
@@ -363,7 +372,8 @@ fn seeded_frame_descriptions_are_reused_across_overlapping_passes() {
     // Seed one second-spaced frames: 0, 1, 2 seconds.
     for second in 0..3 {
         let target = skywrite::providers::resolve(model, &Default::default()).unwrap();
-        let key = skywrite::describe::frame_cache_key(&sha, second as f64, &target, None).unwrap();
+        let key =
+            skywrite::describe::frame_cache_key(&sha, second as f64, 768, &target, None).unwrap();
         let path = cache.join("frame-descriptions").join(format!("{key}.json"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -530,7 +540,7 @@ fn frames_of_rotated_phone_footage_fit_their_displayed_shape() {
     let size = Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", "stream=width,height"])
         .args(["-of", "csv=p=0"])
-        .arg(exact_image(&cache, &video))
+        .arg(exact_image_at(&cache, &video, 432))
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&size.stdout).trim(), "432,768");
