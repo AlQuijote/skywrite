@@ -478,7 +478,8 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
     assert_eq!(lint_shots(d, "card.json", card), (vec![], vec![(60, 62)]));
     // A picture a pixel off the frame's shape (161x90, within 1% of 16:9)
     // renders with a thin bar, so a gap between such shots is not between
-    // full-frame pictures.
+    // full-frame pictures (FFmpeg 5.1.2-9.1 all fit it to 160x89). Cropped
+    // from 162x90: before 7.1 the color source makes "s=161x90" 160x90.
     ffmpeg(&[
         "-v",
         "error",
@@ -486,11 +487,17 @@ fn lint_reports_brief_shots_but_not_continuous_or_hidden_cuts() {
         "-f",
         "lavfi",
         "-i",
-        "color=green:s=161x90",
+        "color=green:s=162x90,format=rgb24,crop=161:90:0:0",
         "-frames:v",
         "1",
         d.join("near.png").to_str().unwrap(),
     ]);
+    let png = std::fs::read(d.join("near.png")).unwrap();
+    assert_eq!(
+        &png[16..24],
+        [0, 0, 0, 161, 0, 0, 0, 90],
+        "near.png is 161x90"
+    );
     let near_gap = json!([{"clips":[{"start":0,"source":"near.png","duration":2.0},
         {"start":2.0667,"source":"near.png","duration":1.9333}]}]);
     assert_eq!(
