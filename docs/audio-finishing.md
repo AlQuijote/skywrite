@@ -1,6 +1,6 @@
 # Local audio finishing
 
-`skywrite audio` uses installed FFmpeg/ffprobe and makes no model calls. Commands emit JSON with source hashes, first-audio decoded timing, sample rounding, format and actual final decoded duration. Outputs are 48-kHz stereo PCM16 WAV or 192-kbit/s MP3, selected by `.wav`/`.mp3`; bytes are encoded and checked, not renamed.
+`skywrite audio` uses installed FFmpeg/ffprobe and makes no model calls. The finishing commands (`normalize`, `tempo`, `loop`, `duck`, `finish`, and `roomtone` below) emit JSON with source hashes, first-audio decoded timing, sample rounding, format and actual final decoded duration. Their outputs are 48-kHz stereo PCM16 WAV or 192-kbit/s MP3, selected by `.wav`/`.mp3`; bytes are encoded and checked, not renamed.
 
 ```sh
 # Normalize speech with two-pass integrated loudness and a true-peak ceiling.
@@ -21,7 +21,7 @@ skywrite audio finish speech.mp3 -o finished.wav --start 0.1 --length 12 \
   --tempo 1.05 --lufs -18 --peak-db -2 --fade-in 0.025 --duration 14
 ```
 
-Every command accepts the same typed options. `normalize` defaults to -18 LUFS when neither level target is supplied; `tempo` requires `--tempo`, `loop` requires `--duration`, and `duck` requires `--sidechain`. `finish` applies only the requested operations. Use `finish --loop --duration ...` to compose looping with other steps. `--crossfade 0` uses direct concatenation. Crossfades must be shorter than half the selected, tempo-adjusted loop; each overlap reduces the repeat stride. A target shorter than the cue trims it without repeating. This first version repeats one cue; assemble different cues on edit tracks or prepare their sequence separately.
+The five commands `normalize`, `tempo`, `loop`, `duck` and `finish` accept the same typed options (`roomtone` has its own, below). `normalize` defaults to -18 LUFS when neither level target is supplied; `tempo` requires `--tempo`, `loop` requires `--duration`, and `duck` requires `--sidechain`. `finish` applies only the requested operations. Use `finish --loop --duration ...` to compose looping with other steps. `--crossfade 0` uses direct concatenation. Crossfades must be shorter than half the selected, tempo-adjusted loop; each overlap reduces the repeat stride. A target shorter than the cue trims it without repeating. This first version repeats one cue; assemble different cues on edit tracks or prepare their sequence separately.
 
 Processing order is source selection, tempo, normalization, loop/crossfade, narration-driven ducking, final padding/trim, then fades. Tempo 1 passes the 48-kHz samples through unchanged. Within 0.1% of 1 tempo resamples, which is sample-exact and shifts pitch by under 1.8 cents; larger changes keep pitch with the time-stretcher chosen by `--stretcher`, as in edit renders ([edit format](edit-format.md)). `auto` (default) uses FFmpeg's `rubberband` when the build has it, latency-compensated by a per-speed calibration so audio lands within about 6 ms (8 ms at 0.125x) and the output has exactly `round(selected samples / tempo)` samples. Without rubberband it falls back to `atempo` with a warning: 3-36 ms early at 0.5-2x and up to about 60 ms early below 0.5x, and its output is short (for one second of source: 1511 samples at 0.8, 7680 samples at 0.25). `rubberband` fails if FFmpeg lacks it; `atempo` always uses atempo. The JSON reports the choice in `audio_stretcher`. Normalization targets the prepared selection. Later crossfades, ducking, fades and MP3 encoding can change final loudness or peaks; the report does not claim a final LUFS target was verified. Two-pass loudnorm may use its dynamic fallback if linear normalization cannot satisfy the requested range/ceiling. Digital silence stays silent and reports that the level target is unachievable. Peak-only normalization targets decoded sample peak, rather than intersample true peak.
 
@@ -40,3 +40,20 @@ reading, and bound actual reads even if a file grows after the initial metadata
 check. Changed sources fail before publication. Hashing stable original media
 in other commands remains bounded to that file's opened size, without a global
 one-GiB restriction.
+
+## Room tone under generated speech
+
+Generated narration has digital-black pauses, which sound unnaturally dead next to recorded footage. `audio roomtone` puts dry speech on a bed of room tone (a recording of the room with nobody talking):
+
+```sh
+skywrite audio roomtone narration.mp3 --bed room.wav -o narration-room.wav
+# Quieter or louder floor; high-pass a bed with machine hum first.
+skywrite audio roomtone narration.mp3 --bed room.wav -o narration-room.wav \
+  --bed-dbfs -62 --bed-highpass 120
+```
+
+The recipe is fixed: the speech is resampled to 48 kHz stereo and two-pass loudness-normalized first (`--lufs`, default -18; `--peak-db` true-peak ceiling, default -2); the bed is converted to the same rate and layout (a mono bed is upmixed at -3 dB per channel), optionally high-passed (`--bed-highpass HZ`, 20–400), measured in double precision over the part that is mixed (the first speech-length of a longer bed; all of a shorter one) and gained so its RMS lands at `--bed-dbfs` (default -58 dBFS, allowed -80 to -40), so any recording gives the same floor. A bed shorter than the speech is looped with equal-power crossfades (`--crossfade`, default 0.5 s; quarter-sine, so uncorrelated noise keeps its level across seams), a longer one is trimmed. The two are summed (`amix` with `normalize=0`) with no loudness pass after the mix, and no reverb or impulse response. The output has exactly the speech's decoded duration at 48 kHz, so word timings measured on the dry take still apply.
+
+Refused before anything is written: speech that is digital silence or too short for integrated loudness (under about 0.4 s of gated signal), a missing or unreadable bed, the speech itself as the bed, a bed under one second, a digitally silent bed, a bed louder than -30 dBFS RMS (speech, music or a loud noise, not room tone), and a bed that would need more than +40 dB to reach its target. The JSON report has `speech` (normalization measurements, `measured_lufs` and `measured_true_peak_dbtp` before the mix), `bed` (`measured_rms_dbfs`, `measured_peak_dbfs`, `applied_gain_db`, `level_in_mix_rms_dbfs`, `loop_repetitions`, `trimmed`, `highpass_hz`), `mix` (`integrated_lufs`, `true_peak_dbtp`) and the fresh output decode. It warns when the mixed true peak exceeds the ceiling by more than 0.1 dB, when the fitted bed lands more than 1 dB from its target (a bed whose level changes over time), and when the bed had to loop; a fitted bed that is digital silence is refused.
+
+Measured with FFmpeg 8.0.1 on synthetic media (6 s of 220-Hz bursts, 0.4 s on and 0.6 s of digital black, mono 24 kHz; pink-noise beds): speech measured -18.0 LUFS before the mix; a 2.5-s stereo 44.1-kHz bed looped three times landed at -58.0 dBFS RMS in the mix (triangular seams had measured -58.24), a 12-s mono 48-kHz bed was trimmed to -57.9 dBFS; every 0.5-s gap measured within 1.5 dB of -58 dBFS RMS; the mix's true peak stayed under -2 dBTP; output was exactly 288000 samples for both WAV and MP3. `tests/roomtone.rs` checks these with independent FFmpeg decodes.

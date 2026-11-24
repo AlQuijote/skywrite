@@ -23,7 +23,48 @@ pub enum AudioCommand {
     Duck(FinishArgs),
     /// Compose trim, tempo, normalization, looping, ducking, fades and exact padding.
     Finish(FinishArgs),
+    /// Put dry speech on a room-tone bed: speech loudness-normalized first, the
+    /// bed looped or trimmed to it at a target level, summed without a later
+    /// loudness pass; output length equals the speech.
+    Roomtone(RoomtoneArgs),
 }
+#[derive(Debug, Args)]
+pub struct RoomtoneArgs {
+    /// Dry speech, for example a generated narration take.
+    pub input: PathBuf,
+    /// Room tone: a recording of the room with nobody talking.
+    #[arg(long)]
+    pub bed: PathBuf,
+    #[arg(short, long)]
+    pub output: PathBuf,
+    #[arg(long)]
+    pub overwrite: bool,
+    /// Speech integrated loudness before mixing, -50 through -5 LUFS (two-pass loudnorm).
+    #[arg(long, default_value_t = -18.0, allow_hyphen_values = true)]
+    pub lufs: f64,
+    /// Speech true-peak ceiling, -20 through 0 dBTP.
+    #[arg(long, default_value_t = -2.0, allow_hyphen_values = true)]
+    pub peak_db: f64,
+    #[arg(long, default_value_t = 7.0)]
+    pub loudness_range: f64,
+    /// Bed RMS level in the mix, -80 through -40 dBFS, measured from the bed
+    /// (after --bed-highpass); any bed lands at this floor.
+    #[arg(long, default_value_t = -58.0, allow_hyphen_values = true)]
+    pub bed_dbfs: f64,
+    /// High-pass the bed at this frequency (20 through 400 Hz), for example 120
+    /// against machine hum.
+    #[arg(long)]
+    pub bed_highpass: Option<f64>,
+    /// Crossfade where a short bed loops, 0 through 30 seconds.
+    #[arg(long, default_value_t = 0.5)]
+    pub crossfade: f64,
+}
+/// A bed louder than this is not room tone (speech, music or a loud noise).
+const BED_MAX_INPUT_DBFS: f64 = -30.0;
+/// The most gain a quiet bed may get to reach its target level.
+const BED_MAX_GAIN_DB: f64 = 40.0;
+/// Shortest usable bed recording.
+const BED_MIN_SECONDS: f64 = 1.0;
 #[derive(Debug, Args)]
 pub struct FinishArgs {
     pub input: PathBuf,
@@ -152,6 +193,78 @@ fn filter_file(source: &Path, output: &Path, filter: &str, deadline: Instant) ->
     run(&args, deadline)?;
     Ok(())
 }
+/// Crossfade shape at loop seams.
+#[derive(Clone, Copy)]
+enum Seam {
+    /// Linear (triangular) gain: constant amplitude for correlated music.
+    Linear,
+    /// Quarter-sine gain: constant power for uncorrelated noise such as room tone.
+    EqualPower,
+}
+/// `repetitions` copies of `source`, joined with `seam` crossfades of
+/// `crossfade_samples` (plain concatenation at zero), cut at `duration`.
+fn loop_file(
+    source: &Path,
+    output: &Path,
+    repetitions: usize,
+    (crossfade_samples, seam): (u64, Seam),
+    duration: f64,
+    deadline: Instant,
+) -> Result<()> {
+    let curve = match seam {
+        Seam::Linear => "tri",
+        Seam::EqualPower => "qsin",
+    };
+    let mut args = base_args();
+    for _ in 0..repetitions {
+        input(&mut args, source);
+    }
+    let mut graph = String::new();
+    if crossfade_samples == 0 {
+        for i in 0..repetitions {
+            graph.push_str(&format!("[{i}:a:0]"));
+        }
+        graph.push_str(&format!("concat=n={repetitions}:v=0:a=1[out]"));
+    } else {
+        let mut last = "0:a:0".to_owned();
+        for i in 1..repetitions {
+            let next = format!("l{i}");
+            graph.push_str(&format!(
+                "[{last}][{i}:a:0]acrossfade=ns={crossfade_samples}:c1={curve}:c2={curve}[{next}];"
+            ));
+            last = next;
+        }
+        graph.push_str(&format!("[{last}]anull[out]"));
+    }
+    args.extend(crate::process::args(&[
+        "-filter_complex_threads",
+        "1",
+        "-filter_complex",
+        &graph,
+        "-map",
+        "[out]",
+        "-t",
+        &duration.to_string(),
+    ]));
+    wav_output(&mut args, output);
+    run(&args, deadline)?;
+    Ok(())
+}
+/// Loop repetitions needed to reach `target` samples from `content` samples.
+fn repetitions_for(content: u64, target: u64, crossfade_samples: u64) -> Result<usize> {
+    if target <= content {
+        return Ok(1);
+    }
+    if crossfade_samples * 2 >= content {
+        bail!("crossfade must be shorter than half the prepared loop source");
+    }
+    let stride = content - crossfade_samples;
+    let repetitions = 1 + (target - content).div_ceil(stride) as usize;
+    if repetitions > MAX_LOOPS {
+        bail!("loop needs {repetitions} repetitions; maximum is {MAX_LOOPS}");
+    }
+    Ok(repetitions)
+}
 fn checked_timing(path: &Path) -> Result<crate::media::AudioTiming> {
     let info = crate::media::probe(path)?;
     if info.size_bytes > MAX_BYTES {
@@ -200,6 +313,68 @@ fn loudness_stats(
         .context("loudnorm measurement was incomplete")?;
     serde_json::from_str(&stderr[start..=end]).context("invalid loudnorm measurements")
 }
+/// Overall RMS and sample peak (dBFS) of `source` after `filter`, decoded in
+/// floating point without writing a file. `None` for digital silence.
+fn levels(source: &Path, filter: &str, deadline: Instant) -> Result<(Option<f64>, Option<f64>)> {
+    let mut args = base_args();
+    args.extend(crate::process::args(&["-loglevel", "info"]));
+    input(&mut args, source);
+    args.extend(crate::process::args(&[
+        "-map",
+        "0:a:0",
+        "-filter_threads",
+        "1",
+        "-af",
+        &format!(
+            "{filter},astats=metadata=0:reset=0:measure_perchannel=none:measure_overall=RMS_level+Peak_level"
+        ),
+        "-f",
+        "null",
+        "-",
+    ]));
+    let out = run(&args, deadline)?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value = |name: &str| -> Result<Option<f64>> {
+        let text = stderr
+            .lines()
+            .filter_map(|line| line.split_once(name).map(|(_, v)| v.trim().to_owned()))
+            .next_back()
+            .with_context(|| format!("level measurement missing {name}"))?;
+        // astats reports digital silence as -inf.
+        Ok(text.parse::<f64>().ok().filter(|v| v.is_finite()))
+    };
+    Ok((value("RMS level dB:")?, value("Peak level dB:")?))
+}
+/// Two-pass linear loudnorm of `source` into `output`. `None` (nothing written)
+/// when the measurements are not finite, as for digital silence.
+fn two_pass_loudnorm(
+    source: &Path,
+    output: &Path,
+    target: f64,
+    peak: f64,
+    range: f64,
+    deadline: Instant,
+) -> Result<Option<Value>> {
+    let stats = loudness_stats(source, target, peak, range, deadline)?;
+    let (Some(i), Some(tp), Some(lra), Some(thresh), Some(offset)) = (
+        stat(&stats, "input_i"),
+        stat(&stats, "input_tp"),
+        stat(&stats, "input_lra"),
+        stat(&stats, "input_thresh"),
+        stat(&stats, "target_offset"),
+    ) else {
+        return Ok(None);
+    };
+    filter_file(
+        source,
+        output,
+        &format!(
+            "loudnorm=I={target}:TP={peak}:LRA={range}:measured_I={i}:measured_TP={tp}:measured_LRA={lra}:measured_thresh={thresh}:offset={offset}:linear=true,aresample={RATE}"
+        ),
+        deadline,
+    )?;
+    Ok(Some(stats))
+}
 fn stat(stats: &Value, key: &str) -> Option<f64> {
     stats[key]
         .as_str()?
@@ -235,6 +410,7 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
             (args, "duck")
         }
         AudioCommand::Finish(args) => (args, "finish"),
+        AudioCommand::Roomtone(args) => return roomtone(args),
     };
     bounded("start", options.start, 0.0, MAX_SECONDS)?;
     for (name, value) in [("length", options.length), ("duration", options.duration)] {
@@ -339,24 +515,15 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
     let mut normalization = Value::Null;
     if let Some(target) = options.lufs {
         let peak = options.peak_db.unwrap_or(-2.0);
-        let stats = loudness_stats(&current, target, peak, options.loudness_range, deadline)?;
-        if let (Some(i), Some(tp), Some(lra), Some(thresh), Some(offset)) = (
-            stat(&stats, "input_i"),
-            stat(&stats, "input_tp"),
-            stat(&stats, "input_lra"),
-            stat(&stats, "input_thresh"),
-            stat(&stats, "target_offset"),
-        ) {
-            let normalized = workspace.path().join("normalized.wav");
-            filter_file(
-                &current,
-                &normalized,
-                &format!(
-                    "loudnorm=I={target}:TP={peak}:LRA={}:measured_I={i}:measured_TP={tp}:measured_LRA={lra}:measured_thresh={thresh}:offset={offset}:linear=true,aresample={RATE}",
-                    options.loudness_range
-                ),
-                deadline,
-            )?;
+        let normalized = workspace.path().join("normalized.wav");
+        if let Some(stats) = two_pass_loudnorm(
+            &current,
+            &normalized,
+            target,
+            peak,
+            options.loudness_range,
+            deadline,
+        )? {
             current = normalized;
             replaced = true;
             normalization = json!({"method":"two_pass_loudnorm","target_lufs":target,"true_peak_ceiling_db":peak,"input_measurements":stats});
@@ -402,48 +569,16 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
     let mut repetitions = 1;
     let crossfade_samples = samples(options.crossfade);
     if options.r#loop && target_samples > content_timing.samples {
-        if crossfade_samples * 2 >= content_timing.samples {
-            bail!("crossfade must be shorter than half the prepared loop source");
-        }
-        let stride = content_timing.samples - crossfade_samples;
-        repetitions += (target_samples - content_timing.samples).div_ceil(stride) as usize;
-        if repetitions > MAX_LOOPS {
-            bail!("loop needs {repetitions} repetitions; maximum is {MAX_LOOPS}");
-        }
+        repetitions = repetitions_for(content_timing.samples, target_samples, crossfade_samples)?;
         let looped = workspace.path().join("looped.wav");
-        let mut args = base_args();
-        for _ in 0..repetitions {
-            input(&mut args, &current);
-        }
-        let mut graph = String::new();
-        if crossfade_samples == 0 {
-            for i in 0..repetitions {
-                graph.push_str(&format!("[{i}:a:0]"));
-            }
-            graph.push_str(&format!("concat=n={repetitions}:v=0:a=1[out]"));
-        } else {
-            let mut last = "0:a:0".to_owned();
-            for i in 1..repetitions {
-                let next = format!("l{i}");
-                graph.push_str(&format!(
-                    "[{last}][{i}:a:0]acrossfade=ns={crossfade_samples}:c1=tri:c2=tri[{next}];"
-                ));
-                last = next;
-            }
-            graph.push_str(&format!("[{last}]anull[out]"));
-        }
-        args.extend(crate::process::args(&[
-            "-filter_complex_threads",
-            "1",
-            "-filter_complex",
-            &graph,
-            "-map",
-            "[out]",
-            "-t",
-            &final_duration.to_string(),
-        ]));
-        wav_output(&mut args, &looped);
-        run(&args, deadline)?;
+        loop_file(
+            &current,
+            &looped,
+            repetitions,
+            (crossfade_samples, Seam::Linear),
+            final_duration,
+            deadline,
+        )?;
         current = looped;
     }
     if let Some(sidechain) = &options.sidechain {
@@ -471,18 +606,305 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
         current = ducked;
     }
     let final_path = workspace.path().join(format!("finished.{extension}"));
+    encode_final(
+        &current,
+        &final_path,
+        &extension,
+        target_samples,
+        (samples(options.fade_in), samples(options.fade_out)),
+        deadline,
+    )?;
+    let mut identities = vec![(source.clone(), source_timing.source_sha256.clone())];
+    if let (Some(side), Some(timing)) = (&options.sidechain, &side_timing) {
+        identities.push((side.clone(), timing.source_sha256.clone()));
+    }
+    let (output_timing, codec) = publish_verified(
+        &final_path,
+        &extension,
+        target_samples,
+        &identities,
+        &options.output,
+        options.overwrite,
+        parent,
+    )?;
+    let codec = codec.as_deref();
+    Ok(
+        json!({"version":1,"operation":operation,"output":options.output,"format":extension,"codec":codec,"sample_rate":RATE,"channels":2,"source":source,"source_sha256":source_timing.source_sha256,"source_timing":source_timing,"source_selection":{"time_basis":"seconds from first decoded audio sample; output rebased to zero","container_start_seconds":source_info.start_time,"audio_stream_start_seconds":source_info.audio().and_then(|s|s.start_time),"requested_start_seconds":options.start,"start_samples_48000":start_samples,"length_samples_48000":selection_samples,"tempo":options.tempo.unwrap_or(1.0)},"audio_stretcher":speed_filters.report(),"warnings":speed_filters.warnings,"normalization":normalization,"loop_repetitions":repetitions,"crossfade_samples":crossfade_samples,"sidechain":options.sidechain,"sidechain_timing":side_timing,"requested_duration_seconds":options.duration,"rounded_target_samples":target_samples,"actual_duration_seconds":output_timing.decoded_duration_seconds,"rounding":"nearest sample at 48000 Hz; exact decoded sample count checked","output_timing":output_timing,"full_output_decode_executed":true,"note":"Normalization precedes loops, ducking and fades; these can change final loudness. Duck output contains the music only."}),
+    )
+}
+
+fn roomtone(options: RoomtoneArgs) -> Result<Value> {
+    bounded("lufs", options.lufs, -50.0, -5.0)?;
+    bounded("peak-db", options.peak_db, -20.0, 0.0)?;
+    bounded("loudness-range", options.loudness_range, 1.0, 20.0)?;
+    bounded("bed-dbfs", options.bed_dbfs, -80.0, -40.0)?;
+    bounded("crossfade", options.crossfade, 0.0, 30.0)?;
+    if let Some(hz) = options.bed_highpass {
+        bounded("bed-highpass", hz, 20.0, 400.0)?;
+    }
+    let extension = options
+        .output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "wav" | "mp3") {
+        bail!("audio output requires .wav or .mp3");
+    }
+    let speech = crate::media::canonical_file(&options.input)
+        .with_context(|| format!("speech input {}", options.input.display()))?;
+    let bed = crate::media::canonical_file(&options.bed).with_context(|| {
+        format!(
+            "room-tone bed {} not found or unreadable; pass a recording of the room with nobody talking",
+            options.bed.display()
+        )
+    })?;
+    if speech == bed {
+        bail!("the bed must be a separate room-tone recording, not the speech itself");
+    }
+    let consumed = vec![speech.clone(), bed.clone()];
+    for path in &consumed {
+        if std::fs::metadata(path)?.len() > MAX_BYTES {
+            bail!("audio finishing input exceeds one GiB");
+        }
+    }
+    crate::io::protect_inputs(&options.output, &consumed)?;
+    if std::fs::symlink_metadata(&options.output).is_ok() && !options.overwrite {
+        bail!("output exists; use --overwrite to replace it");
+    }
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let speech_timing = checked_timing(&speech)?;
+    let bed_timing = checked_timing(&bed).context("room-tone bed")?;
+    if bed_timing.decoded_duration_seconds < BED_MIN_SECONDS {
+        bail!(
+            "room-tone bed is {:.3} s; record at least {BED_MIN_SECONDS} s (30 s is typical)",
+            bed_timing.decoded_duration_seconds
+        );
+    }
+    // The deliverable has exactly the dry speech's duration.
+    let target_samples = samples(speech_timing.decoded_duration_seconds);
+    if target_samples == 0 {
+        bail!("speech rounds to zero samples");
+    }
+    let duration = target_samples as f64 / RATE as f64;
+    let parent = options
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let workspace = tempfile::Builder::new()
+        .prefix(".skywrite-audio-")
+        .tempdir_in(parent)?;
+    let _workspace_cleanup = crate::process::CleanupGuard::new(workspace.path())?;
+    let work = |name: &str| workspace.path().join(name);
+
+    // 1. Speech first: 48 kHz stereo, two-pass loudness normalization.
+    filter_file(
+        &speech,
+        &work("speech.wav"),
+        &format!("asetpts=N/SR/TB,aresample={RATE}"),
+        deadline,
+    )?;
+    let Some(speech_stats) = two_pass_loudnorm(
+        &work("speech.wav"),
+        &work("speech-normalized.wav"),
+        options.lufs,
+        options.peak_db,
+        options.loudness_range,
+        deadline,
+    )?
+    else {
+        if speech_timing.peak_dbfs.is_none() {
+            bail!("speech is digital silence; there is nothing to put on a bed");
+        }
+        bail!(
+            "speech loudness could not be measured: integrated loudness needs at least 0.4 s of signal above the gating threshold ({:.3} s decoded); use a longer take",
+            speech_timing.decoded_duration_seconds
+        );
+    };
+    let normalized = loudness_stats(
+        &work("speech-normalized.wav"),
+        options.lufs,
+        options.peak_db,
+        options.loudness_range,
+        deadline,
+    )?;
+
+    // 2. Bed: same rate and layout, optional high-pass; its level is measured
+    // before any 16-bit write so the gain never amplifies quantization noise.
+    // Double precision and the output's stereo layout (a mono bed is upmixed at
+    // -3 dB per channel) are fixed here, so the measured level is the mixed one.
+    let mut bed_filter = format!(
+        "aformat=sample_fmts=dbl,asetpts=N/SR/TB,aresample={RATE},aformat=sample_fmts=dbl:channel_layouts=stereo"
+    );
+    if let Some(hz) = options.bed_highpass {
+        bed_filter.push_str(&format!(",highpass=f={hz}:poles=2"));
+    }
+    // Level only what is mixed: a bed longer than the speech is trimmed, so
+    // its discarded tail must not set the gain. A looped bed is mixed whole.
+    let bed_available = samples(bed_timing.decoded_duration_seconds);
+    let measured_filter = if bed_available > target_samples {
+        format!("{bed_filter},atrim=end_sample={target_samples}")
+    } else {
+        bed_filter.clone()
+    };
+    let (bed_rms, bed_peak) = levels(&bed, &measured_filter, deadline)?;
+    let bed_rms =
+        bed_rms.context("room-tone bed is digital silence; record the room itself, not silence")?;
+    if bed_rms > BED_MAX_INPUT_DBFS {
+        bail!(
+            "room-tone bed RMS is {bed_rms:.1} dBFS, too loud for room tone (limit {BED_MAX_INPUT_DBFS} dBFS): it likely holds speech, music or a loud noise. Record the room in silence"
+        );
+    }
+    let gain = options.bed_dbfs - bed_rms;
+    if gain > BED_MAX_GAIN_DB {
+        bail!(
+            "room-tone bed RMS is {bed_rms:.1} dBFS; reaching {} dBFS needs {gain:+.1} dB (limit +{BED_MAX_GAIN_DB} dB), which would mostly amplify converter noise. Record closer to the room's real level or lower --bed-dbfs",
+            options.bed_dbfs
+        );
+    }
+    filter_file(
+        &bed,
+        &work("bed.wav"),
+        &format!("{bed_filter},volume={gain:.6}dB"),
+        deadline,
+    )?;
+    let bed_prepared = checked_timing(&work("bed.wav"))?;
+    let crossfade_samples = samples(options.crossfade);
+    let repetitions = repetitions_for(bed_prepared.samples, target_samples, crossfade_samples)?;
+    let mut bed_source = work("bed.wav");
+    if repetitions > 1 {
+        loop_file(
+            &bed_source,
+            &work("bed-looped.wav"),
+            repetitions,
+            (crossfade_samples, Seam::EqualPower),
+            duration,
+            deadline,
+        )?;
+        bed_source = work("bed-looped.wav");
+    }
+    filter_file(
+        &bed_source,
+        &work("bed-fitted.wav"),
+        &format!("apad,atrim=end_sample={target_samples},asetpts=N/SR/TB"),
+        deadline,
+    )?;
+    let bed_fitted = checked_timing(&work("bed-fitted.wav"))?;
+    let Some(fitted_level) = bed_fitted.rms_dbfs else {
+        bail!("the fitted room-tone bed is digital silence; record the room itself");
+    };
+
+    // 3. Sum without normalization; no loudness pass after the mix.
+    let mut args = base_args();
+    input(&mut args, &work("speech-normalized.wav"));
+    input(&mut args, &work("bed-fitted.wav"));
+    args.extend(crate::process::args(&[
+        "-filter_complex_threads",
+        "1",
+        "-filter_complex",
+        "[0:a:0][1:a:0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[out]",
+        "-map",
+        "[out]",
+    ]));
+    wav_output(&mut args, &work("mixed.wav"));
+    run(&args, deadline)?;
+    let final_path = work(&format!("finished.{extension}"));
+    encode_final(
+        &work("mixed.wav"),
+        &final_path,
+        &extension,
+        target_samples,
+        (0, 0),
+        deadline,
+    )?;
+    let mixed = loudness_stats(
+        &final_path,
+        options.lufs,
+        options.peak_db,
+        options.loudness_range,
+        deadline,
+    )?;
+    let true_peak = stat(&mixed, "input_tp");
+    let mut warnings = Vec::new();
+    if let Some(tp) = true_peak
+        && tp > options.peak_db + 0.1
+    {
+        warnings.push(format!(
+            "mixed true peak {tp:.2} dBTP is above the {} dBTP ceiling (the bed adds to speech peaks; MP3 encoding can add more)",
+            options.peak_db
+        ));
+    }
+    if (fitted_level - options.bed_dbfs).abs() > 1.0 {
+        warnings.push(format!(
+            "the bed measures {fitted_level:.1} dBFS in the mix, not {} dBFS: its level changes over time (or 16-bit rounding of a very quiet bed); listen, or record a steadier bed",
+            options.bed_dbfs
+        ));
+    }
+    if repetitions > 1 {
+        warnings.push(format!(
+            "the {:.1} s bed was looped {repetitions} times with {} s crossfades to cover {duration:.1} s; a longer recording avoids an audible pattern",
+            bed_timing.decoded_duration_seconds, options.crossfade
+        ));
+    }
+    let (output_timing, codec) = publish_verified(
+        &final_path,
+        &extension,
+        target_samples,
+        &[
+            (speech.clone(), speech_timing.source_sha256.clone()),
+            (bed.clone(), bed_timing.source_sha256.clone()),
+        ],
+        &options.output,
+        options.overwrite,
+        parent,
+    )?;
+    Ok(json!({
+        "version":1,"operation":"roomtone","output":options.output,"format":extension,"codec":codec,
+        "sample_rate":RATE,"channels":2,
+        "speech":{
+            "source":speech,"source_sha256":speech_timing.source_sha256,"source_timing":speech_timing,
+            "normalization":{"method":"two_pass_loudnorm","target_lufs":options.lufs,"true_peak_ceiling_db":options.peak_db,"input_measurements":speech_stats},
+            "measured_lufs":stat(&normalized, "input_i"),"measured_true_peak_dbtp":stat(&normalized, "input_tp"),
+        },
+        "bed":{
+            "source":bed,"source_sha256":bed_timing.source_sha256,"source_timing":bed_timing,
+            "highpass_hz":options.bed_highpass,"measured_rms_dbfs":bed_rms,"measured_peak_dbfs":bed_peak,
+            "target_rms_dbfs":options.bed_dbfs,"applied_gain_db":gain,"level_in_mix_rms_dbfs":bed_fitted.rms_dbfs,
+            "loop_repetitions":repetitions,"crossfade_samples":crossfade_samples,
+            "trimmed":repetitions == 1 && bed_prepared.samples > target_samples,
+        },
+        "mix":{"method":"amix normalize=0 (plain sum); no loudness normalization after mixing","integrated_lufs":stat(&mixed, "input_i"),"true_peak_dbtp":true_peak},
+        "rounded_target_samples":target_samples,"actual_duration_seconds":output_timing.decoded_duration_seconds,
+        "output_timing":output_timing,"full_output_decode_executed":true,"warnings":warnings,
+        "note":"Speech is normalized before the bed is added, so integrated loudness rises slightly in pauses-heavy takes; the output has exactly the speech's duration. No reverb or impulse response is applied."
+    }))
+}
+/// The 48-kHz stereo deliverable: padded, then cut to exactly `target_samples`,
+/// with optional sample-counted fades.
+fn encode_final(
+    source: &Path,
+    output: &Path,
+    extension: &str,
+    target_samples: u64,
+    (fade_in, fade_out): (u64, u64),
+    deadline: Instant,
+) -> Result<()> {
     // Pad before trim: tempo/filter tails cannot leave 179.2s for a 180s request.
     let mut final_filter =
         format!("aresample={RATE},apad,atrim=end_sample={target_samples},asetpts=N/SR/TB");
-    if options.fade_in > 0.0 {
-        final_filter.push_str(&format!(",afade=t=in:ss=0:ns={}", samples(options.fade_in)));
+    if fade_in > 0 {
+        final_filter.push_str(&format!(",afade=t=in:ss=0:ns={fade_in}"));
     }
-    if options.fade_out > 0.0 {
-        let n = samples(options.fade_out);
-        final_filter.push_str(&format!(",afade=t=out:ss={}:ns={n}", target_samples - n));
+    if fade_out > 0 {
+        final_filter.push_str(&format!(
+            ",afade=t=out:ss={}:ns={fade_out}",
+            target_samples - fade_out
+        ));
     }
     let mut args = base_args();
-    input(&mut args, &current);
+    input(&mut args, source);
     args.extend(crate::process::args(&[
         "-map",
         "0:a:0",
@@ -516,10 +938,23 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
             "mp3",
         ]));
     }
-    args.push(final_path.as_os_str().to_owned());
+    args.push(output.as_os_str().to_owned());
     run(&args, deadline)?;
+    Ok(())
+}
+/// Decodes the finished file afresh, checks its sample count and codec, rechecks
+/// every consumed input's identity, then publishes it atomically.
+fn publish_verified(
+    finished: &Path,
+    extension: &str,
+    target_samples: u64,
+    identities: &[(PathBuf, String)],
+    output: &Path,
+    overwrite: bool,
+    parent: &Path,
+) -> Result<(crate::media::AudioTiming, Option<String>)> {
     // Publication requires a fresh decode, even if these exact bytes were cached before.
-    let output_timing = crate::timing::measure_audio(&crate::media::probe(&final_path)?)?;
+    let output_timing = crate::timing::measure_audio(&crate::media::probe(finished)?)?;
     if output_timing.samples != target_samples || output_timing.sample_rate != RATE {
         bail!(
             "decoded output duration mismatch: requested {target_samples} samples, decoded {} at {} Hz",
@@ -527,41 +962,47 @@ pub fn execute(command: AudioCommand) -> Result<Value> {
             output_timing.sample_rate
         );
     }
-    let output_info = crate::media::probe(&final_path)?;
-    let codec = output_info.audio().and_then(|a| a.codec_name.as_deref());
-    if (extension == "wav" && codec != Some("pcm_s16le"))
-        || (extension == "mp3" && codec != Some("mp3"))
+    let output_info = crate::media::probe(finished)?;
+    let codec = output_info.audio().and_then(|a| a.codec_name.clone());
+    if (extension == "wav" && codec.as_deref() != Some("pcm_s16le"))
+        || (extension == "mp3" && codec.as_deref() != Some("mp3"))
     {
         bail!("encoded audio format does not match requested extension");
     }
     // Recheck every source identity before the single publication boundary.
-    if !source_identity_matches(&source, &source_timing.source_sha256, MAX_BYTES)? {
-        bail!("source changed during audio finishing");
+    for (path, hash) in identities {
+        if !source_identity_matches(path, hash, MAX_BYTES)? {
+            bail!("input {} changed during audio finishing", path.display());
+        }
     }
-    if let (Some(side), Some(timing)) = (&options.sidechain, &side_timing)
-        && !source_identity_matches(side, &timing.source_sha256, MAX_BYTES)?
-    {
-        bail!("sidechain changed during audio finishing");
-    }
-    crate::io::protect_inputs(&options.output, &consumed)?;
+    let consumed: Vec<PathBuf> = identities.iter().map(|(p, _)| p.clone()).collect();
+    crate::io::protect_inputs(output, &consumed)?;
+    publish_copy(finished, output, overwrite, parent)?;
+    Ok((output_timing, codec))
+}
+/// Copies `finished` beside `output` into a signal-cleaned temporary file,
+/// syncs it and publishes it atomically (no-clobber unless `overwrite`).
+pub(crate) fn publish_copy(
+    finished: &Path,
+    output: &Path,
+    overwrite: bool,
+    parent: &Path,
+) -> Result<()> {
     let mut publication = tempfile::NamedTempFile::new_in(parent)?;
     let publication_cleanup = crate::process::CleanupGuard::new(publication.path())?;
     std::io::copy(
-        &mut std::fs::File::open(&final_path)?,
+        &mut std::fs::File::open(finished)?,
         publication.as_file_mut(),
     )?;
     publication.as_file().sync_all()?;
-    if options.overwrite {
-        publication.persist(&options.output).map_err(|e| e.error)?;
+    if overwrite {
+        publication.persist(output).map_err(|e| e.error)?;
     } else {
-        crate::io::persist_new(publication, &options.output)?;
+        crate::io::persist_new(publication, output)?;
     }
     drop(publication_cleanup);
-    Ok(
-        json!({"version":1,"operation":operation,"output":options.output,"format":extension,"codec":codec,"sample_rate":RATE,"channels":2,"source":source,"source_sha256":source_timing.source_sha256,"source_timing":source_timing,"source_selection":{"time_basis":"seconds from first decoded audio sample; output rebased to zero","container_start_seconds":source_info.start_time,"audio_stream_start_seconds":source_info.audio().and_then(|s|s.start_time),"requested_start_seconds":options.start,"start_samples_48000":start_samples,"length_samples_48000":selection_samples,"tempo":options.tempo.unwrap_or(1.0)},"audio_stretcher":speed_filters.report(),"warnings":speed_filters.warnings,"normalization":normalization,"loop_repetitions":repetitions,"crossfade_samples":crossfade_samples,"sidechain":options.sidechain,"sidechain_timing":side_timing,"requested_duration_seconds":options.duration,"rounded_target_samples":target_samples,"actual_duration_seconds":output_timing.decoded_duration_seconds,"rounding":"nearest sample at 48000 Hz; exact decoded sample count checked","output_timing":output_timing,"full_output_decode_executed":true,"note":"Normalization precedes loops, ducking and fades; these can change final loudness. Duck output contains the music only."}),
-    )
+    Ok(())
 }
-
 fn source_identity_matches(path: &std::path::Path, expected: &str, limit: u64) -> Result<bool> {
     Ok(crate::media::file_sha256_limited(path, limit)? == expected)
 }
